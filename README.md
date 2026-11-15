@@ -21,7 +21,7 @@
 
 ## 下载与启动
 
-在本仓库的 [Releases](https://github.com/Azusadeath/BA-JPTR/releases) 页面下载 Windows x64 发行包 **BA-JP-Term-Replacer.zip**，完整解压后打开 **BA-JPTR** 文件夹，双击 **BA-JP-Term-Replacer.exe**。
+在本仓库的 [Releases](https://github.com/Azusadeath/BA-JP-Term-Replacer/releases) 页面下载 Windows x64 发行包 **BA-JP-Term-Replacer.zip**，完整解压后打开 **BA-JPTR** 文件夹，双击 **BA-JP-Term-Replacer.exe**。
 
 发行包包含程序、README.txt 和必要许可文件，不包含汉化补丁或游戏资源。
 

@@ -434,30 +434,30 @@ impl Desktop {
                                 ui.horizontal_wrapped(|ui| {
                                     if primary(ui, true, "查看最新版本").clicked() {
                                         ctx.open_url(egui::OpenUrl::new_tab(
-                                            "https://github.com/Azusadeath/BA-JPTR/releases/latest",
+                                            "https://github.com/Azusadeath/BA-JP-Term-Replacer/releases/latest",
                                         ));
                                     }
                                     if secondary(ui, true, "使用说明").clicked() {
                                         ctx.open_url(egui::OpenUrl::new_tab(
-                                            "https://github.com/Azusadeath/BA-JPTR#readme",
+                                            "https://github.com/Azusadeath/BA-JP-Term-Replacer#readme",
                                         ));
                                     }
                                 });
                             });
                         ui.add_space(6.);
                         ui.label(RichText::new("链接").strong().color(TEXT));
-                        about_link(ui, "GitHub 仓库", "https://github.com/Azusadeath/BA-JPTR");
+                        about_link(ui, "GitHub 仓库", "https://github.com/Azusadeath/BA-JP-Term-Replacer");
                         ui.separator();
                         about_link(
                             ui,
                             "历史版本",
-                            "https://github.com/Azusadeath/BA-JPTR/releases",
+                            "https://github.com/Azusadeath/BA-JP-Term-Replacer/releases",
                         );
                         ui.separator();
                         about_link(
                             ui,
                             "开源许可",
-                            "https://github.com/Azusadeath/BA-JPTR/blob/main/LICENSE",
+                            "https://github.com/Azusadeath/BA-JP-Term-Replacer/blob/main/LICENSE",
                         );
                         ui.add_space(12.);
                         egui::CollapsingHeader::new("构建与运行信息").show(ui, |ui| {
