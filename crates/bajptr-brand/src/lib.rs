@@ -1,5 +1,9 @@
 //! One icon source for executable resources and the native window.
 use std::{fs, io::Write, path::Path};
+pub const NAME: &str = "BA-JP-Term-Replacer";
+pub const SHORT_NAME: &str = "BA-JPTR";
+pub const LAUNCHER: &str = "BA-JP-Term-Replacer.exe";
+
 pub fn rgba(size: u32) -> Vec<u8> {
     let mut pixels = vec![0; (size * size * 4) as usize];
     let segment = |x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32| {

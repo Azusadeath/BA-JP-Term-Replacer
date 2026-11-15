@@ -24,7 +24,7 @@ pub fn scopes(value: &str) -> Result<Option<Vec<String>>> {
         .iter()
         .any(|s| s.is_empty() || s.trim() != s || s.chars().any(char::is_control))
     {
-        return Err(invalid("来源表列表或表名无效。"));
+        return Err(invalid("文本表列表或表名无效。"));
     }
     names.sort();
     names.dedup();
@@ -53,7 +53,7 @@ pub fn parse_rules(bytes: &[u8]) -> Result<Vec<Rule>> {
         let fields: Vec<_> = raw.trim_end_matches('\r').split('\t').collect();
         if fields.len() != 5 {
             return Err(invalid(format!(
-                "词表第 {} 行需要五列：原词、替换词、方式、备注、来源表。",
+                "词表第 {} 行需要五列：原词、替换词、方式、备注、文本表。",
                 line + 1
             )));
         }
@@ -296,17 +296,17 @@ pub fn title(name: &str) -> String {
         tables()[name]["title"]
             .as_str()
             .map(str::to_string)
-            .unwrap_or_else(|| format!("未分类 · {name}"))
+            .unwrap_or_else(|| name.to_string())
     }
 }
 pub fn table_info(name: &str) -> Value {
     let value = &tables()[name];
-    json!({"name":name,"label":title(name),"purpose":value["purpose"].as_str().unwrap_or("尚未确认用途，保留原表名；可先查找文字确认内容。"),"basis":if value["text_checked"]==true { "已根据文本样例核对用途；不代表已核对整张表。" } else { "用途按表名归类，尚未确认可替换文本内容。" }})
+    json!({"name":name,"label":title(name),"purpose":value["purpose"].as_str().unwrap_or("游戏文本表，可在「查找」中查看内容。")})
 }
 pub fn scope_title(scope: &str) -> String {
     match scopes(scope).ok().flatten() {
         None => title(""),
-        Some(n) if n.is_empty() => "未选来源表".into(),
+        Some(n) if n.is_empty() => "未选文本表".into(),
         Some(n) if n.len() > 2 => format!("已选 {} 张表", n.len()),
         Some(n) => n.iter().map(|s| title(s)).collect::<Vec<_>>().join("、"),
     }

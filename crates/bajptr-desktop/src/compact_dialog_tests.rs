@@ -88,6 +88,9 @@ fn source_template_and_about_use_normal_width_and_keep_main_actions_visible() {
             result.window
         );
         assert!(!result.texts.iter().any(|(text, _, _)| text == "取消"));
+        if case == "source" {
+            assert!(!result.texts.iter().any(|(text, _, _)| text == "刷新"));
+        }
         for label in match case {
             "source" => vec!["全选", "反选", "确定"],
             "template" => vec!["填入词条"],
@@ -103,6 +106,137 @@ fn source_template_and_about_use_normal_width_and_keep_main_actions_visible() {
                 "{case}: {label} is clipped"
             );
         }
+    }
+}
+
+#[test]
+fn search_source_sizes_the_popup_to_the_longest_name_and_keeps_the_button_compact() {
+    for width in [900., 1080.] {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut app = Desktop::initial();
+        app.loaded = true;
+        app.connected = true;
+        let metadata: serde_json::Value =
+            serde_json::from_str(include_str!("../../bajptr-project/assets/tables.json")).unwrap();
+        app.tables = metadata
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|name| bajptr_project::model::table_info(name))
+            .collect();
+        let mut warmup = ctx.run_ui(egui::RawInput::default(), |_| {});
+        warmup.textures_delta.clear();
+        let longest = ctx.fonts_mut(|fonts| {
+            app.tables
+                .iter()
+                .max_by(|a, b| {
+                    let mut measure = |row: &serde_json::Value| {
+                        fonts
+                            .layout_no_wrap(
+                                text(row, "label"),
+                                egui::FontId::proportional(14.5),
+                                crate::theme::TEXT,
+                            )
+                            .size()
+                            .x
+                    };
+                    measure(a).total_cmp(&measure(b))
+                })
+                .unwrap()
+                .clone()
+        });
+        let choice = text(&longest, "label");
+        app.tables.sort_by_key(|row| text(row, "label") != choice);
+        let selected = "全部文本表";
+        let mut frame = 0;
+        let mut draw = |events| {
+            frame += 1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 680.),
+                    )),
+                    time: Some(f64::from(frame) / 60.),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::new().inner_margin(18))
+                        .show(ui, |ui| app.search_page(ui));
+                },
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        shape.clip_rect,
+                        text.galley.elided,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut labels = Vec::new();
+        for _ in 0..3 {
+            labels = draw(vec![]);
+        }
+        let (_, rect, clip, _) = labels
+            .iter()
+            .find(|(text, _, _, _)| text == selected)
+            .unwrap();
+        assert!(
+            clip.contains_rect(*rect) && rect.right() <= width,
+            "{width}: {rect:?} / {clip:?}"
+        );
+        assert!(rect.height() <= 36., "selected name must stay on one line");
+        assert!(rect.width() <= 220., "selected name must stay compact");
+        let pos = rect.center();
+        for pressed in [true, false] {
+            draw(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        for _ in 0..3 {
+            labels = draw(vec![]);
+        }
+        let (_, rect, clip, elided) = labels
+            .iter()
+            .find(|(text, _, _, _)| text == &choice)
+            .expect("open popup choice");
+        assert!(
+            clip.contains_rect(*rect) && rect.right() <= width,
+            "{width}: {rect:?} / {clip:?}"
+        );
+        assert!(rect.height() <= 36., "popup names must stay on one line");
+        assert!(!elided, "the longest current table name must be complete");
+        let popup = ctx
+            .memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .into_iter()
+                    .filter(|layer| layer.order == egui::Order::Foreground)
+                    .filter_map(|layer| memory.area_rect(layer.id))
+                    .max_by(|a, b| a.area().total_cmp(&b.area()))
+            })
+            .expect("source popup");
+        assert!(
+            popup.width() >= rect.width() && popup.width() <= rect.width() + 80.,
+            "popup must fit its longest name: {popup:?} / {rect:?}"
+        );
     }
 }
 
@@ -136,7 +270,7 @@ fn record_managers_shrink_for_few_records_and_empty_search_results() {
                 let label = if batch {
                     "从本批移除此段"
                 } else {
-                    "编辑文本"
+                    "编辑"
                 };
                 let (_, rect, clip) = result
                     .texts
@@ -368,6 +502,48 @@ fn settle(ctx: &egui::Context, app: &mut Desktop) -> Snapshot {
     }
     result
 }
+
+#[test]
+fn template_field_changes_refresh_the_example_and_invalidate_the_previous_result() {
+    let ctx = egui::Context::default();
+    crate::theme::install(&ctx);
+    let mut app = Desktop::initial();
+    app.state = json!({"templates":bajptr_project::templates::metadata()}).into();
+    app.template_form = Some(TemplateForm {
+        key: "number".into(),
+        values: vec!["任务".into(), "委托".into()],
+        sample: "任务12完成，任务３解锁。".into(),
+        result: "委托12完成，委托３解锁。".into(),
+        built: Some(json!({})),
+        error: String::new(),
+    });
+    let initial = settle(&ctx, &mut app);
+    for label in [
+        "替换前",
+        "替换后",
+        "任务12完成，任务３解锁。",
+        "委托12完成，委托３解锁。",
+    ] {
+        assert!(initial.texts.iter().any(|(text, _, _)| text == label));
+    }
+    assert!(!initial.texts.iter().any(|(text, _, _)| text == "试写文本"));
+    app.template_form.as_mut().unwrap().values[0] = "技能".into();
+    let changed = settle(&ctx, &mut app);
+    assert!(
+        changed
+            .texts
+            .iter()
+            .any(|(text, _, _)| text == "技能12完成，技能３解锁。")
+    );
+    assert!(
+        !changed
+            .texts
+            .iter()
+            .any(|(text, _, _)| text == "委托12完成，委托３解锁。")
+    );
+    assert!(app.template_form.as_ref().unwrap().built.is_none());
+    assert!(app.pending.is_empty());
+}
 #[test]
 fn zero_change_and_short_editors_use_compact_windows() {
     for case in ["zero", "text", "batch"] {
@@ -539,7 +715,7 @@ fn filling_original_and_live_batch_result_remain_an_unsaved_draft() {
     let (_, rect, clip) = edited
         .texts
         .iter()
-        .find(|(label, _, _)| label == "保存修改")
+        .find(|(label, _, _)| label == "保存")
         .unwrap();
     assert!(
         clip.contains_rect(*rect) && rect.bottom() < 620.,

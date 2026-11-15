@@ -2,6 +2,7 @@
 use crate::{
     Control, Result, baseline, invalid, migration,
     model::{self, Edit},
+    ordering::{Sort, Timeline},
     service::{self, Config, Engine, PatchJob},
     sources::{self, Inventory, Notice, Sources},
     storage::{self, Store},
@@ -46,6 +47,8 @@ pub struct Project {
     pub edits: Vec<Edit>,
     pub game: String,
     pub skip: bool,
+    sort: Sort,
+    times: Timeline,
     pub revision: u64,
     errors: Value,
     messages: Vec<String>,
@@ -80,6 +83,8 @@ impl Project {
             edits: vec![],
             game: String::new(),
             skip: true,
+            sort: Sort::default(),
+            times: Timeline::default(),
             revision: 0,
             errors: json!({}),
             messages: vec![],
@@ -118,7 +123,7 @@ impl Project {
         if settings.exists() {
             match fs::read(&settings)
                 .map_err(crate::Error::Io)
-                .and_then(|b| Ok(serde_json::from_slice::<Value>(&b)?))
+                .and_then(|b| crate::backup::settings(&b))
             {
                 Ok(v)
                     if v["format"] == 2
@@ -127,6 +132,12 @@ impl Project {
                 {
                     self.game = v["game"].as_str().unwrap_or("").into();
                     self.skip = v["skip_kana"].as_bool().unwrap_or(true);
+                    self.sort = serde_json::from_value(
+                        v.get("replacement_sort").cloned().unwrap_or(json!("added")),
+                    )?;
+                    self.times = serde_json::from_value(
+                        v.get("replacement_times").cloned().unwrap_or(json!({})),
+                    )?;
                 }
                 result => {
                     let warning = format!(
@@ -169,6 +180,7 @@ impl Project {
         {
             self.errors["application-state.json"] = json!(error.to_string());
         }
+        self.times.observe(&self.rules, &self.edits, 0)?;
         self.state()
     }
     fn require(&self, revision: Option<&Value>) -> Result<()> {
@@ -191,6 +203,22 @@ impl Project {
         Ok(())
     }
     fn changed(&mut self) {
+        let times = (|| -> Result<()> {
+            if self.times.observe(
+                &self.rules,
+                &self.edits,
+                chrono::Utc::now().timestamp_millis().max(1) as u64,
+            )? {
+                self.save_view_settings(None)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = times {
+            let warning = format!("修改已保存，但排序时间未能保存：{error}");
+            if !self.messages.contains(&warning) {
+                self.messages.push(warning);
+            }
+        }
         self.migration_draft = Value::Null;
         self.engine.invalidate_prepared();
         self.revision += 1;
@@ -200,6 +228,30 @@ impl Project {
         self.promotion_draft = Value::Null;
         self.backup_draft = Value::Null;
         self.application = "词表已保存，尚未应用".into();
+    }
+    fn save_view_settings(&self, sort: Option<Sort>) -> Result<()> {
+        let path = self.store.root.join("settings.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let expected = bytes.as_deref().map(storage::digest);
+        let mut settings = match bytes {
+            Some(bytes) => crate::backup::settings(&bytes)?,
+            None => json!({"format":2,"game":self.game,"skip_kana":self.skip}),
+        };
+        if settings["game"].as_str().unwrap_or("") != self.game
+            || settings["skip_kana"].as_bool().unwrap_or(true) != self.skip
+        {
+            return Err(invalid("目录或选项已被其他窗口修改，请重新打开工具。"));
+        }
+        if let Some(sort) = sort {
+            settings["replacement_sort"] = json!(sort);
+        }
+        settings["replacement_times"] = json!(self.times);
+        storage::atomic_write(&path, &serde_json::to_vec(&settings)?, Some(&expected))?;
+        Ok(())
     }
     fn commit(&mut self, document: Document, record: bool) -> Result<()> {
         self.commit_controlled(document, record, &Control::new(&|_| true))
@@ -371,7 +423,7 @@ impl Project {
         control.check()?;
         let migrated = self.rules.iter().filter(|r| r.table.is_empty()).count();
         if self.current_version(control)? != version {
-            return Err(invalid("来源表核对期间资源版本发生变化，请重新检查底稿。"));
+            return Err(invalid("文本表核对期间资源版本发生变化，请重新检查底稿。"));
         }
         control.check()?;
         let commit_control = control.uncancellable();
@@ -406,7 +458,7 @@ impl Project {
             Some(&metadata),
             &commit_control,
         );
-        let _ = control.log("来源表已就绪。");
+        let _ = control.log("文本表已就绪。");
         Ok(
             json!({"tables":names.iter().map(|n|model::table_info(n)).collect::<Vec<_>>(),"state":self.state()?,"migrated":migrated,"missing_history":false}),
         )
@@ -474,7 +526,7 @@ impl Project {
         Ok(entries)
     }
     pub fn state(&self) -> Result<Value> {
-        let rules=self.rules.iter().map(|r|{let (old,new,draft)=if r.mode=="re"{self.templates.display(&r.old,&r.new)}else{(r.old.clone(),r.new.clone(),None)};json!({"rule":r,"scope":if r.table.is_empty(){"待选择来源表".into()}else{model::scope_title(&r.table)},"display_old":old,"display_new":new,"draft":draft})}).collect::<Vec<_>>();
+        let rules=self.rules.iter().enumerate().map(|(index,r)|{let stamp=self.times.rules.get(index).cloned().unwrap_or_default();let (old,new,draft)=if r.mode=="re"{self.templates.display(&r.old,&r.new)}else{(r.old.clone(),r.new.clone(),None)};json!({"rule":r,"scope":if r.table.is_empty(){"待选择文本表".into()}else{model::scope_title(&r.table)},"display_old":old,"display_new":new,"draft":draft,"added":stamp.added,"modified":stamp.modified})}).collect::<Vec<_>>();
         let key = model::game_key(&self.game)?;
         let edits=self.edits.iter().enumerate().filter(|(_,e)|e.game==key).map(|(i,e)|json!({"index":i,"edit":e,"label":model::title(&e.table),"active":self.version.as_ref().is_none_or(|v|v==&e.version)})).collect::<Vec<_>>();
         let mut batches: Vec<Value> = Vec::new();
@@ -485,6 +537,12 @@ impl Project {
             .enumerate()
             .filter(|(_, e)| e.game == key && e.batch)
         {
+            let stamp = self
+                .times
+                .batches
+                .get(&crate::ordering::batch_key(edit))
+                .cloned()
+                .unwrap_or_default();
             let active = self.version.as_ref().is_none_or(|v| v == &edit.version);
             if let Some(operation) = &edit.batch_operation {
                 if let Some(&position) = positions.get(&operation.id) {
@@ -493,14 +551,14 @@ impl Project {
                     row["active"] = json!(row["active"] == true && active);
                 } else {
                     positions.insert(operation.id.clone(), batches.len());
-                    batches.push(json!({"id":operation.id,"old":operation.old,"new":operation.new,"count":1,"active":active,"version":edit.version}));
+                    batches.push(json!({"id":operation.id,"old":operation.old,"new":operation.new,"count":1,"active":active,"version":edit.version,"added":stamp.added,"modified":stamp.modified}));
                 }
             } else {
-                batches.push(json!({"index":index,"old":edit.original,"new":edit.replacement,"count":1,"active":active,"label":model::title(&edit.table)}));
+                batches.push(json!({"index":index,"old":edit.original,"new":edit.replacement,"count":1,"active":active,"label":model::title(&edit.table),"added":stamp.added,"modified":stamp.modified}));
             }
         }
         Ok(
-            json!({"game":self.game,"version":self.version,"skip_kana":self.skip,"revision":self.revision,"rules":rules,"edits":edits,"batches":batches,"errors":self.errors,"messages":self.messages,"settings_warning":self.settings_warning,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"templates":templates::metadata(),"search":self.search_state()?,"application":self.application,"source_notices":self.source_notices()?}),
+            json!({"game":self.game,"version":self.version,"skip_kana":self.skip,"replacement_sort":self.sort,"revision":self.revision,"rules":rules,"edits":edits,"batches":batches,"errors":self.errors,"messages":self.messages,"settings_warning":self.settings_warning,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"templates":templates::metadata(),"search":self.search_state()?,"application":self.application,"source_notices":self.source_notices()?}),
         )
     }
     // Only read-operation state is rolled back by cancellation. Persisted edits are never rolled back.
@@ -640,6 +698,21 @@ impl Project {
                 self.edits = decoded.edits;
                 self.game = decoded.settings["game"].as_str().unwrap_or("").into();
                 self.skip = decoded.settings["skip_kana"].as_bool().unwrap_or(true);
+                self.sort = serde_json::from_value(
+                    decoded
+                        .settings
+                        .get("replacement_sort")
+                        .cloned()
+                        .unwrap_or(json!("added")),
+                )?;
+                self.times = serde_json::from_value(
+                    decoded
+                        .settings
+                        .get("replacement_times")
+                        .cloned()
+                        .unwrap_or(json!({})),
+                )?;
+                self.times.observe(&self.rules, &self.edits, 0)?;
                 self.source_history = decoded.sources;
                 self.templates = templates;
                 self.settings_warning = None;
@@ -662,12 +735,13 @@ impl Project {
                 let plan = self.dispatch("promotion_preview", p, control)?;
                 let retained = plan["items"].as_array().unwrap().len() as u64
                     - plan["count"].as_u64().unwrap();
-                let mut result = if plan["count"] == 0 {
-                    json!({"state":self.state()?,"count":0,"backup":null})
+                let mut result = if plan["count"] == 0 && plan["relocated"] == 0 {
+                    json!({"state":self.state()?,"count":0,"relocated":0,"backup":null})
                 } else {
                     self.dispatch("promotion_commit", &json!({"nonce":plan["nonce"]}), control)?
                 };
                 result["retained"] = json!(retained);
+                result["relocations"] = plan["relocations"].clone();
                 result["retained_items"] = json!(
                     plan["items"]
                         .as_array()
@@ -708,14 +782,16 @@ impl Project {
                     .filter(|item| item.reason.is_empty())
                     .count();
                 let nonce = nonce();
-                self.promotion_draft = json!({"nonce":nonce,"revision":self.revision,"version":version,"game":model::game_key(&self.game)?,"skip":self.skip,"token":status["token"],"rules":plan.rules,"edits":plan.edits,"count":count});
-                Ok(json!({"nonce":nonce,"items":plan.items,"count":count}))
+                self.promotion_draft = json!({"nonce":nonce,"revision":self.revision,"version":version,"game":model::game_key(&self.game)?,"skip":self.skip,"token":status["token"],"rules":plan.rules,"edits":plan.edits,"count":count,"relocated":plan.relocated});
+                Ok(
+                    json!({"nonce":nonce,"items":plan.items,"count":count,"relocated":plan.relocated,"relocations":plan.relocations}),
+                )
             }
             "promotion_commit" => {
                 let draft = self.promotion_draft.clone();
                 if draft.is_null()
                     || draft["nonce"] != p["nonce"]
-                    || draft["count"] == 0
+                    || (draft["count"] == 0 && draft["relocated"] == 0)
                     || draft["game"] != model::game_key(&self.game)?
                     || draft["skip"] != self.skip
                 {
@@ -765,7 +841,9 @@ impl Project {
                 )?;
                 self.commit_controlled(Document::Replacements(rules, edits), true, &commit)?;
                 self.promotion_draft = Value::Null;
-                Ok(json!({"state":self.state()?,"count":draft["count"],"backup":backup}))
+                Ok(
+                    json!({"state":self.state()?,"count":draft["count"],"relocated":draft["relocated"],"backup":backup}),
+                )
             }
             "combined_open" => {
                 self.require(p.get("revision"))?;
@@ -808,7 +886,7 @@ impl Project {
                     control,
                 )?)?;
                 if tables.iter().any(|table| !available.contains(table)) {
-                    return Err(invalid("整表范围包含不存在的来源表，请重新选择。"));
+                    return Err(invalid("整表范围包含不存在的文本表，请重新选择。"));
                 }
                 let removed = serde_json::from_value(p["removed"].clone())?;
                 let (rules, edits) = crate::combined::update(
@@ -919,6 +997,17 @@ impl Project {
                 *self = loaded;
                 Ok(state)
             }
+            "sort_settings" => {
+                if storage::pending_transaction(&self.store.root)
+                    || p["revision"].as_u64() != Some(self.revision)
+                {
+                    return Err(invalid("记录正在更新，请稍后重新选择排序。"));
+                }
+                let sort: Sort = serde_json::from_value(p["value"].clone())?;
+                self.save_view_settings(Some(sort))?;
+                self.sort = sort;
+                self.state()
+            }
             "settings" => {
                 if storage::pending_transaction(&self.store.root) {
                     return Err(invalid(
@@ -934,7 +1023,9 @@ impl Project {
                     .ok_or_else(|| invalid("选项格式无效。"))?;
                 storage::atomic_write(
                     &self.store.root.join("settings.json"),
-                    &serde_json::to_vec(&json!({"format":2,"game":game,"skip_kana":skip}))?,
+                    &serde_json::to_vec(
+                        &json!({"format":2,"game":game,"skip_kana":skip,"replacement_sort":self.sort,"replacement_times":self.times}),
+                    )?,
                     None,
                 )?;
                 self.settings_warning = None;

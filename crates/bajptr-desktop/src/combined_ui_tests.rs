@@ -14,7 +14,6 @@ fn combined_row_shows_one_summary_and_keeps_later_rule_editing_correct() {
         {"rule":{"old":"其他原词","new":"其他译词","mode":"exact","table":"A"}}
     ],"batches":[{"id":"batch","old":"任务","new":"委托","active":true,"version":"current","count":5}]});
     app.apply_state(state.clone());
-    app.combined_hits = vec![json!({"old":"任务","new":"委托","count":7})];
     app.rule_selection = Some(1);
     let mut frame = 0;
     let mut draw = |app: &mut Desktop, events| {
@@ -66,10 +65,9 @@ fn combined_row_shows_one_summary_and_keeps_later_rule_editing_correct() {
         .unwrap();
     assert!(clip.contains_rect(*rect));
     assert!(labels.iter().any(|(label, _, _)| label == "生效范围"));
-    assert!(labels.iter().any(|(label, _, _)| label == "7"));
     let single_button = labels
         .iter()
-        .find(|(label, _, _)| label == "单条修改（0）")
+        .find(|(label, _, _)| label == "单条修改")
         .unwrap()
         .1;
     let (_, promotion_button, promotion_clip) = labels
@@ -78,6 +76,13 @@ fn combined_row_shows_one_summary_and_keeps_later_rule_editing_correct() {
         .unwrap();
     assert!(promotion_button.left() > single_button.right());
     assert!(promotion_clip.contains_rect(*promotion_button));
+    let mut sorted = state.clone();
+    sorted["replacement_sort"] = json!("alphabetical");
+    app.apply_state(sorted);
+    assert_eq!(app.rule_selection, Some(0));
+    for _ in 0..3 {
+        labels = draw(&mut app, vec![]);
+    }
     let pos = labels
         .iter()
         .find(|(label, _, _)| label == "编辑")
@@ -104,7 +109,6 @@ fn combined_row_shows_one_summary_and_keeps_later_rule_editing_correct() {
     next["version"] = json!("next");
     app.apply_state(next);
     assert!(app.rule_selection.is_none());
-    assert!(app.combined_hits.is_empty());
 }
 
 #[test]
@@ -113,7 +117,7 @@ fn combined_editor_keeps_actions_visible_and_range_changes_are_only_a_draft() {
     crate::theme::install(&ctx);
     let mut app = Desktop::initial();
     app.loaded = true;
-    let members=(0..45).map(|index|json!({"index":index*10+10,"label":"来源表","edit":{"original":format!("任务{index}"),"replacement":format!("委托{index}"),"table":"A","batch_operation":{"before":format!("任务{index}")}}})).collect::<Vec<_>>();
+    let members=(0..45).map(|index|json!({"index":index*10+10,"label":"文本表","edit":{"original":format!("任务{index}"),"replacement":format!("委托{index}"),"table":"A","batch_operation":{"before":format!("任务{index}")}}})).collect::<Vec<_>>();
     app.tables = vec![
         json!({"name":"A","label":"界面与系统提示"}),
         json!({"name":"B","label":"任务文本"}),
@@ -162,7 +166,7 @@ fn combined_editor_keeps_actions_visible_and_range_changes_are_only_a_draft() {
     for _ in 0..3 {
         labels = draw(&mut app, vec![]);
     }
-    for label in ["保存修改", "选择来源表…", "移出所选"] {
+    for label in ["保存", "选择文本表…", "移除"] {
         let (_, rect, clip) = labels.iter().find(|(text, _, _)| text == label).unwrap();
         assert!(
             rect.bottom() < 620.,
@@ -179,6 +183,17 @@ fn combined_editor_keeps_actions_visible_and_range_changes_are_only_a_draft() {
     assert!(
         visible_members >= 4,
         "only {visible_members} list entries are visible"
+    );
+    let list_clip = labels
+        .iter()
+        .find(|(text, _, _)| text == "任务1")
+        .unwrap()
+        .2;
+    assert!(
+        !labels
+            .iter()
+            .any(|(text, _, clip)| text.starts_with("委托") && *clip == list_clip),
+        "replacement results belong in the detail pane, not the summary list"
     );
     let (_, _, detail_clip) = labels
         .iter()
@@ -236,7 +251,7 @@ fn combined_editor_keeps_actions_visible_and_range_changes_are_only_a_draft() {
         app.combined_form.as_ref().unwrap().selection.rows,
         std::collections::BTreeSet::from([10, 20, 40])
     );
-    labels = click(&mut app, &labels, "移出所选（3）", egui::Modifiers::NONE);
+    labels = click(&mut app, &labels, "移除（3）", egui::Modifiers::NONE);
     assert_eq!(
         app.combined_form.as_ref().unwrap().payload()["removed"],
         json!([10, 20, 40])
@@ -262,7 +277,7 @@ fn combined_editor_keeps_actions_visible_and_range_changes_are_only_a_draft() {
         app.combined_form.as_ref().unwrap().selection.rows,
         std::collections::BTreeSet::from([30, 50, 60])
     );
-    labels = click(&mut app, &labels, "移出所选（3）", egui::Modifiers::NONE);
+    labels = click(&mut app, &labels, "移除（3）", egui::Modifiers::NONE);
     assert_eq!(
         app.combined_form.as_ref().unwrap().payload()["removed"],
         json!([10, 20, 30, 40, 50, 60])
@@ -274,4 +289,66 @@ fn combined_editor_keeps_actions_visible_and_range_changes_are_only_a_draft() {
         json!(["A", "B"])
     );
     assert!(app.pending.is_empty());
+}
+
+#[test]
+fn combined_summary_wraps_only_before_text_into_two_lines() {
+    let ctx = egui::Context::default();
+    crate::theme::install(&ctx);
+    let before = "任务说明很长，需要折行查看完整的上下文。".repeat(8);
+    let after = before.replace("任务", "委托");
+    let mut app = Desktop::initial();
+    app.loaded = true;
+    app.combined_form = Some(CombinedForm::new(json!({
+        "nonce":"test", "old":"任务", "new":"委托", "tables":["A"],
+        "members":[{"index":10,"label":"文本表","edit":{"original":before,"replacement":after,"table":"A","batch_operation":{"before":before}}}]
+    })));
+    let mut output = None;
+    for frame in 0..3 {
+        let mut current = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900., 620.),
+                )),
+                time: Some(f64::from(frame) / 60.),
+                ..Default::default()
+            },
+            |ui| app.combined_dialog(ui.ctx()),
+        );
+        current.textures_delta.clear();
+        output = Some(current);
+    }
+    let shapes = &output.unwrap().shapes;
+    let summary_clip = shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text)
+                if text.galley.text() == before && text.galley.rows.len() == 2 =>
+            {
+                Some(shape.clip_rect)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let list_text = shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if shape.clip_rect == summary_clip => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let summary = list_text
+        .iter()
+        .find(|text| text.galley.text() == before)
+        .unwrap();
+    assert_eq!(summary.galley.rows.len(), 2);
+    assert!(
+        list_text
+            .iter()
+            .all(|text| !text.galley.text().contains("委托"))
+    );
+    assert!(shapes.iter().any(
+        |shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == after)
+    ));
 }

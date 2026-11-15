@@ -679,7 +679,7 @@ impl Rules {
         missing.dedup();
         if !missing.is_empty() {
             return Err(invalid(format!(
-                "来源表不存在或不在当前扫描范围内：{}。请检查表名或重新读取来源表。",
+                "文本表不存在或不在当前扫描范围内：{}。请检查表名或重新读取文本表。",
                 missing.join("、")
             )));
         }
@@ -704,12 +704,12 @@ impl Rules {
         for (i, r) in self.values.iter().enumerate() {
             if self.scopes[i].as_ref().is_some_and(|s| !s.contains(table)) {
                 view.excluded
-                    .push((i, "原词出现在未选中的来源表里。请核对来源范围。"));
+                    .push((i, "原词出现在未选中的文本表里。请核对来源范围。"));
                 continue;
             }
             if self.scopes[i].is_none() && overrides.contains(&(r.old.as_str(), r.mode.as_str())) {
                 view.excluded
-                    .push((i, "该来源表有同原词的专用规则，已覆盖这条全局规则。"));
+                    .push((i, "该文本表有同原词的专用规则，已覆盖这条全局规则。"));
                 continue;
             }
             view.eligible.push(i);

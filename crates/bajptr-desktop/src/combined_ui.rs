@@ -1,6 +1,6 @@
 use crate::{
     app::*,
-    dialogs::{record_browser, window},
+    dialogs::{ListSummary, comparison_browser, record_comparisons, window},
     state::*,
 };
 use eframe::egui;
@@ -12,7 +12,7 @@ impl Desktop {
         };
         let mut open = true;
         let nested = self.scope_form.is_some();
-        window("编辑替换内容与范围", ctx, 760.)
+        window("编辑批量修改", ctx, 760.)
             .id(egui::Id::unique("combined-editor-compact"))
             .min_width(560.)
             .open(&mut open)
@@ -25,7 +25,7 @@ impl Desktop {
                             ui.colored_label(RED, &form.error);
                         }
                         ui.horizontal(|ui| {
-                            if primary(ui, !form.old.is_empty(), "保存修改").clicked() {
+                            if primary(ui, !form.old.is_empty(), "保存").clicked() {
                                 self.submit(
                                     "combined_save",
                                     form.payload(),
@@ -56,8 +56,8 @@ impl Desktop {
                         .flatten()
                         .unwrap_or_default();
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("整表替换 · {} 个来源表", tables.len()));
-                        if secondary(ui, true, "选择来源表…").clicked() {
+                        ui.label(format!("整表替换 · {} 个文本表", tables.len()));
+                        if ui.button("选择文本表…").clicked() {
                             let mut scope = ScopeForm::new(&form.scope, vec![]);
                             scope.old = form.old.clone();
                             scope.mode = "sub".into();
@@ -73,11 +73,14 @@ impl Desktop {
                         ));
                         let selected_count = form.selection.rows.len();
                         let action = if selected_count > 1 {
-                            format!("移出所选（{selected_count}）")
+                            format!("移除（{selected_count}）")
                         } else {
-                            "移出所选".into()
+                            "移除".into()
                         };
-                        if secondary(ui, selected_count > 0, &action).clicked() {
+                        if ui
+                            .add_enabled(selected_count > 0, egui::Button::new(&action))
+                            .clicked()
+                        {
                             form.removed.extend(form.selection.rows.iter().copied());
                             form.selection.clear();
                             form.selected = None;
@@ -85,7 +88,7 @@ impl Desktop {
                         if ui
                             .add(
                                 egui::TextEdit::singleline(&mut form.filter)
-                                    .hint_text("搜索文本或来源表")
+                                    .hint_text("搜索文本或文本表")
                                     .desired_width(160.),
                             )
                             .changed()
@@ -111,13 +114,14 @@ impl Desktop {
                         ui.colored_label(MUTED, "没有指定文本");
                         ui.take_available_space();
                     } else {
-                        record_browser(
+                        let rows = record_comparisons(&members, &form.filter, true);
+                        comparison_browser(
                             ui,
                             "combined-members",
-                            &members,
-                            &form.filter,
+                            &rows,
                             &mut form.selected,
-                            true,
+                            ["替换前", "替换后"],
+                            ListSummary::BeforeOnly,
                             Some(&mut form.selection),
                         );
                     }

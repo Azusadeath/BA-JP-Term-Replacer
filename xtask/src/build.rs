@@ -195,7 +195,7 @@ pub fn publish(root: &Path, debug: bool) -> Result {
     )?;
     files::copy(
         &binaries.join("bajptr-launcher.exe"),
-        &root.join("BA-JPTR.exe"),
+        &root.join(bajptr_brand::LAUNCHER),
     )?;
     println!("Published: {}", native.join("engine.json").display());
     if let Err(error) = retire_old(&native, &manifest) {

@@ -62,7 +62,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "蔚蓝档案 · 日服译名替换",
+        bajptr_brand::NAME,
         options,
         Box::new(move |cc| Ok(Box::new(app::Desktop::new(cc, project, data)))),
     )

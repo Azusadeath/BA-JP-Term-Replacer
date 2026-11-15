@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
 use walkdir::WalkDir;
 
@@ -141,7 +141,7 @@ pub fn guide(markdown: &str) -> String {
 
 pub fn package(root: &Path, destination: &Path) -> Result {
     let destination = std::path::absolute(destination)?;
-    let archive = PathBuf::from(format!("{}.zip", destination.display()));
+    let archive = destination.with_file_name(format!("{}.zip", bajptr_brand::NAME));
     require(
         !archive.exists(),
         "Package archive already exists; archive the old output first.",
@@ -156,7 +156,7 @@ pub fn package(root: &Path, destination: &Path) -> Result {
         &source.join("engine.json"),
         &destination.join("native/engine.json"),
     )?;
-    for name in ["BA-JPTR.exe", "LICENSE", "THIRD_PARTY_NOTICES.md"] {
+    for name in [bajptr_brand::LAUNCHER, "LICENSE", "THIRD_PARTY_NOTICES.md"] {
         copy(&root.join(name), &destination.join(name))?;
     }
     let mut readme = vec![0xef, 0xbb, 0xbf];
@@ -307,7 +307,7 @@ mod tests {
             write(&root.join("native").join(path), b"engine")?;
         }
         for name in [
-            "BA-JPTR.exe",
+            bajptr_brand::LAUNCHER,
             "LICENSE",
             "THIRD_PARTY_NOTICES.md",
             "licenses/中文.txt",
@@ -328,8 +328,9 @@ mod tests {
             std::str::from_utf8(&readme[3..])?,
             "标题\r\n说明 code\r\n网页 (https://example.com)\r\n"
         );
-        let mut zip =
-            zip::ZipArchive::new(fs::File::open(format!("{}.zip", destination.display()))?)?;
+        let mut zip = zip::ZipArchive::new(fs::File::open(
+            destination.with_file_name(format!("{}.zip", bajptr_brand::NAME)),
+        )?)?;
         assert!(zip.by_name("BA-JPTR/licenses/中文.txt").is_ok());
         assert!(zip.file_names().all(|name| name.starts_with("BA-JPTR/")
             && !name.contains(".gui")

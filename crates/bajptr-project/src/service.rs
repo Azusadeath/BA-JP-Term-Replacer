@@ -520,25 +520,6 @@ impl Engine {
                 control,
             )?;
             value["comparison_identity"] = identity.clone();
-            if value["parse_failed"] == 0 {
-                value["combined_hits"] = crate::combined::hits(
-                    &self.session.database.as_ref().unwrap().con,
-                    &config.rules,
-                    &config.edits,
-                    &storage::identity(&live.dir)?,
-                    &original.version,
-                    config.skip_kana,
-                    control,
-                )?;
-            }
-            value["rule_hits"] = json!(
-                config
-                    .rules
-                    .iter()
-                    .zip(value["hits"].as_array().unwrap())
-                    .map(|(r, h)| json!([r.old, r.new, r.mode, r.source, r.table, h]))
-                    .collect::<Vec<_>>()
-            );
             value["zero_reasons"] = json!(
                 value["zero_reasons"]
                     .as_array()

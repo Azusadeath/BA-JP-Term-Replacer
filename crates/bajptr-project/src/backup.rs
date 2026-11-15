@@ -42,6 +42,12 @@ pub fn settings(bytes: &[u8]) -> Result<Value> {
     {
         return Err(invalid("设置文件格式无效。"));
     }
+    if let Some(sort) = value.get("replacement_sort") {
+        serde_json::from_value::<crate::ordering::Sort>(sort.clone())?;
+    }
+    if let Some(times) = value.get("replacement_times") {
+        serde_json::from_value::<crate::ordering::Timeline>(times.clone())?;
+    }
     Ok(value)
 }
 pub fn capture(root: &Path, control: &Control<'_>) -> Result<Snapshot> {

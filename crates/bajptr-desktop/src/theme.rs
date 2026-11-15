@@ -22,6 +22,8 @@ pub fn install(ctx: &egui::Context) -> bool {
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
     style.visuals = egui::Visuals::light();
+    style.url_in_tooltip = false;
+    style.explanation_tooltips = false;
     style.visuals.panel_fill = BG;
     style.visuals.window_fill = Color32::WHITE;
     style.visuals.override_text_color = Some(TEXT);
@@ -155,17 +157,17 @@ impl Icon {
             "撤销" => Self::Undo,
             "重做" => Self::Redo,
             "恢复备份" => Self::Import,
-            "导出备份" | "导出底稿文本" | "导出日志" => Self::Export,
-            "预览替换" | "预览选中" | "预览并应用" => Self::Preview,
+            "导出" | "导出底稿文本" | "导出日志" => Self::Export,
+            "预览并应用" | "预览替换" | "预览选中" => Self::Preview,
             "应用到游戏" => Self::Apply,
-            "保存词条" | "保存修改" => Self::Save,
+            "保存" => Self::Save,
             "填入词条" => Self::Insert,
             "确定" => Self::Confirm,
             "填回原文" => Self::Restore,
             "整理批量修改" => Self::Merge,
             "从本批移除此段" => Self::MoveOut,
             "定位词条" => Self::Locate,
-            "选择来源表…" => Self::Tables,
+            "选择文本表…" => Self::Tables,
             "清空记录…" | "确认清空" => Self::Remove,
             "选择文件夹" | "打开输出目录" | "打开底稿位置" | "打开数据目录" | "打开备份位置" => {
                 Self::Folder
@@ -174,13 +176,12 @@ impl Icon {
                 Self::Refresh
             }
             "查找" => Self::Search,
-            "查看日志" | "来源表详情" | "关于 BA-JPTR" | "使用说明" => Self::Info,
+            "查看日志" | "文本表详情" | "关于 BA-JPTR" | "使用说明" => Self::Info,
             "取消任务" => Self::Close,
             "替换选中文本" | "替换" => Self::Replace,
             "恢复底稿" | "恢复初始底稿" | "恢复" => Self::Restore,
             "工具" => Self::Tools,
             _ if label.starts_with("单条修改") => Self::Text,
-            _ if label.starts_with("移出所选") => Self::MoveOut,
             _ if label.starts_with("保存已确认") => Self::Save,
             _ if label.starts_with("确认本组") => Self::Confirm,
             _ => return None,
@@ -525,7 +526,7 @@ mod tests {
                     },
                     |ui| {
                         let response = ui
-                            .add_enabled_ui(!inherited, |ui| primary(ui, inherited, "保存修改"))
+                            .add_enabled_ui(!inherited, |ui| primary(ui, inherited, "保存"))
                             .inner;
                         rect = response.rect;
                         enabled = response.enabled();
@@ -540,7 +541,7 @@ mod tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.job.text == "保存修改" => {
+                    egui::Shape::Text(text) if text.galley.job.text == "保存" => {
                         text.override_text_color.or_else(|| {
                             text.galley
                                 .rows

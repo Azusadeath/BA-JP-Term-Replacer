@@ -10,9 +10,10 @@ pub fn user_message(action: &str, error: &Error) -> String {
         "apply" => "应用到游戏",
         "restore" => "恢复初始底稿",
         "preview" | "prepare_patch" => "准备替换",
-        "sources" => "同步来源表",
+        "sources" => "同步文本表",
         "import_read" | "import_commit" => "导入词表",
-        "save_rule" | "text_save" | "batch_save" | "combined_save" | "settings" => "保存记录",
+        "save_rule" | "text_save" | "batch_save" | "combined_save" | "settings"
+        | "sort_settings" => "保存记录",
         "combined_remove" => "移除替换",
         "combined_open" => "读取替换范围",
         "promotion_preview" => "核对批量修改",
@@ -37,7 +38,7 @@ pub fn user_message(action: &str, error: &Error) -> String {
             format!("{operation}失败：资源内容无法解析。请检查游戏资源与底稿，详细原因见日志。")
         }
         Error::Regex(_) => "正则表达式或替换内容无法处理，请检查词条；详细原因见日志。".into(),
-        Error::UnsupportedTable(_) => "此来源表的结构暂不支持，请查看日志中的来源信息。".into(),
+        Error::UnsupportedTable(_) => "此文本表的结构暂不支持，请查看日志中的来源信息。".into(),
         Error::Rule {
             index,
             original,
@@ -52,7 +53,7 @@ pub fn user_message(action: &str, error: &Error) -> String {
             record,
             source,
         } => format!(
-            "来源表 {table}，记录 {record}：{}",
+            "文本表 {table}，记录 {record}：{}",
             user_message(action, source)
         ),
         Error::Cancelled => "操作已取消。".into(),

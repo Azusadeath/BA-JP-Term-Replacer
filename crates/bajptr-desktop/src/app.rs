@@ -71,8 +71,6 @@ pub struct Desktop {
     pub baseline_check: Value,
     pub baseline: Value,
     pub output_dir: PathBuf,
-    pub hits: Vec<u64>,
-    pub combined_hits: Vec<Value>,
     pub table_detail: Option<Value>,
     pub startup_probe: Option<crate::startup::Probe>,
 }
@@ -166,8 +164,6 @@ impl Desktop {
             baseline_check: Value::Null,
             baseline: Value::Null,
             output_dir: PathBuf::from("output"),
-            hits: Vec::new(),
-            combined_hits: Vec::new(),
             table_detail: None,
             startup_probe: crate::startup::Probe::from_environment(),
         }
@@ -226,8 +222,6 @@ impl Desktop {
         self.baseline_check = Value::Null;
         self.baseline = Value::Null;
         self.preview = None;
-        self.hits.clear();
-        self.combined_hits.clear();
         self.search_input_changed();
         if self.busy.as_ref().is_some_and(|busy| {
             self.pending.get(&busy.id).is_some_and(|action| {
@@ -357,8 +351,6 @@ impl Desktop {
         self.selection.clear();
         self.preview = None;
         self.preview_row = None;
-        self.hits.clear();
-        self.combined_hits.clear();
         self.tables.clear();
         self.baseline = Value::Null;
         self.baseline_check = Value::Null;
@@ -412,7 +404,7 @@ impl Desktop {
             return;
         }
         self.sources_ready = false;
-        self.submit("sources", json!({}), "正在核对来源表与词条范围…");
+        self.submit("sources", json!({}), "正在核对文本表与词条范围…");
     }
     fn set_baseline(&mut self, baseline: Value) {
         if self.baseline["version_id"] != baseline["version_id"] {
@@ -429,7 +421,7 @@ impl Desktop {
         self.submit(
             "scope_sources",
             json!({"old":form.old,"mode":form.mode}),
-            "正在查找匹配的来源表…",
+            "正在查找匹配的文本表…",
         );
         form.request = self.busy.as_ref().map(|busy| busy.id);
     }
@@ -449,7 +441,7 @@ impl Desktop {
                     && form.request == Some(busy.id)
                 {
                     form.request = None;
-                    form.error = "已取消读取，可点击刷新重试。".into();
+                    form.error = "已取消读取，请关闭后重新选择文本表。".into();
                 }
             }
             if let Some(backend) = &mut self.backend {
@@ -477,6 +469,20 @@ impl Desktop {
         );
     }
     pub fn apply_state(&mut self, value: Value) {
+        for message in list(&value, "messages") {
+            if !slice(&self.state, "messages").contains(&message)
+                && let Some(message) = message.as_str()
+            {
+                self.log(message.into(), Some(crate::logging::Level::Warning));
+            }
+        }
+        let sort_changed = value["replacement_sort"] != self.state["replacement_sort"];
+        let selected = if sort_changed {
+            self.rule_selection
+                .and_then(|index| replacement_rows(&self.state).get(index).cloned())
+        } else {
+            None
+        };
         if value["settings_warning"] != self.state["settings_warning"] {
             self.settings_warning = value["settings_warning"].as_str().map(str::to_string);
         }
@@ -492,8 +498,6 @@ impl Desktop {
             .unwrap_or(true);
         if changed {
             self.edit_view.selected = None;
-            self.hits.clear();
-            self.combined_hits.clear();
             self.preview = None;
             self.rule_selection = None;
             self.reveal_rule = None;
@@ -531,6 +535,14 @@ impl Desktop {
             .filter(|e| e["active"] == false)
             .count();
         self.state = value.into();
+        if sort_changed && !changed && !game_changed {
+            self.rule_selection = selected.and_then(|selected| {
+                replacement_rows(&self.state)
+                    .iter()
+                    .position(|row| *row == selected)
+            });
+            self.reveal_rule = None;
+        }
     }
     pub fn open_text(&mut self, index: usize) {
         if !self.connected || self.busy.is_some() || self.modal() {
@@ -675,7 +687,7 @@ impl Desktop {
                     && form.request == Some(id)
                 {
                     form.request = None;
-                    form.error = "已取消读取，可点击刷新重试。".into();
+                    form.error = "已取消读取，请关闭后重新选择文本表。".into();
                 }
                 self.status = "已取消，保留上次结果。".into();
                 continue;
@@ -790,7 +802,13 @@ impl Desktop {
             match action.as_str() {
                 "promotion_start" => {
                     self.apply_state(data["state"].clone());
-                    self.status = if count(&data, "count") > 0 {
+                    self.status = if count(&data, "relocated") > 0 {
+                        format!(
+                            "已重新定位 {} 段文本，整理 {} 个整表范围。",
+                            count(&data, "relocated"),
+                            count(&data, "count")
+                        )
+                    } else if count(&data, "count") > 0 {
                         format!(
                             "已整理 {} 个整表范围，另有 {} 个范围保留指定文本。",
                             count(&data, "count"),
@@ -799,6 +817,24 @@ impl Desktop {
                     } else {
                         "没有可转换的整表范围，现有批量修改已保留。".into()
                     };
+                    if count(&data, "retained") > 0
+                        || slice(&data, "relocations")
+                            .iter()
+                            .any(|item| item["moved"] == false)
+                    {
+                        self.status.push_str("原因与处理方法见日志。");
+                    }
+                    for item in slice(&data, "relocations") {
+                        self.log(
+                            format!(
+                                "核对修改位置：{} · {}：{}",
+                                text(item, "label"),
+                                text(item, "original"),
+                                text(item, "reason")
+                            ),
+                            None,
+                        );
+                    }
                     if data["backup"].is_string() {
                         self.log(
                             format!("整理前的记录已备份：{}", text(&data, "backup")),
@@ -825,12 +861,6 @@ impl Desktop {
                 "load" => {
                     self.apply_state(data);
                     self.loaded = true;
-                    for message in list(&self.state, "messages")
-                        .iter()
-                        .filter_map(Value::as_str)
-                    {
-                        self.log(message.into(), Some(crate::logging::Level::Warning));
-                    }
                     if !self.healthy() {
                         let errors = self.state["errors"]
                             .as_object()
@@ -860,6 +890,10 @@ impl Desktop {
                     if !self.path_dirty {
                         self.submit("check", json!({}), "正在检查游戏目录…");
                     }
+                }
+                "sort_settings" => {
+                    self.apply_state(data);
+                    self.restore_context_status();
                 }
                 "check" => {
                     if self.path_dirty || text(&self.state, "game") != self.game {
@@ -919,8 +953,6 @@ impl Desktop {
                     self.search = Value::Null.into();
                     self.selection.clear();
                     self.preview = None;
-                    self.hits.clear();
-                    self.combined_hits.clear();
                     self.tables.clear();
                     self.submit("check", json!({}), "底稿已保存，正在核对…");
                 }
@@ -1006,7 +1038,7 @@ impl Desktop {
                     self.tables = list(&data, "tables");
                     self.sources_ready = data["missing_history"] != true;
                     if !self.sources_ready {
-                        self.error = Some("没有找到旧词条上次记录的来源表。请逐条选择来源范围后再预览；未自动把当前新表加入旧词条。".into());
+                        self.error = Some("没有找到旧词条上次记录的文本表。请逐条选择来源范围后再预览；未自动把当前新表加入旧词条。".into());
                     } else if !slice(&self.state, "source_notices").is_empty() {
                         self.show_source_notices = true;
                     }
@@ -1104,11 +1136,7 @@ impl Desktop {
                                 == f.values.iter().map(|s| json!(s)).collect::<Vec<_>>()
                             && text(draft, "sample") == f.sample
                         {
-                            f.result = format!(
-                                "{}（{} 处）",
-                                text(&data, "sample"),
-                                count(&data, "count")
-                            );
+                            f.result = text(&data, "sample");
                             f.built = Some(data);
                             f.error.clear();
                         }
@@ -1119,22 +1147,16 @@ impl Desktop {
                     if let Some(application) = data["application"].as_str() {
                         self.application = application.into();
                     }
-                    self.combined_hits = list(&data["stats"], "combined_hits");
-                    self.hits = list(&data["stats"], "rule_hits")
-                        .iter()
-                        .map(|r| {
-                            r.as_array()
-                                .and_then(|a| a.last())
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0)
-                        })
-                        .collect();
                     self.preview_row = if list(&data["stats"], "changes").is_empty() {
                         None
                     } else {
                         Some(0)
                     };
-                    self.status = format!("预览完成：{} 处变化。", count(&data, "total_changes"));
+                    self.status = if self.application == "当前游戏文字与词表一致" {
+                        String::new()
+                    } else {
+                        format!("预览完成：{} 处变化。", count(&data, "total_changes"))
+                    };
                     let can_prepare = count(&data, "total_changes") > 0
                         && count(&data["stats"], "parse_failed") == 0;
                     let nonce = text(&data, "nonce");
@@ -1251,7 +1273,9 @@ impl eframe::App for Desktop {
                                 && self.busy.is_none()
                                 && self.application != self.status)
                                 .then_some(self.application.as_str())
-                                .filter(|label| !label.is_empty());
+                                .filter(|label| {
+                                    !label.is_empty() && *label != "当前游戏文字与词表一致"
+                                });
                             let application_width = application.map_or(0., |label| {
                                 ui.painter()
                                     .layout_no_wrap(
@@ -1285,11 +1309,20 @@ impl eframe::App for Desktop {
                                     ui.set_min_width(width);
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(&self.status).size(13.).color(MUTED),
+                                            RichText::new(
+                                                if self.status == "当前游戏文字与词表一致"
+                                                {
+                                                    ""
+                                                } else {
+                                                    &self.status
+                                                },
+                                            )
+                                            .size(13.)
+                                            .color(MUTED),
                                         )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&self.status);
+                                        .truncate()
+                                        .show_tooltip_when_elided(false),
+                                    );
                                 },
                             );
                             if let Some(label) = application {
@@ -1297,9 +1330,9 @@ impl eframe::App for Desktop {
                                     [application_width, 36.],
                                     egui::Label::new(RichText::new(label).size(13.).color(MUTED))
                                         .halign(egui::Align::RIGHT)
-                                        .truncate(),
-                                )
-                                .on_hover_text(label);
+                                        .truncate()
+                                        .show_tooltip_when_elided(false),
+                                );
                             }
                             if cancellable && secondary(ui, true, "取消任务").clicked() {
                                 self.cancel();
@@ -1352,7 +1385,8 @@ pub fn table_header(ui: &mut egui::Ui, values: &[&str], widths: &[f32]) {
             egui::Label::new(RichText::new(*value).size(13.).color(MUTED))
                 .selectable(false)
                 .halign(egui::Align::LEFT)
-                .truncate(),
+                .truncate()
+                .show_tooltip_when_elided(false),
         );
         x += widths[i];
     }
@@ -1414,7 +1448,8 @@ pub fn data_row(
                     egui::Label::new(RichText::new(value).size(15.5))
                         .selectable(false)
                         .halign(egui::Align::LEFT)
-                        .truncate(),
+                        .truncate()
+                        .show_tooltip_when_elided(false),
                 );
                 x += widths[i];
             }
@@ -1941,7 +1976,7 @@ mod view_tests {
                 .unwrap()
                 .1;
             assert_eq!(row, selected_row, "selection must not move the table");
-            for title in ["本次文本", "来源表"] {
+            for title in ["本次文本", "文本表"] {
                 let header = labels.iter().find(|(text, _)| text == title).unwrap().1;
                 assert!(edit.bottom() < header.top(), "toolbar overlaps {title}");
                 assert!(header.bottom() < row.top());
@@ -2374,7 +2409,7 @@ mod view_tests {
     }
 
     #[test]
-    fn checking_baseline_keeps_directory_layout_until_the_result() {
+    fn directory_controls_stay_in_tools_before_during_and_after_a_failed_check() {
         for connected in [false, true] {
             let ctx = egui::Context::default();
             crate::theme::install(&ctx);
@@ -2386,7 +2421,6 @@ mod view_tests {
             app.backend = Some(Backend::start(&data, &data, ctx.clone()).unwrap());
             app.connected = connected;
             app.loaded = true;
-            app.game = "connected-game".into();
             app.state = Arc::new(json!({"game":"connected-game","revision":0}));
             let mut frame = 0;
             let mut draw = |app: &mut Desktop, events| {
@@ -2395,7 +2429,7 @@ mod view_tests {
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
-                            egui::vec2(1080., 680.),
+                            egui::vec2(900., 620.),
                         )),
                         time: Some(f64::from(frame) / 60.),
                         events,
@@ -2422,13 +2456,35 @@ mod view_tests {
                     .collect::<Vec<_>>()
             };
             let mut header = Vec::new();
+            app.loaded = false;
             for _ in 0..3 {
                 header = draw(&mut app, vec![]);
             }
-            assert_eq!(
-                header.iter().any(|(label, _)| label == "游戏目录"),
-                !connected,
-                "the main page must expose directory controls only when needed"
+            assert!(!header.iter().any(|(label, _)| label == "尚未配置游戏目录"));
+            app.loaded = true;
+            for tab in [0, 1] {
+                app.tab = tab;
+                for _ in 0..3 {
+                    header = draw(&mut app, vec![]);
+                }
+                assert!(header.iter().any(|(label, _)| label == "尚未配置游戏目录"));
+                assert!(!header.iter().any(|(label, _)| label == "游戏目录"));
+            }
+            assert!(!header.iter().any(|(label, _)| label == "前往工具页"));
+            app.tab = 2;
+            let header = draw(&mut app, vec![]);
+            assert!(header.iter().any(|(label, _)| label == "游戏目录"));
+            assert!(!header.iter().any(|(label, _)| label == "尚未配置游戏目录"));
+            app.game = "connected-game".into();
+            app.tab = 0;
+            let mut header = Vec::new();
+            for _ in 0..3 {
+                header = draw(&mut app, vec![]);
+            }
+            assert!(!header.iter().any(|(label, _)| label == "尚未配置游戏目录"));
+            assert!(
+                !header.iter().any(|(label, _)| label == "游戏目录"),
+                "directory controls belong only in tools"
             );
             for label in ["工具", "检查底稿"] {
                 for _ in 0..3 {
@@ -2476,8 +2532,8 @@ mod view_tests {
                 1,
                 "checking must preserve the chosen directory layout"
             );
-            // The worker has no loaded game, so this check must fail. Consume
-            // the real error to verify that failure still exposes the editor.
+            // The worker has no loaded game; consume the real failure to verify
+            // it does not move directory controls back onto the main page.
             let deadline = Instant::now() + Duration::from_secs(2);
             while app.busy.is_some() && Instant::now() < deadline {
                 app.events();
@@ -2495,7 +2551,7 @@ mod view_tests {
             );
             app.tab = 0;
             let header = draw(&mut app, vec![]);
-            assert!(header.iter().any(|(label, _)| label == "游戏目录"));
+            assert!(!header.iter().any(|(label, _)| label == "游戏目录"));
         }
     }
 
@@ -2908,7 +2964,7 @@ fn backup_controls_and_restore_summary_remain_visible_at_minimum_size() {
     for _ in 0..3 {
         labels = draw(&mut app, false);
     }
-    for label in ["导出备份", "恢复备份"] {
+    for label in ["导出", "恢复"] {
         let (_, rect, clip) = labels.iter().find(|(text, _, _)| text == label).unwrap();
         assert!(clip.contains_rect(*rect));
     }

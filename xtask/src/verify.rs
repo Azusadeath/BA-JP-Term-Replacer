@@ -213,7 +213,7 @@ pub fn portable(options: &VerifyOptions) -> Result {
     fs::create_dir_all(&foreign)?;
     let profile = work.join("Clean user");
     let startup = work.join("gui-startup.json");
-    let mut command = clean_command(&copy.join("BA-JPTR.exe"), &foreign, &profile)?;
+    let mut command = clean_command(&copy.join(bajptr_brand::LAUNCHER), &foreign, &profile)?;
     command.env("BAJPTR_STARTUP_REPORT", &startup);
     let mut launcher = ChildGuard(command.spawn()?);
     let mut observed = None;

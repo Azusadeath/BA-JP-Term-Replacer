@@ -22,7 +22,7 @@ use std::{
 #[command(
     name = "bajptr-rs",
     version,
-    about = "蔚蓝档案日服译名替换工具（纯 Rust）"
+    about = "BA-JP-Term-Replacer（BA-JPTR）· 蔚蓝档案日服译名替换工具"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -92,7 +92,7 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// 导出为每个来源表一个 TSV
+    /// 导出为每个文本表一个 TSV
     Export {
         #[command(flatten)]
         source: Source,

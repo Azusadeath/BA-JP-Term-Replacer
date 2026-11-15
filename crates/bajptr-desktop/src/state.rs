@@ -38,7 +38,7 @@ pub fn mode_name(mode: &str) -> &'static str {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ReplacementRow {
     Rule(usize),
     Batch(usize),
@@ -103,7 +103,100 @@ pub fn replacement_rows(state: &Value) -> Vec<ReplacementRow> {
             .filter(|index| !used_batches.contains(index))
             .map(ReplacementRow::Batch),
     );
+    let entries = |row: &ReplacementRow| -> Vec<&Value> {
+        match row {
+            ReplacementRow::Rule(index) => vec![&rules[*index]],
+            ReplacementRow::Batch(index) => vec![&batches[*index]],
+            ReplacementRow::Combined {
+                rules: indices,
+                batches: batch_indices,
+            } => indices
+                .iter()
+                .map(|&i| &rules[i])
+                .chain(batch_indices.iter().map(|&i| &batches[i]))
+                .collect(),
+        }
+    };
+    match state["replacement_sort"].as_str().unwrap_or("added") {
+        "alphabetical" => rows.sort_by_cached_key(|row| {
+            let name = match row {
+                ReplacementRow::Rule(index) => rules[*index]["display_old"]
+                    .as_str()
+                    .or(rules[*index]["rule"]["old"].as_str())
+                    .unwrap_or(""),
+                ReplacementRow::Batch(index) => batches[*index]["old"].as_str().unwrap_or(""),
+                ReplacementRow::Combined { rules: indices, .. } => rules[indices[0]]["display_old"]
+                    .as_str()
+                    .or(rules[indices[0]]["rule"]["old"].as_str())
+                    .unwrap_or(""),
+            };
+            alphabetical_key(name)
+        }),
+        mode => rows.sort_by_cached_key(|row| {
+            let entries = entries(row);
+            let stamp = if mode == "modified" {
+                entries
+                    .iter()
+                    .map(|entry| count(entry, "modified"))
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                entries
+                    .iter()
+                    .map(|entry| count(entry, "added"))
+                    .min()
+                    .unwrap_or(0)
+            };
+            std::cmp::Reverse(stamp)
+        }),
+    }
     rows
+}
+
+fn alphabetical_key(text: &str) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{LCMAP_SORTKEY, LCMapStringEx, NORM_IGNORECASE};
+        let locale: Vec<u16> = "zh-CN\0".encode_utf16().collect();
+        let source: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let flags = LCMAP_SORTKEY | NORM_IGNORECASE;
+        // SAFETY: locale/source are NUL-terminated; a null output with size zero queries the byte count.
+        let length = unsafe {
+            LCMapStringEx(
+                locale.as_ptr(),
+                flags,
+                source.as_ptr(),
+                -1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        if length > 0 {
+            let mut key = vec![0u8; length as usize];
+            // SAFETY: LCMAP_SORTKEY writes bytes, despite the wide-pointer signature; key has the queried byte capacity.
+            let written = unsafe {
+                LCMapStringEx(
+                    locale.as_ptr(),
+                    flags,
+                    source.as_ptr(),
+                    -1,
+                    key.as_mut_ptr().cast(),
+                    length,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            if written > 0 {
+                key.truncate(written as usize);
+                return key;
+            }
+        }
+    }
+    text.to_lowercase().into_bytes()
 }
 
 pub struct CombinedForm {
@@ -367,7 +460,7 @@ impl ScopeForm {
     }
     pub fn encode(&self) -> Result<String, String> {
         if self.checked.is_empty() {
-            Err("请至少选择一张来源表。".into())
+            Err("请至少选择一张文本表。".into())
         } else if self.checked.len() == 1 {
             Ok(self.checked.first().unwrap().clone())
         } else {
@@ -447,9 +540,118 @@ pub struct TemplateForm {
     pub error: String,
 }
 
+impl TemplateForm {
+    pub fn example(&self) -> String {
+        let Some(first) = self.values.first().filter(|value| !value.is_empty()) else {
+            return String::new();
+        };
+        match self.key.as_str() {
+            "aliases" => {
+                let names = first
+                    .split([';', '；'])
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>();
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}正在交谈。", names.join("与"))
+                }
+            }
+            "prefix" => format!("{first}完成后，领取{first}奖励。"),
+            "suffix" => format!("请{first}确认，欢迎回来，{first}"),
+            "between" => self
+                .values
+                .get(1)
+                .filter(|value| !value.is_empty())
+                .map(|last| format!("查看{first}原有内容{last}详情。"))
+                .unwrap_or_default(),
+            "number" => format!("{first}12完成，{first}３解锁。"),
+            _ => String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_sorting_uses_pinyin_and_timestamps_without_changing_rule_indices() {
+        let mut state = json!({"rules":[
+            {"display_old":"体力","rule":{"old":"体力","mode":"exact"},"added":10,"modified":60},
+            {"display_old":"阿罗娜","rule":{"old":"阿罗娜","mode":"exact"},"added":30,"modified":40},
+            {"display_old":"任务","rule":{"old":"任务","mode":"exact"},"added":20,"modified":50}
+        ]});
+        let indices = |state: &Value| {
+            replacement_rows(state)
+                .into_iter()
+                .map(|row| match row {
+                    ReplacementRow::Rule(index) => index,
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        state["replacement_sort"] = json!("alphabetical");
+        assert_eq!(indices(&state), vec![1, 2, 0]);
+        state["replacement_sort"] = json!("modified");
+        assert_eq!(indices(&state), vec![0, 2, 1]);
+        state["replacement_sort"] = json!("added");
+        assert_eq!(indices(&state), vec![1, 2, 0]);
+        assert_eq!(state["rules"][0]["rule"]["old"], "体力");
+    }
+
+    #[test]
+    fn template_examples_follow_fields_and_demonstrate_the_actual_regex() {
+        for (key, values, expected, count) in [
+            (
+                "aliases",
+                vec!["体力；AP", "行动力"],
+                "行动力与行动力正在交谈。",
+                2,
+            ),
+            (
+                "prefix",
+                vec!["任务", "委托"],
+                "委托完成后，领取任务奖励。",
+                1,
+            ),
+            (
+                "suffix",
+                vec!["老师", "先生"],
+                "请老师确认，欢迎回来，先生",
+                1,
+            ),
+            (
+                "between",
+                vec!["【", "】", "限时活动"],
+                "查看【限时活动】详情。",
+                1,
+            ),
+            (
+                "number",
+                vec!["任务", "委托"],
+                "委托12完成，委托３解锁。",
+                2,
+            ),
+        ] {
+            let mut form = TemplateForm {
+                key: key.into(),
+                values: values.into_iter().map(str::to_string).collect(),
+                sample: String::new(),
+                result: String::new(),
+                built: None,
+                error: String::new(),
+            };
+            let (old, new) = bajptr_project::templates::build(&form.key, &form.values).unwrap();
+            assert_eq!(
+                bajptr_core::rules::regex_sample(&old, &new, &form.example()).unwrap(),
+                (expected.to_string(), count)
+            );
+            form.values[0].clear();
+            assert!(form.example().is_empty());
+        }
+    }
 
     #[test]
     fn combined_rows_only_join_current_literal_substrings_with_the_same_pair() {

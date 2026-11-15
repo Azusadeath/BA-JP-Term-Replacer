@@ -7,7 +7,7 @@ use bajptr_core::{
     rules::{Rule, Rules},
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Serialize)]
 pub struct Item {
@@ -22,6 +22,129 @@ pub struct Plan {
     pub items: Vec<Item>,
     pub rules: Vec<Rule>,
     pub edits: Vec<Edit>,
+    pub relocated: usize,
+    pub relocations: Vec<Relocation>,
+}
+
+#[derive(Serialize)]
+pub struct Relocation {
+    pub table: String,
+    pub label: String,
+    pub original: String,
+    pub moved: bool,
+    pub reason: String,
+}
+
+fn relocate(
+    con: &rusqlite::Connection,
+    edits: &[Edit],
+    game: &str,
+    version: &str,
+    available: &[String],
+    control: &Control<'_>,
+) -> Result<(Vec<Edit>, Vec<Relocation>)> {
+    let mut values = edits.to_vec();
+    let mut notes = Vec::new();
+    let mut tables = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, edit) in edits
+        .iter()
+        .enumerate()
+        .filter(|(_, edit)| edit.game == game && edit.version == version)
+    {
+        tables.entry(&edit.table).or_default().push(index);
+    }
+    for (table, indices) in tables {
+        control.log(&format!("核对修改位置：{}", model::title(table)))?;
+        let mut groups = Vec::<Vec<usize>>::new();
+        let mut positions = HashMap::new();
+        let mut candidates = HashMap::<&str, Vec<(database::RowId, usize)>>::new();
+        for index in indices {
+            let edit = &edits[index];
+            let position = *positions
+                .entry((edit.row_id.clone(), edit.slot))
+                .or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+            groups[position].push(index);
+            if !edit.original.is_empty() {
+                candidates.entry(&edit.original).or_default();
+            }
+        }
+        let mut verified = HashSet::new();
+        let exists = available.iter().any(|name| name == table);
+        if exists {
+            database::visit_table(con, table, control, |row| {
+                let address = (row.1, row.2);
+                if let Some(&position) = positions.get(&address)
+                    && edits[groups[position][0]].original == row.3
+                {
+                    verified.insert(address.clone());
+                }
+                if let Some(matches) = candidates.get_mut(row.3.as_str())
+                    && matches.len() < 2
+                {
+                    matches.push(address);
+                }
+                Ok(())
+            })?;
+        }
+        let mut claims = HashMap::new();
+        for group in &groups {
+            let edit = &edits[group[0]];
+            if !verified.contains(&(edit.row_id.clone(), edit.slot))
+                && let Some(matches) = candidates.get(edit.original.as_str())
+                && matches.len() == 1
+            {
+                *claims.entry(matches[0].clone()).or_insert(0) += 1;
+            }
+        }
+        for group in groups {
+            control.check()?;
+            let edit = &edits[group[0]];
+            if verified.contains(&(edit.row_id.clone(), edit.slot)) {
+                continue;
+            }
+            let matches = candidates
+                .get(edit.original.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut moved = false;
+            let reason = if !exists {
+                "当前底稿中没有这张文本表，请检查游戏目录和版本。".into()
+            } else if edit.original.is_empty() {
+                "保存的原文为空，无法通过全文确定位置。".into()
+            } else if matches.is_empty() {
+                "未找到完整原文，请在「查找」中核对文字是否已变化。".into()
+            } else if matches.len() > 1 {
+                "多处文本与完整原文相同，无法唯一确定位置。请在「编辑批量修改」或「单条修改」中移除旧记录，再从「查找」选择所需文本。".into()
+            } else if positions.contains_key(&matches[0]) {
+                "对应文本已有其他修改，未覆盖。请先核对现有修改和旧记录。".into()
+            } else if claims[&matches[0]] > 1 {
+                "多条旧记录指向同一段文本，无法确定对应关系。请核对后移除重复旧记录。".into()
+            } else {
+                let (row_id, slot) = &matches[0];
+                for index in group {
+                    values[index].row_id = row_id.clone();
+                    values[index].slot = *slot;
+                }
+                moved = true;
+                format!(
+                    "完整原文唯一匹配，已重新定位到记录 {}，字段 {slot}。",
+                    row_id.display()
+                )
+            };
+            notes.push(Relocation {
+                table: table.into(),
+                label: model::title(table),
+                original: edit.original.clone(),
+                moved,
+                reason,
+            });
+        }
+    }
+    model::validate_edits(&values)?;
+    Ok((values, notes))
 }
 
 fn extend_scope(rules: &[Rule], old: &str, new: &str, table: &str) -> Result<Vec<Rule>> {
@@ -70,6 +193,14 @@ pub fn plan(
     control: &Control<'_>,
 ) -> Result<Plan> {
     model::validate_edits(edits)?;
+    let tables = database::tables(con, &database::default_tables())?;
+    let (located, relocations) = relocate(con, edits, game, version, &tables, control)?;
+    let edits = located.as_slice();
+    let blocked = relocations
+        .iter()
+        .filter(|item| !item.moved)
+        .map(|item| item.table.as_str())
+        .collect::<HashSet<_>>();
     let mut groups = BTreeMap::<_, Vec<&Edit>>::new();
     for edit in edits
         .iter()
@@ -82,11 +213,12 @@ pub fn plan(
                 .push(edit);
         }
     }
-    let tables = database::tables(con, &database::default_tables())?;
     let mut result = Plan {
         items: vec![],
         rules: rules.to_vec(),
         edits: edits.to_vec(),
+        relocated: relocations.iter().filter(|item| item.moved).count(),
+        relocations: vec![],
     };
     for ((table, old, new), members) in groups {
         control.log(&format!(
@@ -101,8 +233,14 @@ pub fn plan(
             count: members.len(),
             reason: String::new(),
         };
-        if old == new || !tables.contains(&table) {
-            item.reason = "替换内容未变化，或来源表已不存在。".into();
+        if old == new {
+            item.reason = "替换前后文字相同，无需转换。".into();
+        } else if !tables.contains(&table) {
+            item.reason = "当前底稿中没有这张文本表。请检查游戏目录和版本；旧版记录可通过「迁移旧版修改」重新定位。".into();
+        } else if blocked.contains(table.as_str()) {
+            item.reason =
+                "本表仍有无法确定位置的修改，保留指定文本；具体原因和处理方法见位置核对日志。"
+                    .into();
         } else if members.iter().any(|member| {
             edits
                 .iter()
@@ -144,19 +282,32 @@ pub fn plan(
             .iter()
             .map(|edit| ((edit.row_id.clone(), edit.slot), *edit))
             .collect::<HashMap<_, _>>();
+        let mut unseen = addresses.clone();
+        let mut invalid_originals = Vec::new();
         let mut seen = 0;
-        let mut coverage = true;
+        let mut missing = 0;
+        let mut outside = 0;
+        let mut changed = 0;
         let mut same = true;
         database::visit_table(con, &table, control, |row| {
             let member = addresses.get(&(row.1.clone(), row.2));
             let expected =
                 model::effective(&row, &[], game, version, &scope_rule, skip)?.0 != row.3;
-            coverage &= expected == member.is_some();
+            if expected && member.is_none() {
+                missing += 1;
+            }
+            if !expected && member.is_some() {
+                outside += 1;
+            }
             if let Some(edit) = member {
                 seen += 1;
+                unseen.remove(&(row.1.clone(), row.2));
                 let op = edit.batch_operation.as_ref().unwrap();
-                coverage &=
-                    edit.original == row.3 && edit.replacement == op.before.replace(&old, &new);
+                if edit.original != row.3 || edit.replacement != op.before.replace(&old, &new) {
+                    changed += 1;
+                    invalid_originals.push(edit.original.as_str());
+                    return Ok(());
+                }
             }
             if model::effective(&row, &result.edits, game, version, &before_rules, skip)?.0
                 != model::effective(&row, &next_edits, game, version, &after_rules, skip)?.0
@@ -165,16 +316,46 @@ pub fn plan(
             }
             Ok(())
         })?;
-        if !coverage || seen != members.len() {
-            item.reason = "未完整覆盖全部匹配文本，或记录定位无法核对。".into();
+        if seen != members.len() || changed > 0 {
+            invalid_originals.extend(unseen.values().map(|edit| edit.original.as_str()));
+            invalid_originals.sort_unstable();
+            invalid_originals.dedup();
+            let originals = invalid_originals
+                .iter()
+                .take(3)
+                .map(|original| {
+                    format!(
+                        "「{}」",
+                        original
+                            .chars()
+                            .take(80)
+                            .collect::<String>()
+                            .replace(['\r', '\n'], " ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+            item.reason = format!(
+                "{} 段记录无法定位，{changed} 段记录内容不一致。请在「编辑批量修改」中搜索并移除旧记录，再从「查找」重新选择文本进行批量修改。需重选的原文（最多列出 3 条）：{originals}",
+                members.len() - seen
+            );
+        } else if outside > 0 {
+            item.reason = format!(
+                "{outside} 段指定文本不在整表替换范围内（含假名的文本会受跳过设置影响）。保留指定文本即可；若需整表替换，请先核对「跳过日文假名的文本」设置和原文字。"
+            );
+        } else if missing > 0 {
+            item.reason = format!(
+                "本表还有 {missing} 段匹配文本未包含在本批修改中。仅修改部分文本时无需处理；若需整表替换，请在「查找」中选中遗漏文本，以相同内容批量修改后再次整理。"
+            );
         } else if !same {
-            item.reason = "转换会改变当前结果，保留原批量修改。".into();
+            item.reason = "转换会改变当前结果，保留原批量修改。若需调整，请先预览并核对同一文本表的其他词条。".into();
         } else {
             result.rules = next_rules;
             result.edits = next_edits;
         }
         result.items.push(item);
     }
+    result.relocations = relocations;
     Ok(result)
 }
 
@@ -269,7 +450,9 @@ mod tests {
         assert_eq!(result.rules[0].table, "LocalizeDBSchema");
         assert_eq!(result.edits, vec![edits[2].clone(), prior]);
         assert!(result.items[0].reason.is_empty());
-        assert!(!result.items[1].reason.is_empty());
+        assert!(result.items[1].reason.contains("还有 1 段匹配文本"));
+        assert!(result.items[1].reason.contains("无需处理"));
+        assert!(result.items[1].reason.contains("再次整理"));
     }
     #[test]
     fn equivalence_includes_existing_rules_and_rejects_precedence_changes() {
@@ -287,10 +470,14 @@ mod tests {
     fn paired_single_edits_and_kana_overrides_keep_their_existing_behavior() {
         let con = database(&[("LocalizeDBSchema", 1, "任务あ")]);
         let edit = edit("LocalizeDBSchema", 1, "任务あ");
-        assert_eq!(
-            check(&con, &[], std::slice::from_ref(&edit), true).edits,
-            vec![edit.clone()]
+        let skipped = check(&con, &[], std::slice::from_ref(&edit), true);
+        assert_eq!(skipped.edits, vec![edit.clone()]);
+        assert!(
+            skipped.items[0]
+                .reason
+                .contains("1 段指定文本不在整表替换范围内")
         );
+        assert!(skipped.items[0].reason.contains("跳过日文假名"));
         assert!(
             check(&con, &[], std::slice::from_ref(&edit), false)
                 .edits
@@ -304,6 +491,129 @@ mod tests {
         let result = check(&con, &[], &paired, false);
         assert_eq!(result.edits, paired);
         assert!(result.items[0].reason.contains("单条修改"));
+    }
+    #[test]
+    fn missing_originals_keep_records_and_report_each_searchable_text() {
+        let con = database(&[("LocalizeDBSchema", 1, "任务甲")]);
+        let stale = edit("LocalizeDBSchema", 2, "任务乙");
+        let changed = edit("LocalizeDBSchema", 1, "任务旧文");
+        let edits = vec![stale, changed];
+        let result = check(&con, &[], &edits, true);
+        assert!(result.rules.is_empty());
+        assert_eq!(result.edits, edits);
+        assert_eq!(result.relocations.len(), 2);
+        assert!(
+            result
+                .relocations
+                .iter()
+                .all(|item| !item.moved && item.reason.contains("未找到完整原文"))
+        );
+        assert!(
+            result
+                .relocations
+                .iter()
+                .any(|item| item.original == "任务乙")
+        );
+        assert!(
+            result
+                .relocations
+                .iter()
+                .any(|item| item.original == "任务旧文")
+        );
+    }
+    #[test]
+    fn full_original_relocates_unique_current_records_and_preserves_paired_layers() {
+        let con = database(&[
+            ("LocalizeDBSchema", 5, "任务甲"),
+            ("LocalizeDBSchema", 6, "任务乙"),
+        ]);
+        let batch = edit("LocalizeDBSchema", 1, "任务甲");
+        let mut single = batch.clone();
+        single.batch = false;
+        single.batch_operation = None;
+        single.replacement = "特别指定的结果".into();
+        let mut other_game = edit("LocalizeDBSchema", 2, "任务乙");
+        other_game.game = "other".into();
+        other_game.batch_operation.as_mut().unwrap().id = "2".repeat(32);
+        let mut other_version = other_game.clone();
+        other_version.game = "game".into();
+        other_version.version = "b".repeat(64);
+        other_version.batch_operation.as_mut().unwrap().id = "3".repeat(32);
+        let edits = vec![batch, single, other_game.clone(), other_version.clone()];
+        let result = check(&con, &[], &edits, true);
+        assert_eq!(result.relocated, 1);
+        assert!(result.rules.is_empty());
+        assert_eq!(result.edits.len(), 4);
+        for (index, edit) in edits.iter().take(2).enumerate() {
+            let mut expected = edit.clone();
+            expected.row_id = RowId::Integer(5);
+            assert_eq!(result.edits[index], expected);
+        }
+        assert_eq!(&result.edits[2..], &[other_game, other_version]);
+    }
+    #[test]
+    fn relocation_can_promote_complete_batches_but_never_expands_partial_batches() {
+        let con = database(&[
+            ("LocalizeDBSchema", 5, "任务甲"),
+            ("LocalizeDBSchema", 6, "任务乙"),
+        ]);
+        let first = edit("LocalizeDBSchema", 1, "任务甲");
+        let partial = check(&con, &[], std::slice::from_ref(&first), true);
+        assert_eq!(partial.relocated, 1);
+        assert!(partial.rules.is_empty());
+        assert_eq!(partial.edits[0].row_id, RowId::Integer(5));
+        assert!(partial.items[0].reason.contains("还有 1 段"));
+        let second = edit("LocalizeDBSchema", 2, "任务乙");
+        let complete = check(&con, &[], &[first, second], true);
+        assert_eq!(complete.relocated, 2);
+        assert_eq!(complete.rules.len(), 1);
+        assert!(complete.edits.is_empty());
+    }
+    #[test]
+    fn relocation_keeps_ambiguous_occupied_competing_and_missing_records_unchanged() {
+        for (rows, edits, reason) in [
+            (
+                vec![
+                    ("LocalizeDBSchema", 5, "任务甲"),
+                    ("LocalizeDBSchema", 6, "任务甲"),
+                ],
+                vec![edit("LocalizeDBSchema", 1, "任务甲")],
+                "多处",
+            ),
+            (
+                vec![("LocalizeDBSchema", 5, "任务甲")],
+                vec![
+                    edit("LocalizeDBSchema", 1, "任务甲"),
+                    edit("LocalizeDBSchema", 5, "任务甲"),
+                ],
+                "已有",
+            ),
+            (
+                vec![("LocalizeDBSchema", 5, "任务甲")],
+                vec![
+                    edit("LocalizeDBSchema", 1, "任务甲"),
+                    edit("LocalizeDBSchema", 2, "任务甲"),
+                ],
+                "多条",
+            ),
+            (
+                vec![("LocalizeDBSchema", 5, "任务乙")],
+                vec![edit("LocalizeDBSchema", 1, "任务甲")],
+                "未找到",
+            ),
+        ] {
+            let con = database(&rows);
+            let result = check(&con, &[], &edits, true);
+            assert_eq!(result.relocated, 0);
+            assert_eq!(result.edits, edits);
+            assert!(result.rules.is_empty());
+            assert!(
+                result
+                    .relocations
+                    .iter()
+                    .any(|item| item.reason.contains(reason))
+            );
+        }
     }
     #[test]
     fn conflicting_scope_and_unclassified_legacy_records_are_not_promoted() {

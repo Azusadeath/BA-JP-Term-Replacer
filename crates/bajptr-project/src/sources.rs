@@ -42,7 +42,7 @@ impl Sources {
                 .values()
                 .any(|g| g.known.iter().any(|s| s.is_empty()))
         {
-            return Err(invalid("来源表记录格式无效，未重建或覆盖原记录。"));
+            return Err(invalid("文本表记录格式无效，未重建或覆盖原记录。"));
         }
         Ok(value)
     }

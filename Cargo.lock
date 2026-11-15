@@ -500,14 +500,14 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bajptr-brand"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "embed-resource",
 ]
 
 [[package]]
 name = "bajptr-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "aes",
  "base64",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "bajptr-desktop"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bajptr-brand",
  "bajptr-core",
@@ -538,11 +538,12 @@ dependencies = [
  "eframe",
  "rfd",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "bajptr-launcher"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bajptr-brand",
  "serde_json",
@@ -551,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "bajptr-project"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bajptr-core",
  "base64",
@@ -569,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "bajptr-rs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bajptr-core",
  "bajptr-project",
@@ -4354,8 +4355,9 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
+ "bajptr-brand",
  "clap",
  "regex",
  "serde",

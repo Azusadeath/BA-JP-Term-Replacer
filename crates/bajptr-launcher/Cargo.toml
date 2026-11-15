@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bajptr-brand = { path = "../bajptr-brand" }
 serde_json.workspace = true
 
 [build-dependencies]

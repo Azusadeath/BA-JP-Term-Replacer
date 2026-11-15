@@ -6,6 +6,7 @@ pub mod desktop;
 pub mod diagnostics;
 pub mod migration;
 pub mod model;
+pub mod ordering;
 mod promotion;
 mod recovery;
 pub mod region;

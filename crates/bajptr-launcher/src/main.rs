@@ -4,7 +4,7 @@ fn main() {
         #[cfg(windows)]
         unsafe {
             let message: Vec<u16> = format!("无法启动工具：{error}\0").encode_utf16().collect();
-            let title: Vec<u16> = "蔚蓝档案 · 日服译名替换\0".encode_utf16().collect();
+            let title: Vec<u16> = format!("{}\0", bajptr_brand::NAME).encode_utf16().collect();
             windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 std::ptr::null_mut(),
                 message.as_ptr(),

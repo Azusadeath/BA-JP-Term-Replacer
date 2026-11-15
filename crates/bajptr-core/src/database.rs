@@ -102,7 +102,7 @@ pub struct Diagnostic {
 }
 impl Diagnostic {
     fn display(&self) -> String {
-        let mut address = format!("来源表 {}", self.table);
+        let mut address = format!("文本表 {}", self.table);
         if let Some(id) = &self.row_id {
             address.push_str(&format!("，记录 {}", id.display()));
         }
@@ -403,7 +403,7 @@ pub fn current_overrides(
         let key = match key_name(original, table) {
             Ok(key) => key,
             Err(Error::UnsupportedTable(reason)) => {
-                control.warn(&format!("来源表 {table}：{reason}"))?;
+                control.warn(&format!("文本表 {table}：{reason}"))?;
                 continue;
             }
             Err(error) => return Err(error),
@@ -476,7 +476,7 @@ fn targets(con: &Connection, edits: &[TextEdit], tables: &[String]) -> Result<Ta
     let mut result = HashMap::new();
     for edit in edits {
         if !tables.contains(&edit.table) {
-            return Err(invalid("单条修改的来源表已不存在，请重新查找对应记录。"));
+            return Err(invalid("单条修改的文本表已不存在，请重新查找对应记录。"));
         }
         if edit.replacement.len() > fields::MAX_STRING || fields::forbidden(&edit.replacement) {
             return Err(record_error(
@@ -654,7 +654,7 @@ pub fn patch_database(
                     note(&mut stats, "table", table, None, None, reason, control)?;
                     continue;
                 }
-                Err(error) => return Err(invalid(format!("来源表 {table}：{error}"))),
+                Err(error) => return Err(invalid(format!("文本表 {table}：{error}"))),
             };
             let sql = format!("SELECT {key}, Bytes FROM {} ORDER BY 1", quote(table));
             let mut query = con.prepare(&sql)?;
@@ -856,12 +856,12 @@ pub fn visit_table(
         let blob = row
             .get_ref(1)?
             .as_blob()
-            .map_err(|_| invalid(format!("来源表 {table} 存在非文本记录，无法完整核对范围。")))?;
+            .map_err(|_| invalid(format!("文本表 {table} 存在非文本记录，无法完整核对范围。")))?;
         let parsed = fields::parse_with_issues(blob, true)
             .map_err(|error| record_error(table, &rid, error))?;
         if parsed.skipped > 0 {
             return Err(invalid(format!(
-                "来源表 {table} 存在异常字段，无法完整核对批量修改范围。"
+                "文本表 {table} 存在异常字段，无法完整核对批量修改范围。"
             )));
         }
         for field in parsed.fields {
@@ -955,7 +955,7 @@ pub fn source_rule_matches(
 ) -> Result<Vec<SourceRuleMatch>> {
     let mut output = Vec::new();
     for table in names {
-        control.log(&format!("正在检查来源表：{table}"))?;
+        control.log(&format!("正在检查文本表：{table}"))?;
         let key = key_name(con, table)?;
         let mut statement = con.prepare(&format!(
             "SELECT {key},Bytes FROM {} ORDER BY 1",
@@ -999,7 +999,7 @@ pub fn source_rule_matches(
                 return Err(record_error(
                     table,
                     &rid,
-                    invalid("存在无法解析的文本字段，未标记此来源表为已检查。"),
+                    invalid("存在无法解析的文本字段，未标记此文本表为已检查。"),
                 ));
             }
             for field in parsed.fields {
@@ -1076,7 +1076,7 @@ fn report_skips(stats: &Stats, control: &Control<'_>) -> Result<()> {
         parts.push(format!("{} 条无法解析的记录", stats.parse_failed));
     }
     if stats.tables_skipped > 0 {
-        parts.push(format!("{} 张不支持的来源表", stats.tables_skipped));
+        parts.push(format!("{} 张不支持的文本表", stats.tables_skipped));
     }
     if stats.fields_skipped > 0 {
         parts.push(format!("{} 个异常字段", stats.fields_skipped));
@@ -1261,7 +1261,7 @@ pub fn visit_matches(
                 )?;
                 continue;
             }
-            Err(error) => return Err(invalid(format!("来源表 {table}：{error}"))),
+            Err(error) => return Err(invalid(format!("文本表 {table}：{error}"))),
         };
         let mut query = con.prepare(&format!(
             "SELECT {key},Bytes FROM {} ORDER BY 1",
@@ -1310,11 +1310,11 @@ pub fn export(
     let mut total = 0;
     let mut diagnostics = Stats::default();
     for table in tables(con, pattern)? {
-        control.log(&format!("导出来源表：{table}"))?;
+        control.log(&format!("导出文本表：{table}"))?;
         if table.chars().any(|c| "<>:\"/\\|?*".contains(c))
             || PathBuf::from(&table).file_name().is_none()
         {
-            return Err(invalid("来源表名称不能作为导出文件名。"));
+            return Err(invalid("文本表名称不能作为导出文件名。"));
         }
         let key = match key_name(con, &table) {
             Ok(k) => k,
@@ -1331,7 +1331,7 @@ pub fn export(
                 )?;
                 continue;
             }
-            Err(error) => return Err(invalid(format!("来源表 {table}：{error}"))),
+            Err(error) => return Err(invalid(format!("文本表 {table}：{error}"))),
         };
         let mut query = con.prepare(&format!(
             "SELECT {key},Bytes FROM {} ORDER BY 1",

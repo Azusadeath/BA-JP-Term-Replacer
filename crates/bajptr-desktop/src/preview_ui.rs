@@ -1,6 +1,6 @@
 use crate::{
     app::*,
-    dialogs::{ComparisonRow, comparison_browser, window},
+    dialogs::{ComparisonRow, ListSummary, comparison_browser, window},
     state::*,
 };
 use eframe::egui;
@@ -78,9 +78,9 @@ impl Desktop {
                                                                 egui::RichText::new(&caption)
                                                                     .strong(),
                                                             )
-                                                            .truncate(),
-                                                        )
-                                                        .on_hover_text(&caption);
+                                                            .truncate()
+                                                            .show_tooltip_when_elided(false),
+                                                        );
                                                         if secondary(ui, true, "定位词条").clicked()
                                                         {
                                                             locate = index;
@@ -113,9 +113,9 @@ impl Desktop {
                                                             egui::RichText::new(&scope)
                                                                 .color(MUTED),
                                                         )
-                                                        .truncate(),
-                                                    )
-                                                    .on_hover_text(&scope);
+                                                        .truncate()
+                                                        .show_tooltip_when_elided(false),
+                                                    );
                                                 });
                                             }
                                             ui.add(
@@ -140,7 +140,7 @@ impl Desktop {
                             let mut skipped = Vec::new();
                             if count(stats, "tables_skipped") > 0 {
                                 skipped
-                                    .push(format!("{} 张来源表", count(stats, "tables_skipped")));
+                                    .push(format!("{} 张文本表", count(stats, "tables_skipped")));
                             }
                             if count(stats, "fields_skipped") > 0 {
                                 skipped
@@ -243,7 +243,6 @@ impl Desktop {
                     show_actions(ui);
                 }
                 if total == 0 {
-                    ui.label("本次 0 处变化");
                     ui.colored_label(
                         MUTED,
                         if count(stats, "parse_failed") > 0 {
@@ -292,6 +291,7 @@ impl Desktop {
                         &rows,
                         &mut self.preview_row,
                         ["当前游戏文字", "替换后的文字"],
+                        ListSummary::BeforeAfter,
                         None,
                     );
                 }

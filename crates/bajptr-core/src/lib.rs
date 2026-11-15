@@ -16,7 +16,7 @@ pub enum Error {
     Invalid(String),
     #[error("FlatBuffer 解析失败：{0}")]
     Parse(String),
-    #[error("来源表结构暂不支持：{0}")]
+    #[error("文本表结构暂不支持：{0}")]
     UnsupportedTable(String),
     #[error("第 {index} 条词条（{original}）：{source}")]
     Rule {
@@ -26,7 +26,7 @@ pub enum Error {
     },
     #[error("字段 {slot}：{source}")]
     Field { slot: usize, source: Box<Error> },
-    #[error("来源表 {table}，记录 {record}：{source}")]
+    #[error("文本表 {table}，记录 {record}：{source}")]
     Record {
         table: String,
         record: String,

@@ -293,7 +293,7 @@
         "zero_reasons": [
           {
             "index": 0,
-            "reason": "该来源表有同原词的专用规则，已覆盖这条全局规则。",
+            "reason": "该文本表有同原词的专用规则，已覆盖这条全局规则。",
             "example": "暴击",
             "table": "LocalizeDBSchema"
           }
@@ -336,7 +336,7 @@
         "zero_reasons": [
           {
             "index": 0,
-            "reason": "原词出现在未选中的来源表里。请核对来源范围。",
+            "reason": "原词出现在未选中的文本表里。请核对来源范围。",
             "example": "暴击",
             "table": "LocalizeDBSchema"
           }

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Parser)]
-#[command(about = "BA-JPTR Windows development and release tools")]
+#[command(about = "BA-JP-Term-Replacer (BA-JPTR) Windows development and release tools")]
 struct Cli {
     #[command(subcommand)]
     command: Task,

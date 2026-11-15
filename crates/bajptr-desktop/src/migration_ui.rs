@@ -104,7 +104,7 @@ impl Desktop {
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut form.filter)
-                        .hint_text("搜索文本或来源表")
+                        .hint_text("搜索文本或文本表")
                         .desired_width(ui.available_width()),
                 );
             });
@@ -234,7 +234,12 @@ impl Desktop {
                                         ))
                                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                                 );
-                                line.add(egui::Label::new(label).selectable(false).truncate());
+                                line.add(
+                                    egui::Label::new(label)
+                                        .selectable(false)
+                                        .truncate()
+                                        .show_tooltip_when_elided(false),
+                                );
                             }
                             if response.clicked() {
                                 form.selected = Some(index);

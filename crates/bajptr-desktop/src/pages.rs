@@ -7,20 +7,12 @@ impl Desktop {
     pub fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             self.navigation(ui);
+            if self.loaded && self.game.trim().is_empty() && self.tab != 2 {
+                ui.separator();
+                ui.colored_label(ORANGE, "尚未配置游戏目录");
+            }
         });
         self.recovery_notices(ui);
-        if self.tab != 2 && (!self.connected || self.confirm_baseline.is_some()) {
-            ui.add_space(8.);
-            egui::Frame::new()
-                .fill(Color32::WHITE)
-                .stroke(egui::Stroke::new(1., LINE))
-                .corner_radius(10)
-                .inner_margin(12)
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    self.directory_controls(ui);
-                });
-        }
     }
     pub fn recovery_notices(&mut self, ui: &mut egui::Ui) {
         if let Some(warning) = self.settings_warning.clone() {
@@ -216,13 +208,7 @@ impl Desktop {
             if ui
                 .add_enabled(
                     can_edit,
-                    ToolButton::new(format!(
-                        "单条修改（{}）",
-                        slice(&self.state, "edits")
-                            .iter()
-                            .filter(|v| v["edit"]["batch"] != true)
-                            .count()
-                    )),
+                    ToolButton::new("单条修改"),
                 )
                 .clicked()
             {
@@ -230,9 +216,8 @@ impl Desktop {
             }
             let can_promote = can_edit && self.connected && self.sources_ready
                 && !self.path_dirty && self.busy.is_none()
-                && batches.iter().any(|batch| batch["active"] == true && batch["id"].is_string());
+                && slice(&self.state, "edits").iter().any(|edit| edit["active"] == true);
             if ui.add_enabled(can_promote,ToolButton::new("整理批量修改"))
-                .on_hover_text("将完整覆盖且结果一致的批量范围改为整表规则；保存前备份，可撤销。")
                 .clicked() {
                 self.submit("promotion_start",json!({"revision":self.revision()}),"正在核对并整理批量修改…");
             }
@@ -257,12 +242,8 @@ impl Desktop {
                 });
             });
         let width = ui.available_width() - 12.;
-        let widths = [(width - 420.) * 0.5, (width - 420.) * 0.5, 110., 240., 70.];
-        table_header(
-            ui,
-            &["原文字", "替换为", "匹配方式", "生效范围", "命中"],
-            &widths,
-        );
+        let widths = [(width - 350.) * 0.5, (width - 350.) * 0.5, 110., 240.];
+        table_header(ui, &["原文字", "替换为", "匹配方式", "生效范围"], &widths);
         egui::Frame::new()
             .fill(Color32::WHITE)
             .corner_radius(10)
@@ -294,108 +275,43 @@ impl Desktop {
                         .id_salt("replacement-rows")
                         .auto_shrink([false, false]);
                     if let Some(index) = self.reveal_rule.take() {
-                        scroll = scroll.vertical_scroll_offset(index as f32 * (ROW_HEIGHT + ui.spacing().item_spacing.y));
+                        scroll = scroll.vertical_scroll_offset(
+                            index as f32 * (ROW_HEIGHT + ui.spacing().item_spacing.y),
+                        );
                     }
                     scroll.show_rows(ui, ROW_HEIGHT, display_rows.len(), |ui, range| {
-                            for i in range {
-                                if let ReplacementRow::Combined { rules: indices, batches: batch_indices } = &display_rows[i] {
-                                    let rule = &rules[indices[0]]["rule"];
-                                    let tables = indices.iter().flat_map(|&index| {
-                                        bajptr_project::model::scopes(&text(&rules[index]["rule"], "table"))
-                                            .ok().flatten().unwrap_or_default()
-                                    }).collect::<std::collections::BTreeSet<_>>();
-                                    let members = batch_indices.iter().map(|&index| count(&batches[index], "count")).sum::<u64>();
-                                    let hits = self.combined_hits.iter()
-                                        .find(|hit| hit["old"] == rule["old"] && hit["new"] == rule["new"])
-                                        .map(|hit| count(hit, "count").to_string())
-                                        .unwrap_or_else(|| "—".into());
-                                    let values = [
-                                        text(rule, "old"),
-                                        if text(rule, "new").is_empty() { "（删除匹配文字）".into() } else { text(rule, "new") },
-                                        "包含文字".into(),
-                                        format!("整表 {} · 指定文本 {} 条", tables.len(), members),
-                                        hits,
-                                    ];
-                                    let response = data_row(ui, i, self.rule_selection == Some(i), &values, &widths)
-                                        .on_hover_text("双击统一编辑替换内容、整表范围和指定文本。实际变化请查看预览。");
-                                    if response.clicked() { self.rule_selection = Some(i); }
-                                    if response.double_clicked() && can_edit { self.open_combined(rule); }
-                                    continue;
-                                }
-                                if let ReplacementRow::Batch(index) = display_rows[i] {
-                                    let entry = &batches[index];
-                                    let replacement = text(entry, "new");
-                                    let grouped = entry["id"].is_string();
-                                    let values = [
-                                        text(entry, "old").replace(['\r', '\n'], " "),
-                                        if replacement.is_empty() {
-                                            if grouped {
-                                                "（删除匹配文字）"
-                                            } else {
-                                                "（清空文本）"
-                                            }
-                                            .into()
-                                        } else {
-                                            replacement.replace(['\r', '\n'], " ")
-                                        },
-                                        if grouped {
-                                            "包含文字"
-                                        } else {
-                                            "整段相同"
-                                        }
-                                        .into(),
-                                        "批量修改".into(),
-                                        if entry["active"] == true {
-                                            "—"
-                                        } else {
-                                            "失效"
-                                        }
-                                        .into(),
-                                    ];
-                                    let response = data_row(
-                                        ui,
-                                        i,
-                                        self.rule_selection == Some(i),
-                                        &values,
-                                        &widths,
-                                    )
-                                    .on_hover_text(format!(
-                                        "仅修改选中的 {} 条文本{}",
-                                        count(entry, "count"),
-                                        if entry["active"] == true {
-                                            ""
-                                        } else {
-                                            "（版本失效）"
-                                        }
-                                    ));
-                                    if response.clicked() {
-                                        self.rule_selection = Some(i);
-                                    }
-                                    if response.double_clicked()
-                                        && can_edit
-                                        && entry["active"] == true
-                                    {
-                                        self.open_batch(entry);
-                                    }
-                                    continue;
-                                }
-                                let ReplacementRow::Rule(index)=display_rows[i] else {unreachable!()};
-                                let row = &rules[index];
-                                let new = text(row, "display_new");
+                        for i in range {
+                            if let ReplacementRow::Combined {
+                                rules: indices,
+                                batches: batch_indices,
+                            } = &display_rows[i]
+                            {
+                                let rule = &rules[indices[0]]["rule"];
+                                let tables = indices
+                                    .iter()
+                                    .flat_map(|&index| {
+                                        bajptr_project::model::scopes(&text(
+                                            &rules[index]["rule"],
+                                            "table",
+                                        ))
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_default()
+                                    })
+                                    .collect::<std::collections::BTreeSet<_>>();
+                                let members = batch_indices
+                                    .iter()
+                                    .map(|&index| count(&batches[index], "count"))
+                                    .sum::<u64>();
                                 let values = [
-                                    text(row, "display_old"),
-                                    if new.is_empty() {
+                                    text(rule, "old"),
+                                    if text(rule, "new").is_empty() {
                                         "（删除匹配文字）".into()
                                     } else {
-                                        new
+                                        text(rule, "new")
                                     },
-                                    if !row["draft"].is_null() {
-                                        mode_name("re").into()
-                                    } else {
-                                        mode_name(&text(&row["rule"], "mode")).into()
-                                    },
-                                    text(row, "scope"),
-                                    self.hits.get(index).map(u64::to_string).unwrap_or("—".into()),
+                                    "包含文字".into(),
+                                    format!("整表 {} · 指定文本 {} 条", tables.len(), members),
                                 ];
                                 let response = data_row(
                                     ui,
@@ -408,22 +324,112 @@ impl Desktop {
                                     self.rule_selection = Some(i);
                                 }
                                 if response.double_clicked() && can_edit {
-                                    self.rule_form =
-                                        Some(RuleForm::new(Some(index), self.revision(), Some(row)));
+                                    self.open_combined(rule);
                                 }
+                                continue;
                             }
-                        });
+                            if let ReplacementRow::Batch(index) = display_rows[i] {
+                                let entry = &batches[index];
+                                let replacement = text(entry, "new");
+                                let grouped = entry["id"].is_string();
+                                let values = [
+                                    text(entry, "old").replace(['\r', '\n'], " "),
+                                    if replacement.is_empty() {
+                                        if grouped {
+                                            "（删除匹配文字）"
+                                        } else {
+                                            "（清空文本）"
+                                        }
+                                        .into()
+                                    } else {
+                                        replacement.replace(['\r', '\n'], " ")
+                                    },
+                                    if grouped {
+                                        "包含文字"
+                                    } else {
+                                        "整段相同"
+                                    }
+                                    .into(),
+                                    if entry["active"] == true {
+                                        "批量修改"
+                                    } else {
+                                        "批量修改（版本失效）"
+                                    }
+                                    .into(),
+                                ];
+                                let response = data_row(
+                                    ui,
+                                    i,
+                                    self.rule_selection == Some(i),
+                                    &values,
+                                    &widths,
+                                );
+                                if response.clicked() {
+                                    self.rule_selection = Some(i);
+                                }
+                                if response.double_clicked() && can_edit && entry["active"] == true
+                                {
+                                    self.open_batch(entry);
+                                }
+                                continue;
+                            }
+                            let ReplacementRow::Rule(index) = display_rows[i] else {
+                                unreachable!()
+                            };
+                            let row = &rules[index];
+                            let new = text(row, "display_new");
+                            let values = [
+                                text(row, "display_old"),
+                                if new.is_empty() {
+                                    "（删除匹配文字）".into()
+                                } else {
+                                    new
+                                },
+                                if !row["draft"].is_null() {
+                                    mode_name("re").into()
+                                } else {
+                                    mode_name(&text(&row["rule"], "mode")).into()
+                                },
+                                text(row, "scope"),
+                            ];
+                            let response =
+                                data_row(ui, i, self.rule_selection == Some(i), &values, &widths);
+                            if response.clicked() {
+                                self.rule_selection = Some(i);
+                            }
+                            if response.double_clicked() && can_edit {
+                                self.rule_form =
+                                    Some(RuleForm::new(Some(index), self.revision(), Some(row)));
+                            }
+                        }
+                    });
                 }
             });
     }
     pub fn search_page(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = 6.;
         let wide = ui.available_width() >= 960.;
+        let source_label = self.search_source_label();
+        let source_width = (ui
+            .painter()
+            .layout_no_wrap(
+                source_label.clone(),
+                egui::TextStyle::Button.resolve(ui.style()),
+                TEXT,
+            )
+            .size()
+            .x
+            + 42.)
+            .clamp(145., 220.);
         let mut run = false;
         ui.horizontal(|ui| {
             let reserved = action_width(ui, "查找")
                 + ui.spacing().item_spacing.x
-                + if wide { 170. } else { 0. };
+                + if wide {
+                    source_width + ui.spacing().item_spacing.x
+                } else {
+                    0.
+                };
             let id = egui::Id::unique("search-keyword");
             let focused = ui.memory(|m| m.has_focus(id));
             let enabled = self.connected
@@ -451,12 +457,12 @@ impl Desktop {
             .clicked()
                 || enter;
             if wide {
-                run |= self.search_source_control(ui);
+                run |= self.search_source_control(ui, &source_label, source_width);
             }
         });
         if !wide {
             ui.horizontal(|ui| {
-                run |= self.search_source_control(ui);
+                run |= self.search_source_control(ui, &source_label, source_width);
             });
         }
         if run && self.busy.is_none() {
@@ -475,7 +481,7 @@ impl Desktop {
         }
         let width = ui.available_width() - 12.;
         let widths = [width - 180., 180.];
-        table_header(ui, &["本次文本", "来源表"], &widths);
+        table_header(ui, &["本次文本", "文本表"], &widths);
         let table_height = ui.available_height();
         egui::Frame::new()
             .fill(Color32::WHITE)
@@ -552,9 +558,6 @@ impl Desktop {
                                         self.selection.rows.contains(&i),
                                         &values,
                                         &widths,
-                                    )
-                                    .on_hover_text(
-                                        "单击选择，Ctrl 多选，Shift 连选；双击编辑完整文本。",
                                     );
                                     if response.clicked() {
                                         let modifiers = ui.input(|i| i.modifiers);
@@ -580,7 +583,7 @@ impl Desktop {
         {
             let selected = self.selection.rows.len();
             let labels: &[&str] = if selected == 1 {
-                &["编辑文本", "替换选中文本", "用此表添加词条", "来源表详情"]
+                &["编辑文本", "替换选中文本", "用此表添加词条", "文本表详情"]
             } else {
                 &["替换选中文本"]
             };
@@ -621,7 +624,7 @@ impl Desktop {
                                         let value = json!({"rule":{"old":keyword,"new":keyword,"mode":"sub","source":"-","table":row["table"]}});
                                         self.rule_form = Some(RuleForm::new(None, self.revision(), Some(&value)));
                                     }
-                                    if secondary(ui, true, "来源表详情").clicked() {
+                                    if secondary(ui, true, "文本表详情").clicked() {
                                         self.table_detail = Some(self.tables.iter().find(|v|v["name"]==row["table"]).cloned().unwrap_or(json!({"name":row["table"],"label":row["table"]})));
                                     }
                                 }
@@ -631,9 +634,9 @@ impl Desktop {
                 });
         }
     }
-    fn search_source_control(&mut self, ui: &mut egui::Ui) -> bool {
-        let selected = if self.search_source.is_empty() {
-            "全部来源表".into()
+    fn search_source_label(&self) -> String {
+        if self.search_source.is_empty() {
+            "全部文本表".into()
         } else {
             self.tables
                 .iter()
@@ -641,17 +644,36 @@ impl Desktop {
                 .find(|v| text(v, "name") == self.search_source)
                 .map(|v| text(v, "label"))
                 .unwrap_or_else(|| self.search_source.clone())
-        };
+        }
+    }
+    fn search_source_control(&mut self, ui: &mut egui::Ui, selected: &str, width: f32) -> bool {
         let mut changed = false;
         ui.add_enabled_ui(self.busy.is_none(), |ui| {
+            ui.set_max_width(width);
             egui::ComboBox::from_id_salt("search-source")
-                .width(155.)
+                .width(width)
+                .truncate()
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
+                    let sources = search_sources(&self.tables, &self.search, &self.keyword);
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let longest = std::iter::once("全部文本表".to_string())
+                        .chain(sources.iter().map(|table| text(table, "label")))
+                        .map(|label| {
+                            ui.painter()
+                                .layout_no_wrap(label, font.clone(), TEXT)
+                                .size()
+                                .x
+                        })
+                        .fold(0., f32::max);
+                    let menu_width = (longest + ui.spacing().button_padding.x * 2. + 16.)
+                        .min((ui.ctx().content_rect().width() - 48.).max(width));
+                    ui.set_width(menu_width);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                     changed |= ui
-                        .selectable_value(&mut self.search_source, String::new(), "全部来源表")
+                        .selectable_value(&mut self.search_source, String::new(), "全部文本表")
                         .changed();
-                    for table in search_sources(&self.tables, &self.search, &self.keyword) {
+                    for table in sources {
                         changed |= ui
                             .selectable_value(
                                 &mut self.search_source,
@@ -688,7 +710,7 @@ impl Desktop {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(MUTED, "初始底稿");
                         let verified = !self.baseline.is_null();
-                        let (rect, response) =
+                        let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(14., 20.), egui::Sense::hover());
                         ui.painter().circle_filled(
                             rect.center(),
@@ -699,11 +721,6 @@ impl Desktop {
                                 Color32::from_rgb(160, 169, 181)
                             },
                         );
-                        response.on_hover_text(if verified {
-                            "底稿已验证"
-                        } else {
-                            "尚无已验证的初始底稿"
-                        });
                         if verified && secondary(ui, true, "打开底稿位置").clicked() {
                             Self::open_folder(&PathBuf::from(text(&self.baseline, "folder")));
                         }
@@ -748,6 +765,35 @@ impl Desktop {
                 ui.add_space(4.);
                 tool_section(ui, "工作区", |ui| {
                     let can_edit = self.loaded && self.healthy() && !self.write_busy();
+                    ui.horizontal(|ui| {
+                        ui.colored_label(MUTED, "来源表排序");
+                        let saved = self.state["replacement_sort"].as_str().unwrap_or("added");
+                        let mut selected = saved.to_string();
+                        ui.add_enabled_ui(self.loaded && self.busy.is_none(), |ui| {
+                            egui::ComboBox::from_id_salt("replacement-sort")
+                                .selected_text(match selected.as_str() {
+                                    "alphabetical" => "按首字母",
+                                    "modified" => "按修改时间",
+                                    _ => "按添加时间",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for (mode, label) in [
+                                        ("alphabetical", "按首字母"),
+                                        ("modified", "按修改时间"),
+                                        ("added", "按添加时间"),
+                                    ] {
+                                        ui.selectable_value(&mut selected, mode.to_string(), label);
+                                    }
+                                });
+                        });
+                        if selected != saved {
+                            self.submit(
+                                "sort_settings",
+                                json!({"revision":self.revision(),"value":selected}),
+                                "正在保存排序…",
+                            );
+                        }
+                    });
                     let response = egui::Frame::new()
                         .fill(Color32::WHITE)
                         .stroke(egui::Stroke::new(1., LINE))
@@ -772,8 +818,8 @@ impl Desktop {
                         self.save_settings();
                     }
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(MUTED, "数据");
-                        if secondary(ui, can_edit && !self.path_dirty, "导出备份").clicked()
+                        ui.colored_label(MUTED, "备份");
+                        if secondary(ui, can_edit && !self.path_dirty, "导出").clicked()
                             && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("BA-JPTR 备份", &["json"])
                                 .set_file_name("BA-JPTR备份.json")
@@ -785,7 +831,7 @@ impl Desktop {
                                 "正在保存备份…",
                             );
                         }
-                        if secondary(ui, self.loaded && !self.write_busy(), "恢复备份").clicked()
+                        if secondary(ui, self.loaded && !self.write_busy(), "恢复").clicked()
                             && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("BA-JPTR 备份", &["json"])
                                 .pick_file()

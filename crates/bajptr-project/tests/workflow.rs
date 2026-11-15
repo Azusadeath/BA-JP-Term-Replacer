@@ -99,6 +99,61 @@ fn oracle() -> Value {
     serde_json::from_str(include_str!("fixtures/v1/oracle.json")).unwrap()
 }
 
+#[test]
+fn replacement_sort_preferences_and_times_survive_restart_and_backup_without_reordering_rules() {
+    let f = Fixture::new();
+    let mut p = f.project();
+    let added = call(
+        &mut p,
+        "save_rule",
+        json!({"revision":0,"index":null,"rule":{"old":"体力","new":"行动力","mode":"sub","table":"LocalizeDBSchema","source":""}}),
+    );
+    let index = p.rules.len() - 1;
+    let creation = added["rules"][index]["added"].as_u64().unwrap();
+    assert!(creation > 0);
+    let revision = p.revision;
+    let rules = fs::read(f.data.join(".gui/rules.tsv")).unwrap();
+    let sorted = call(
+        &mut p,
+        "sort_settings",
+        json!({"revision":revision,"value":"modified"}),
+    );
+    assert_eq!(sorted["replacement_sort"], "modified");
+    assert_eq!(p.revision, revision);
+    assert_eq!(fs::read(f.data.join(".gui/rules.tsv")).unwrap(), rules);
+    let edited = call(
+        &mut p,
+        "save_rule",
+        json!({"revision":revision,"index":index,"rule":{"old":"体力","new":"AP","mode":"sub","table":"LocalizeDBSchema","source":""}}),
+    );
+    assert_eq!(edited["rules"][index]["added"], creation);
+    assert!(edited["rules"][index]["modified"].as_u64().unwrap() > creation);
+    let mut restarted = f.project();
+    let state = restarted.state().unwrap();
+    assert_eq!(state["replacement_sort"], "modified");
+    assert_eq!(state["rules"][index]["added"], creation);
+    let path = f.root.join("backup.json");
+    call(&mut restarted, "backup_create", json!({"path":path}));
+    let revision = restarted.revision;
+    call(
+        &mut restarted,
+        "sort_settings",
+        json!({"revision":revision,"value":"alphabetical"}),
+    );
+    let plan = call(&mut restarted, "backup_read", json!({"path":path}));
+    call(
+        &mut restarted,
+        "backup_restore",
+        json!({"nonce":plan["nonce"]}),
+    );
+    assert_eq!(restarted.state().unwrap()["replacement_sort"], "modified");
+    assert_eq!(
+        restarted.state().unwrap()["rules"][index]["added"],
+        creation
+    );
+    f.unchanged();
+}
+
 fn combined_fixture() -> (Fixture, Project) {
     let mut f = Fixture::new();
     add_new_source(&mut f, false);
@@ -428,6 +483,95 @@ fn batch_promotion_preserves_results_backs_up_both_documents_and_undoes_together
     f.unchanged();
 }
 
+#[test]
+fn promotion_relocates_a_single_edit_without_a_table_conversion_and_undoes_after_backup() {
+    let (f, p) = combined_fixture();
+    let rules = p.rules.clone();
+    let mut correct = p.edits[0].clone();
+    correct.batch = false;
+    correct.batch_operation = None;
+    correct.replacement = "特定文本的修改".into();
+    let mut stale = correct.clone();
+    stale.row_id = bajptr_core::database::RowId::Integer(99999);
+    stale.slot = 99;
+    drop(p);
+    let bytes = bajptr_project::model::edits_bytes(std::slice::from_ref(&stale)).unwrap();
+    fs::write(f.data.join(".gui/text-edits.json"), &bytes).unwrap();
+    let mut p = f.project();
+    let preview = call(&mut p, "promotion_preview", json!({}));
+    assert_eq!(preview["count"], 0);
+    assert_eq!(preview["relocated"], 1);
+    assert_eq!(p.edits, vec![stale.clone()]);
+    assert_eq!(
+        fs::read(f.data.join(".gui/text-edits.json")).unwrap(),
+        bytes
+    );
+    assert!(
+        p.dispatch(
+            "promotion_commit",
+            &json!({"nonce":preview["nonce"]}),
+            &Control::new(&|_| false)
+        )
+        .is_err()
+    );
+    assert_eq!(p.edits, vec![stale.clone()]);
+    let saved = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(saved["count"], 0);
+    assert_eq!(saved["relocated"], 1);
+    assert_eq!(p.rules, rules);
+    assert_eq!(p.edits, vec![correct.clone()]);
+    let backup = Path::new(saved["backup"].as_str().unwrap());
+    assert_eq!(fs::read(backup.join("text-edits.json")).unwrap(), bytes);
+    assert_eq!(f.project().edits, vec![correct.clone()]);
+    let revision = p.revision;
+    let repeated = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(repeated["relocated"], 0);
+    assert!(repeated["backup"].is_null());
+    assert_eq!(p.revision, revision);
+    call(&mut p, "history", json!({"undo":true}));
+    assert_eq!(p.edits, vec![stale]);
+    call(&mut p, "history", json!({"undo":false}));
+    assert_eq!(p.edits, vec![correct]);
+    f.unchanged();
+}
+
+#[cfg(windows)]
+#[test]
+fn promotion_relocation_save_failure_keeps_the_old_addresses_and_rules() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (f, p) = combined_fixture();
+    let rules = p.rules.clone();
+    let mut stale = p.edits[0].clone();
+    stale.row_id = bajptr_core::database::RowId::Integer(99999);
+    stale.batch = false;
+    stale.batch_operation = None;
+    drop(p);
+    let bytes = bajptr_project::model::edits_bytes(std::slice::from_ref(&stale)).unwrap();
+    let path = f.data.join(".gui/text-edits.json");
+    fs::write(&path, &bytes).unwrap();
+    let mut p = f.project();
+    let plan = call(&mut p, "promotion_preview", json!({}));
+    assert_eq!(plan["relocated"], 1);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2)
+        .open(&path)
+        .unwrap();
+    assert!(
+        p.dispatch(
+            "promotion_commit",
+            &json!({"nonce":plan["nonce"]}),
+            &control()
+        )
+        .is_err()
+    );
+    assert_eq!(p.edits, vec![stale]);
+    assert_eq!(p.rules, rules);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop(held);
+    f.unchanged();
+}
+
 #[cfg(windows)]
 #[test]
 fn batch_promotion_rejects_cancelled_stale_and_failed_saves_without_losing_records() {
@@ -516,7 +660,7 @@ fn combined_replacement_saves_both_scopes_and_undoes_as_one_operation() {
             .all(|row| row["text"].as_str().unwrap().contains("差事"))
     );
     let preview = call(&mut p, "preview", json!({}));
-    assert_eq!(preview["stats"]["combined_hits"][0]["count"], 2);
+    assert_eq!(preview["total_changes"], 2);
     let saved_rules = p.rules.clone();
     let saved_edits = p.edits.clone();
     call(&mut p, "history", json!({"undo":true}));
@@ -550,10 +694,7 @@ fn combined_scopes_overlap_without_counting_a_text_twice_or_replaying_replacemen
                 .replace("任务", "任务任务")
         );
     }
-    assert_eq!(
-        call(&mut p, "preview", json!({}))["stats"]["combined_hits"][0]["count"],
-        2
-    );
+    assert_eq!(call(&mut p, "preview", json!({}))["total_changes"], 2);
     f.unchanged();
 }
 
@@ -786,7 +927,7 @@ fn cancellation_preserves_import_and_export_files_and_allows_retry() {
     let existing = export.join("LocalizeDBSchema.tsv");
     fs::write(&existing, b"previous export").unwrap();
     let cancel_export =
-        Control::new(&|message| !message.is_some_and(|m| m.starts_with("导出来源表：")));
+        Control::new(&|message| !message.is_some_and(|m| m.starts_with("导出文本表：")));
     assert!(matches!(
         project.dispatch("export_text", &json!({"path":export}), &cancel_export),
         Err(bajptr_project::Error::Cancelled)
@@ -833,7 +974,7 @@ fn source_and_baseline_commits_report_success_after_a_late_cancel() {
     call(&mut project, "tables", json!({}));
     let late_source_cancel = std::cell::Cell::new(false);
     let cancel_after_commit = |message: Option<&str>| {
-        if message == Some("来源表已就绪。") {
+        if message == Some("文本表已就绪。") {
             late_source_cancel.set(true);
             false
         } else {
@@ -1569,7 +1710,7 @@ fn unchanged_source_inventory_reuses_metadata_without_opening_the_database() {
             "sources",
             &json!({}),
             &Control::new(&|message| {
-                if message == Some("来源表已就绪。") {
+                if message == Some("文本表已就绪。") {
                     ready_messages.set(ready_messages.get() + 1);
                 }
                 !message.is_some_and(|m| m.starts_with("正在读取初始底稿"))
@@ -2564,7 +2705,13 @@ fn current_documents_preserve_verified_replacement_behavior() {
         expected["version"]
     );
     let preview = call(&mut p, "preview", json!({}));
-    for (key, value) in expected["preview"].as_object().unwrap() {
+    // The historical Python fixture also recorded the retired main-table hit counts.
+    for (key, value) in expected["preview"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key.as_str() != "rule_hits")
+    {
         assert_eq!(&preview["stats"][key], value, "{key}");
     }
     for example in expected["templates"].as_array().unwrap() {

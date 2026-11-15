@@ -10,7 +10,7 @@ fn record_name(name: &str) -> &str {
     match name {
         "rules.tsv" => "替换词表",
         "text-edits.json" => "单条与批量修改",
-        "source-history.json" => "来源表记录",
+        "source-history.json" => "文本表记录",
         "application-state.json" => "应用状态记录",
         _ => name,
     }
@@ -48,7 +48,6 @@ fn about_link(ui: &mut egui::Ui, label: &str, url: &str) {
     if response.clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
-    response.on_hover_text(url);
 }
 
 // Share text filtering and full-text presentation without forcing both managers
@@ -63,7 +62,7 @@ pub(crate) fn record_filter(
         if ui
             .add(
                 egui::TextEdit::singleline(filter)
-                    .hint_text("搜索原文、替换结果或来源表")
+                    .hint_text("搜索原文、替换结果或文本表")
                     .desired_width(f32::INFINITY),
             )
             .changed()
@@ -82,12 +81,18 @@ pub(crate) struct ComparisonRow<'a> {
     pub active: bool,
 }
 
+pub(crate) enum ListSummary {
+    BeforeAfter,
+    BeforeOnly,
+}
+
 pub(crate) fn comparison_browser(
     ui: &mut egui::Ui,
     id: &str,
     rows: &[ComparisonRow<'_>],
     selected: &mut Option<usize>,
     labels: [&str; 2],
+    summary: ListSummary,
     mut multi: Option<&mut Selection>,
 ) {
     ui.push_id(id, |ui| {
@@ -139,25 +144,41 @@ pub(crate) fn comparison_browser(
                                     format!("{}：{} → {}", row.label, row.before, row.after),
                                 )
                             });
-                            for (offset, value, color) in
-                                [(6., row.before, TEXT), (30., row.after, BLUE)]
-                            {
-                                let mut line = ui.new_child(
-                                    egui::UiBuilder::new()
-                                        .max_rect(egui::Rect::from_min_size(
-                                            rect.min + egui::vec2(8., offset),
-                                            egui::vec2(rect.width() - 16., 20.),
-                                        ))
-                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            if matches!(summary, ListSummary::BeforeOnly) {
+                                let mut job = egui::text::LayoutJob::simple(
+                                    row.before.replace(['\r', '\n'], " "),
+                                    egui::FontId::proportional(16.),
+                                    TEXT,
+                                    (rect.width() - 16.).max(1.),
                                 );
-                                line.add(
-                                    egui::Label::new(
-                                        RichText::new(value.replace(['\r', '\n'], " "))
-                                            .color(color),
-                                    )
-                                    .selectable(false)
-                                    .truncate(),
-                                );
+                                job.wrap.max_rows = 2;
+                                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                                ui.painter()
+                                    .galley(rect.min + egui::vec2(8., 6.), galley, TEXT);
+                            } else {
+                                for (offset, value, color) in
+                                    [(6., row.before, TEXT), (30., row.after, BLUE)]
+                                {
+                                    let mut line = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(egui::Rect::from_min_size(
+                                                rect.min + egui::vec2(8., offset),
+                                                egui::vec2(rect.width() - 16., 20.),
+                                            ))
+                                            .layout(egui::Layout::left_to_right(
+                                                egui::Align::Center,
+                                            )),
+                                    );
+                                    line.add(
+                                        egui::Label::new(
+                                            RichText::new(value.replace(['\r', '\n'], " "))
+                                                .color(color),
+                                        )
+                                        .selectable(false)
+                                        .truncate()
+                                        .show_tooltip_when_elided(false),
+                                    );
+                                }
                             }
                             if response.clicked() {
                                 if let Some(multi) = multi.as_mut() {
@@ -207,16 +228,12 @@ pub(crate) fn comparison_browser(
     });
 }
 
-pub(crate) fn record_browser(
-    ui: &mut egui::Ui,
-    id: &str,
-    entries: &[&Value],
+pub(crate) fn record_comparisons<'a>(
+    entries: &[&'a Value],
     filter: &str,
-    selected: &mut Option<usize>,
     batch: bool,
-    multi: Option<&mut Selection>,
-) {
-    let rows = entries
+) -> Vec<ComparisonRow<'a>> {
+    entries
         .iter()
         .filter(|entry| edit_matches(entry, filter))
         .map(|entry| {
@@ -237,7 +254,19 @@ pub(crate) fn record_browser(
                 active: entry["active"] != false,
             }
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+pub(crate) fn record_browser(
+    ui: &mut egui::Ui,
+    id: &str,
+    entries: &[&Value],
+    filter: &str,
+    selected: &mut Option<usize>,
+    batch: bool,
+    multi: Option<&mut Selection>,
+) {
+    let rows = record_comparisons(entries, filter, batch);
     ui.colored_label(MUTED, format!("显示 {} / {} 段", rows.len(), entries.len()));
     comparison_browser(
         ui,
@@ -249,6 +278,7 @@ pub(crate) fn record_browser(
         } else {
             ["底稿原文", "修改后"]
         },
+        ListSummary::BeforeAfter,
         multi,
     );
 }
@@ -386,14 +416,15 @@ impl Desktop {
                             .inner_margin(18)
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
-                                ui.label(RichText::new("BA-JPTR").size(24.).strong().color(TEXT));
+                                ui.label(
+                                    RichText::new(bajptr_brand::NAME)
+                                        .size(24.)
+                                        .strong()
+                                        .color(TEXT),
+                                );
                                 ui.colored_label(
                                     MUTED,
-                                    format!(
-                                        "版本 {}（构建于 {}）",
-                                        env!("CARGO_PKG_VERSION"),
-                                        env!("BAJPTR_BUILD_TIME")
-                                    ),
+                                    format!("版本 {}", env!("CARGO_PKG_VERSION")),
                                 );
                                 ui.colored_label(
                                     MUTED,
@@ -435,6 +466,7 @@ impl Desktop {
                                 .spacing(egui::vec2(18., 10.))
                                 .show(ui, |ui| {
                                     for (label, value) in [
+                                        ("构建时间", env!("BAJPTR_BUILD_TIME")),
                                         ("源码版本", env!("BAJPTR_BUILD_COMMIT")),
                                         ("构建目标", env!("BAJPTR_BUILD_TARGET")),
                                         ("构建模式", env!("BAJPTR_BUILD_PROFILE")),
@@ -523,12 +555,11 @@ impl Desktop {
         self.about_dialog(ctx);
         if let Some(detail) = self.table_detail.clone() {
             let mut open = true;
-            window("来源表详情", ctx, 580.)
+            window("文本表详情", ctx, 580.)
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.heading(text(&detail, "label"));
                     ui.label(text(&detail, "purpose"));
-                    ui.colored_label(MUTED, text(&detail, "basis"));
                     ui.add_space(8.);
                     ui.label("原始表名");
                     ui.add(
@@ -673,12 +704,11 @@ impl Desktop {
                             {
                                 self.open_data_folder(".gui");
                             }
-                            for (name, error) in &errors {
+                            for (name, _) in &errors {
                                 ui.push_id(name, |ui| {
                                     egui::Frame::group(ui.style()).show(ui, |ui| {
                                         ui.horizontal_wrapped(|ui| {
-                                            ui.label(record_name(name))
-                                                .on_hover_text(format!("{name}\n{error}"));
+                                            ui.label(record_name(name));
                                             if [
                                                 "rules.tsv",
                                                 "text-edits.json",
@@ -855,7 +885,7 @@ impl Desktop {
                 ui.separator();
                 ui.horizontal(|ui| {
                     let label = if form.scope.is_empty() || form.scope == "[]" {
-                        "未选来源表".into()
+                        "未选文本表".into()
                     } else if form.scope.starts_with('[') {
                         format!(
                             "已选 {} 张表",
@@ -871,7 +901,7 @@ impl Desktop {
                             .unwrap_or(form.scope.clone())
                     };
                     ui.label(label);
-                    if ui.button("选择来源表…").clicked() {
+                    if ui.button("选择文本表…").clicked() {
                         let mut scope = ScopeForm::new(&form.scope, vec![]);
                         scope.old = form.old.clone();
                         scope.mode = form.mode.clone();
@@ -893,7 +923,7 @@ impl Desktop {
                             && !form.scope.is_empty()
                             && form.scope != "[]"
                             && (form.mode != "re" || form.raw || !form.draft.is_null()),
-                        "保存词条",
+                        "保存",
                     )
                     .clicked()
                     {
@@ -912,7 +942,7 @@ impl Desktop {
         };
         let mut open = true;
         let mut close = false;
-        window("选择来源表", ctx, 480.)
+        window("选择文本表", ctx, 480.)
             .id(egui::Id::unique("source-picker-compact"))
             .min_width(360.)
             .open(&mut open)
@@ -922,14 +952,8 @@ impl Desktop {
                         egui::TextEdit::singleline(&mut form.filter)
                             .font(egui::TextStyle::Body)
                             .hint_text("筛选中文名称或表名")
-                            .desired_width((ui.available_width() - 85.).max(140.)),
+                            .desired_width(ui.available_width()),
                     );
-                    if ui
-                        .add_enabled(form.request.is_none(), egui::Button::new("刷新"))
-                        .clicked()
-                    {
-                        self.query_scope_sources(&mut form);
-                    }
                 });
                 ui.horizontal_wrapped(|ui| {
                     for (label, operation) in
@@ -961,14 +985,14 @@ impl Desktop {
                     .show(ui, |ui| {
                         if form.request.is_some() {
                             ui.spinner();
-                            ui.colored_label(MUTED, "正在读取来源表…");
+                            ui.colored_label(MUTED, "正在读取文本表…");
                         } else if available.is_empty() && form.error.is_empty() {
                             ui.colored_label(
                                 MUTED,
                                 if form.old.is_empty() {
-                                    "未读取到来源表。"
+                                    "未读取到文本表。"
                                 } else {
-                                    "没有匹配的来源表。"
+                                    "没有匹配的文本表。"
                                 },
                             );
                         }
@@ -983,10 +1007,7 @@ impl Desktop {
                                 .allocate_ui_with_layout(
                                     egui::vec2(ui.available_width(), 34.),
                                     egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.checkbox(&mut checked, label)
-                                            .on_hover_text(text(&row, "purpose"))
-                                    },
+                                    |ui| ui.checkbox(&mut checked, label),
                                 )
                                 .inner;
                             if response.changed() {
@@ -1061,7 +1082,6 @@ impl Desktop {
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect();
-                    form.sample = text(&templates[&form.key], "example");
                     changed = true;
                 }
                 let template = &templates[&form.key];
@@ -1073,23 +1093,54 @@ impl Desktop {
                         .add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY))
                         .changed();
                 }
-                ui.label("试写文本");
-                changed |= ui
-                    .add(
-                        egui::TextEdit::multiline(&mut form.sample)
-                            .font(egui::TextStyle::Body)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(3),
-                    )
-                    .changed();
+                let example = form.example();
+                if form.sample != example {
+                    form.sample = example;
+                    changed = true;
+                }
                 if changed {
                     form.built = None;
                     form.result.clear();
                     form.error.clear();
                     self.template_changed = Some(Instant::now());
                 }
-                ui.label("替换效果");
-                ui.add(egui::Label::new(&form.result).wrap());
+                ui.separator();
+                ui.label(egui::RichText::new("替换示例").strong());
+                ui.columns(2, |columns| {
+                    for (column, (heading, value, color)) in columns.iter_mut().zip([
+                        ("替换前", form.sample.as_str(), TEXT),
+                        ("替换后", form.result.as_str(), BLUE),
+                    ]) {
+                        column.colored_label(MUTED, heading);
+                        egui::Frame::new()
+                            .fill(BG)
+                            .corner_radius(8)
+                            .inner_margin(10)
+                            .show(column, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                egui::ScrollArea::vertical()
+                                    .id_salt(heading)
+                                    .min_scrolled_height(0.)
+                                    .max_height(80.)
+                                    .show(ui, |ui| {
+                                        if heading == "替换后"
+                                            && form.built.is_none()
+                                            && form.error.is_empty()
+                                        {
+                                            ui.spinner();
+                                        } else {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(value).color(color),
+                                                )
+                                                .wrap()
+                                                .selectable(true),
+                                            );
+                                        }
+                                    });
+                            });
+                    }
+                });
                 if !form.error.is_empty() {
                     ui.colored_label(RED, &form.error);
                 }
@@ -1101,7 +1152,7 @@ impl Desktop {
                     self.submit(
                         "template",
                         json!({"key":form.key,"values":form.values,"sample":form.sample}),
-                        "正在试写…",
+                        "正在更新替换示例…",
                     );
                 }
                 ui.horizontal(|ui| {
@@ -1209,7 +1260,7 @@ impl Desktop {
                             form.error.clear();
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if primary(ui, true, "保存修改").clicked() {
+                            if primary(ui, true, "保存").clicked() {
                                 self.submit(
                                     "text_save",
                                     json!({"nonce":form.nonce,"text":form.value}),
@@ -1267,7 +1318,7 @@ impl Desktop {
                     }
                     if !form.error.is_empty() {ui.colored_label(RED,&form.error);}
                     ui.horizontal(|ui| {
-                        if primary(ui,!form.nonce.is_empty() && !form.changes.is_empty(),"保存修改").clicked() {
+                        if primary(ui,!form.nonce.is_empty() && !form.changes.is_empty(),"保存").clicked() {
                             self.submit("batch_save",json!({"nonce":form.nonce}),"正在保存选中文本修改…");
                         }
                     });
@@ -1327,7 +1378,8 @@ impl Desktop {
                         text(&first["edit"]["batch_operation"], "new"),
                         members.len()
                     ))
-                    .truncate(),
+                    .truncate()
+                    .show_tooltip_when_elided(false),
                 );
             } else {
                 ui.label("此批已没有文本段。");
@@ -1346,7 +1398,6 @@ impl Desktop {
                         selected.is_some() && !self.write_busy(),
                         "从本批移除此段",
                     )
-                    .on_hover_text("保留这段文本已有的单条修改。")
                     .clicked()
                         && let Some(entry) = selected
                     {
@@ -1386,10 +1437,10 @@ impl Desktop {
         }
         let mut open = true;
         let mut edit = None;
-        window("新增来源表 · 词条命中", ctx, 860.)
+        window("新增文本表 · 词条命中", ctx, 860.)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("以下词条在新增来源表中命中，尚未加入替换范围。");
+                ui.label("以下词条在新增文本表中命中，尚未加入替换范围。");
                 egui::ScrollArea::vertical()
                     .id_salt("new-source-notices")
                     .max_height((ctx.content_rect().height() - 240.).max(180.))
@@ -1401,8 +1452,7 @@ impl Desktop {
                                         "{} · {} 段",
                                         text(notice, "label"),
                                         count(notice, "fields")
-                                    ))
-                                    .on_hover_text(text(notice, "table"));
+                                    ));
                                     if secondary(ui, !self.write_busy(), "编辑词条").clicked() {
                                         edit = Some(count(notice, "index") as usize);
                                     }
@@ -1576,7 +1626,7 @@ impl Desktop {
                     .find(|e| Some(count(e, "index") as usize) == self.edit_view.selected)
                 {
                     ui.horizontal(|ui| {
-                        if primary(ui, entry["active"] == true, "编辑文本").clicked() {
+                        if primary(ui, entry["active"] == true, "编辑").clicked() {
                             self.submit(
                                 "text_open",
                                 json!({"edit_index":entry["index"]}),
