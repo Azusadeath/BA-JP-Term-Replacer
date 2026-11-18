@@ -425,6 +425,297 @@ fn workspace_backup_interrupted_restore_recovers_all_five_documents_on_restart()
 }
 
 #[test]
+fn batch_promotion_previews_and_fills_only_missing_unedited_rows() {
+    let mut f = Fixture::new();
+    add_source_rows(&mut f, false, 3);
+    fs::write(f.data.join(".gui/rules.tsv"), "").unwrap();
+    let mut p = f.ready_project();
+    let search = call(&mut p, "search", json!({"keyword":"任务"}));
+    let rows = search["rows"].as_array().unwrap();
+    let indices: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row["table"] == "LocalizeSkillDBSchema")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(indices.len(), 3);
+    let first = call(
+        &mut p,
+        "batch_preview",
+        json!({"search_nonce":search["nonce"],"indices":[indices[0]],"old":"任务","new":"委托"}),
+    );
+    call(&mut p, "batch_save", json!({"nonce":first["nonce"]}));
+
+    let report = call(&mut p, "promotion_start", json!({}));
+    let item = &report["retained_items"][0];
+    assert_eq!(item["table"], "LocalizeSkillDBSchema");
+    assert_eq!(item["missing"], 2);
+    assert_eq!(item["attention"], 0);
+    let review = json!({"nonce":report["review_nonce"],"item":item["review_item"]});
+    let preview = call(&mut p, "promotion_missing_preview", review.clone());
+    assert_eq!(p.edits.len(), 1);
+    let changes = preview["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 2);
+    for (change, index) in changes.iter().zip(&indices[1..]) {
+        assert_eq!(change["row_id"], rows[*index]["row_id"]);
+        assert_eq!(change["before"], "阿罗娜的任务");
+        assert_eq!(change["after"], "阿罗娜的委托");
+    }
+    let single = call(
+        &mut p,
+        "text_open",
+        json!({"search_nonce":search["nonce"],"index":indices[2]}),
+    );
+    call(
+        &mut p,
+        "text_save",
+        json!({"nonce":single["nonce"],"text":"自定义任务"}),
+    );
+    assert!(
+        p.dispatch("batch_save", &json!({"nonce":preview["nonce"]}), &control())
+            .is_err()
+    );
+    let fresh = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(fresh["retained_items"][0]["missing"], 1);
+    let repair = call(
+        &mut p,
+        "promotion_missing_preview",
+        json!({"nonce":fresh["review_nonce"],"item":fresh["retained_items"][0]["review_item"]}),
+    );
+    assert_eq!(repair["changes"].as_array().unwrap().len(), 1);
+    call(&mut p, "batch_save", json!({"nonce":repair["nonce"]}));
+    assert_eq!(p.edits.len(), 3);
+    let single_index = p.edits.iter().position(|e| !e.batch).unwrap();
+    assert_eq!(p.edits[single_index].replacement, "自定义任务");
+    let edits_before = p.edits.clone();
+    let no_supplement = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(no_supplement["count"], 0);
+    assert_eq!(no_supplement["retained"], 1);
+    assert!(
+        no_supplement["retained_items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        p.dispatch(
+            "promotion_missing_preview",
+            &json!({"nonce":no_supplement["review_nonce"],"item":0}),
+            &control(),
+        )
+        .is_err()
+    );
+    assert_eq!(p.edits, edits_before);
+    call(&mut p, "remove_edit", json!({"index":single_index}));
+    let fresh = call(&mut p, "promotion_start", json!({}));
+    let repair = call(
+        &mut p,
+        "promotion_missing_preview",
+        json!({"nonce":fresh["review_nonce"],"item":fresh["retained_items"][0]["review_item"]}),
+    );
+    assert_eq!(repair["changes"].as_array().unwrap().len(), 1);
+    call(&mut p, "batch_save", json!({"nonce":repair["nonce"]}));
+    assert!(
+        p.dispatch("promotion_missing_preview", &review, &control())
+            .is_err()
+    );
+    assert_eq!(call(&mut p, "promotion_start", json!({}))["count"], 1);
+    assert!(p.edits.is_empty());
+    f.unchanged();
+}
+
+#[test]
+fn reviewed_batch_gaps_stay_hidden_after_reopening_and_new_gaps_still_show() {
+    let mut f = Fixture::new();
+    add_source_rows(&mut f, false, 3);
+    fs::write(f.data.join(".gui/rules.tsv"), "").unwrap();
+    let mut p = f.ready_project();
+    let search = call(
+        &mut p,
+        "search",
+        json!({"keyword":"任务","source":"LocalizeSkillDBSchema"}),
+    );
+    let batch = call(
+        &mut p,
+        "batch_preview",
+        json!({"search_nonce":search["nonce"],"indices":[0,1],"old":"任务","new":"委托"}),
+    );
+    call(&mut p, "batch_save", json!({"nonce":batch["nonce"]}));
+    let before = fs::read(f.data.join(".gui/text-edits.json")).unwrap();
+    let preview = call(&mut p, "promotion_preview", json!({}));
+    assert_eq!(preview["items"][0]["missing"], 1);
+    assert!(
+        p.dispatch(
+            "promotion_mark_reviewed",
+            &json!({"nonce":preview["nonce"],"version":"other"}),
+            &control(),
+        )
+        .is_err()
+    );
+    let reviewed = call(
+        &mut p,
+        "promotion_mark_reviewed",
+        json!({"nonce":preview["nonce"],"version":search["version"]}),
+    );
+    assert_eq!(reviewed["reviewed"], 1);
+    assert_eq!(
+        fs::read(f.data.join(".gui/text-edits.json")).unwrap(),
+        before
+    );
+    drop(p);
+    let mut p = f.project();
+    let report = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(report["count"], 0);
+    assert_eq!(report["retained_items"], json!([]));
+    call(&mut p, "remove_edit", json!({"index":0}));
+    let report = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(report["retained_items"][0]["missing"], 1);
+    let preview = call(
+        &mut p,
+        "promotion_missing_preview",
+        json!({"nonce":report["review_nonce"],"item":report["retained_items"][0]["review_item"]}),
+    );
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["changes"][0]["row_id"], search["rows"][0]["row_id"]);
+    f.unchanged();
+}
+
+#[test]
+fn promotion_only_prompts_for_new_matches_after_a_partial_batch_migrates() {
+    use bajptr_core::{
+        codec, database,
+        rules::{Evidence, Rules},
+    };
+
+    fn publish_scope_version(f: &mut Fixture, moved: bool) {
+        let live = region::locate(f.game.to_str().unwrap()).unwrap();
+        let plain = f.root.join(if moved {
+            "scope-new.db"
+        } else {
+            "scope-old.db"
+        });
+        let encrypted = f.root.join(if moved {
+            "scope-new.enc"
+        } else {
+            "scope-old.enc"
+        });
+        let key = codec::key(region::KEY).unwrap();
+        codec::decrypt(&live.bundle, &plain, &key, &control()).unwrap();
+        let con = rusqlite::Connection::open(&plain).unwrap();
+        if moved {
+            con.execute("DELETE FROM LocalizeDBSchema WHERE rowid IN (21,22)", [])
+                .unwrap();
+        }
+        let blob: Vec<u8> = con
+            .query_row(
+                "SELECT Bytes FROM LocalizeDBSchema WHERE rowid=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rules = Rules::new(vec![]).unwrap();
+        let texts = if moved {
+            vec![(41, "省略的任务"), (42, "新增的任务")]
+        } else {
+            vec![(21, "省略的任务"), (22, "旧版另一个任务")]
+        };
+        for (id, text) in texts {
+            let (updated, _) = database::patch_blob(
+                &blob,
+                &rules,
+                &rules.view("LocalizeDBSchema"),
+                &mut Evidence::new(0, false),
+                &serde_json::from_value(json!({})).unwrap(),
+                &[(0, text.to_string())].into_iter().collect(),
+            )
+            .unwrap();
+            con.execute(
+                "INSERT INTO LocalizeDBSchema(rowid, Bytes) VALUES (?1, ?2)",
+                rusqlite::params![id, updated.unwrap()],
+            )
+            .unwrap();
+        }
+        drop(con);
+        let (_, checked) =
+            codec::encrypt_checked(&plain, &encrypted, &key, &[0; 16], &[], &control()).unwrap();
+        fs::copy(
+            &encrypted,
+            live.bundle
+                .with_file_name(format!("123456_{}", checked.crc)),
+        )
+        .unwrap();
+        region::publish_catalog(&live, fs::metadata(&encrypted).unwrap().len(), checked.crc)
+            .unwrap();
+        if moved {
+            fs::write(
+                live.catalog.with_file_name("TableCatalog.hash"),
+                b"scope-update-fixture",
+            )
+            .unwrap();
+        }
+        f.before = fs::read(&live.catalog).unwrap();
+    }
+
+    let mut f = Fixture::new();
+    publish_scope_version(&mut f, false);
+    fs::write(f.data.join(".gui/rules.tsv"), "").unwrap();
+    let mut p = f.ready_project();
+    let search = call(&mut p, "search", json!({"keyword":"任务"}));
+    let index = search["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|row| row["row_id"] == 1)
+        .unwrap();
+    let draft = call(
+        &mut p,
+        "batch_preview",
+        json!({"search_nonce":search["nonce"],"indices":[index],"old":"任务","new":"委托"}),
+    );
+    call(&mut p, "batch_save", json!({"nonce":draft["nonce"]}));
+    publish_scope_version(&mut f, true);
+    let ready = call(&mut p, "check", json!({}));
+    call(
+        &mut p,
+        "baseline_commit",
+        json!({"token":ready["baseline_status"]["token"]}),
+    );
+    let migration = call(&mut p, "migration_preview", json!({}));
+    let candidate = migration["items"][0]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|candidate| candidate["row"][1] == 1)
+        .unwrap();
+    call(
+        &mut p,
+        "migration_commit",
+        json!({"nonce":migration["nonce"],"choices":[{"item":0,"candidate":candidate}]}),
+    );
+    drop(p);
+
+    let mut p = f.project();
+    let report = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(report["count"], 0);
+    let item = &report["retained_items"][0];
+    assert_eq!(item["missing"], 1);
+    assert_eq!(item["attention"], 1);
+    let preview = call(
+        &mut p,
+        "promotion_missing_preview",
+        json!({"nonce":report["review_nonce"],"item":item["review_item"]}),
+    );
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["changes"][0]["before"], "新增的任务");
+    call(&mut p, "batch_save", json!({"nonce":preview["nonce"]}));
+    let again = call(&mut p, "promotion_start", json!({}));
+    assert_eq!(again["count"], 0);
+    assert!(again["retained_items"].as_array().unwrap().is_empty());
+    assert_eq!(p.edits.len(), 2);
+    f.unchanged();
+}
+
+#[test]
 fn batch_promotion_preserves_results_backs_up_both_documents_and_undoes_together() {
     let (f, mut p) = combined_fixture();
     let rules = p.rules.clone();
@@ -1224,6 +1515,10 @@ fn receipt_maintenance_keeps_missing_applied_games_and_live_restored_games() {
 }
 
 fn add_new_source(f: &mut Fixture, malformed: bool) {
+    add_source_rows(f, malformed, 1);
+}
+
+fn add_source_rows(f: &mut Fixture, malformed: bool, copies: usize) {
     let game = region::locate(f.game.to_str().unwrap()).unwrap();
     let plain = f.root.join("new-source.db");
     let encrypted = f.root.join("new-source.encrypted");
@@ -1231,6 +1526,13 @@ fn add_new_source(f: &mut Fixture, malformed: bool) {
     bajptr_core::codec::decrypt(&game.bundle, &plain, &key, &control()).unwrap();
     let con = rusqlite::Connection::open(&plain).unwrap();
     con.execute_batch("CREATE TABLE LocalizeSkillDBSchema(Bytes BLOB); INSERT INTO LocalizeSkillDBSchema SELECT Bytes FROM LocalizeDBSchema WHERE rowid=1;").unwrap();
+    for _ in 1..copies {
+        con.execute(
+            "INSERT INTO LocalizeSkillDBSchema SELECT Bytes FROM LocalizeDBSchema WHERE rowid=1",
+            [],
+        )
+        .unwrap();
+    }
     if malformed {
         con.execute_batch("UPDATE LocalizeSkillDBSchema SET Bytes=X'010203'")
             .unwrap();
@@ -1749,15 +2051,43 @@ fn generate_fixture_patch(p: &mut Project) -> bajptr_project::Result<Value> {
 }
 
 #[test]
+fn preview_rejects_damaged_live_bytes_with_the_same_catalog_entry() {
+    let f = Fixture::new();
+    let mut p = f.ready_project();
+    let original = call(&mut p, "preview", json!({}));
+    assert!(original["total_changes"].as_u64().unwrap() > 0);
+    let live = region::locate(f.game.to_str().unwrap()).unwrap();
+    let mut bytes = fs::read(&live.bundle).unwrap();
+    bytes[4000] ^= 1;
+    fs::write(&live.bundle, bytes).unwrap();
+    let error = p.dispatch("preview", &json!({}), &control()).unwrap_err();
+    assert!(error.to_string().contains("HMAC"), "{error}");
+    f.unchanged();
+}
+
+#[test]
 fn prepared_preview_never_writes_game_and_reopens_without_rebuilding() {
     let f = Fixture::new();
     let mut p = f.ready_project();
+    let search = call(&mut p, "search", json!({"keyword":"任务"}));
     let preview = call(&mut p, "preview", json!({}));
-    let prepared = call(&mut p, "prepare_patch", json!({"nonce":preview["nonce"]}));
+    let cached_source =
+        Control::new(&|message| !message.is_some_and(|m| m.starts_with("正在解密数据库")));
+    let prepared = p
+        .dispatch(
+            "prepare_patch",
+            &json!({"nonce":preview["nonce"]}),
+            &cached_source,
+        )
+        .unwrap();
     assert_eq!(prepared["ready"], true);
     assert_eq!(prepared["reused"], false);
     assert!(!f.data.join("output").exists());
     f.unchanged();
+    let searched_again = p
+        .dispatch("search", &json!({"keyword":"任务"}), &cached_source)
+        .unwrap();
+    assert_eq!(searched_again["rows"], search["rows"]);
     let reopened = call(&mut p, "preview", json!({}));
     let reused = call(&mut p, "prepare_patch", json!({"nonce":reopened["nonce"]}));
     assert_eq!(reused["cache_id"], prepared["cache_id"]);
@@ -2196,6 +2526,156 @@ fn migration_after_update_preserves_pairs_backs_up_and_rejects_stale_or_cancelle
         0
     );
     f.unchanged();
+}
+
+#[test]
+fn migration_replays_paired_edits_on_changed_and_moved_baseline_text() {
+    use bajptr_core::{
+        database,
+        rules::{Evidence, Rules},
+    };
+    let f = Fixture::new();
+    let mut project = f.ready_project();
+    let search = call(&mut project, "search", json!({"keyword":"任务"}));
+    let opened = call(
+        &mut project,
+        "text_open",
+        json!({"index":0,"search_nonce":search["nonce"]}),
+    );
+    let single = format!("校订{}", opened["original"].as_str().unwrap());
+    call(
+        &mut project,
+        "text_save",
+        json!({"nonce":opened["nonce"],"text":single}),
+    );
+    let batch = call(
+        &mut project,
+        "batch_preview",
+        json!({"search_nonce":search["nonce"],"indices":[0],"old":"任务","new":"委托"}),
+    );
+    call(&mut project, "batch_save", json!({"nonce":batch["nonce"]}));
+    assert!(project.edits.iter().all(|e| e.anchor.is_some()));
+    let old_edits = project.edits.clone();
+    let source = &old_edits[0];
+
+    let game = region::locate(f.game.to_str().unwrap()).unwrap();
+    let plain = f.root.join("changed-base.db");
+    let encrypted = f.root.join("changed-base.enc");
+    let key = bajptr_core::codec::key(region::KEY).unwrap();
+    bajptr_core::codec::decrypt(&game.bundle, &plain, &key, &control()).unwrap();
+    let con = rusqlite::Connection::open(&plain).unwrap();
+    assert_eq!(source.table, "LocalizeDBSchema");
+    let database::RowId::Integer(id) = source.row_id else {
+        panic!("expected numeric fixture ID");
+    };
+    let blob: Vec<u8> = con
+        .query_row(
+            "SELECT Bytes FROM LocalizeDBSchema WHERE rowid=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let original = format!("{}，奖励增加", source.original);
+    let rules = Rules::new(vec![]).unwrap();
+    let (new_blob, _) = database::patch_blob(
+        &blob,
+        &rules,
+        &rules.view(&source.table),
+        &mut Evidence::new(0, false),
+        &serde_json::from_value(json!({})).unwrap(),
+        &[(source.slot, original.clone())].into_iter().collect(),
+    )
+    .unwrap();
+    con.execute(
+        "UPDATE LocalizeDBSchema SET rowid=999, Bytes=?1 WHERE rowid=?2",
+        rusqlite::params![new_blob.unwrap(), id],
+    )
+    .unwrap();
+    con.execute_batch(
+        "CREATE TABLE LocalizeSkillDBSchema(Bytes BLOB);
+        INSERT INTO LocalizeSkillDBSchema SELECT Bytes FROM LocalizeDBSchema WHERE rowid=999;",
+    )
+    .unwrap();
+    drop(con);
+    let (_, inspection) =
+        bajptr_core::codec::encrypt_checked(&plain, &encrypted, &key, &[0; 16], &[], &control())
+            .unwrap();
+    fs::copy(
+        &encrypted,
+        game.bundle
+            .with_file_name(format!("123456_{}", inspection.crc)),
+    )
+    .unwrap();
+    region::publish_catalog(
+        &game,
+        fs::metadata(&encrypted).unwrap().len(),
+        inspection.crc,
+    )
+    .unwrap();
+    fs::write(
+        game.catalog.with_file_name("TableCatalog.hash"),
+        b"changed-migration-fixture",
+    )
+    .unwrap();
+    let catalog = fs::read(&game.catalog).unwrap();
+    let checked = call(&mut project, "check", json!({}));
+    call(
+        &mut project,
+        "baseline_commit",
+        json!({"token":checked["baseline_status"]["token"]}),
+    );
+
+    let review = call(&mut project, "migration_start", json!({}));
+    assert_eq!(review["automatic_count"], 0);
+    let plan = &review["plan"];
+    let found = call(
+        &mut project,
+        "migration_find",
+        json!({"nonce":plan["nonce"],"revision":plan["revision"],"item":0,"keyword":"奖励增加"}),
+    );
+    assert_eq!(found["added"], 1);
+    let item = &found["value"];
+    assert!(
+        item["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["row"][0] == "LocalizeSkillDBSchema")
+    );
+    let candidate = item["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c["row"][1] == 999 && c["row"][3] == original)
+        .unwrap();
+    let expected_single = format!("校订{original}");
+    let expected_batch = expected_single.replace("任务", "委托");
+    assert_eq!(item["proposals"][candidate]["replacement"], expected_batch);
+    call(
+        &mut project,
+        "migration_commit",
+        json!({"nonce":plan["nonce"],"revision":plan["revision"],"choices":[{"item":0,"candidate":candidate}]}),
+    );
+    assert!(
+        project
+            .edits
+            .iter()
+            .all(|e| e.original == original && e.row_id == database::RowId::Integer(999))
+    );
+    assert_eq!(
+        project.edits.iter().find(|e| !e.batch).unwrap().replacement,
+        expected_single
+    );
+    let batch = project.edits.iter().find(|e| e.batch).unwrap();
+    assert_eq!(batch.replacement, expected_batch);
+    assert_eq!(
+        batch.batch_operation.as_ref().unwrap().before,
+        expected_single
+    );
+    call(&mut project, "preview", json!({}));
+    assert_eq!(fs::read(&game.catalog).unwrap(), catalog);
+    call(&mut project, "history", json!({"undo":true}));
+    assert_eq!(project.edits, old_edits);
 }
 
 #[test]

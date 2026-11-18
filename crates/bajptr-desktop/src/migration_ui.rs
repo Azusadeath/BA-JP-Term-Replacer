@@ -4,9 +4,9 @@ use serde_json::json;
 
 fn comparison(ui: &mut egui::Ui, original: &str, replacement: &str) {
     ui.columns(2, |cols| {
-        cols[0].colored_label(MUTED, "底稿原文");
+        cols[0].colored_label(MUTED, "旧版原文");
         cols[0].add(egui::Label::new(original).wrap().selectable(true));
-        cols[1].colored_label(MUTED, "迁移后");
+        cols[1].colored_label(MUTED, "旧版修改结果");
         cols[1].add(
             egui::Label::new(RichText::new(replacement).color(BLUE))
                 .wrap()
@@ -261,7 +261,7 @@ impl Desktop {
                 let equal = group.equal_count();
                 let competing = form.has_competing(index);
                 let is_confirmed = group.confirmed;
-                let contexts = form.context_groups(index);
+
                 egui::ScrollArea::vertical()
                     .id_salt(("migration-detail", index))
                     .min_scrolled_height(0.)
@@ -279,77 +279,97 @@ impl Desktop {
                         ui.add_space(10.);
                         ui.separator();
                         if competing {
-                            ui.colored_label(
-                                ORANGE,
-                                "同一位置对应不同的旧修改，请选择要保留的结果。",
-                            );
-                            if !equal {
-                                ui.label(format!("最多选择 {old_count} 处。"));
-                            }
-                        } else {
-                            ui.label(format!("选择新版中要恢复修改的位置，最多 {old_count} 处。"));
+                            ui.colored_label(ORANGE, "这段新版文本也出现在其他组的候选中。");
                         }
-                        for (bucket, (context, candidates)) in contexts.iter().enumerate() {
-                            let reserved = candidates.iter().any(|&c| form.reserved(index, c));
-                            let checked = candidates
-                                .iter()
-                                .all(|c| form.groups[index].chosen.contains(c));
-                            let selected_count = candidates
-                                .iter()
-                                .filter(|c| !form.groups[index].chosen.contains(c))
-                                .count()
-                                + form.groups[index].chosen.len();
-                            let selectable = !busy
-                                && !is_confirmed
-                                && !reserved
-                                && (checked || selected_count <= old_count);
-                            egui::Frame::new()
-                                .fill(BG)
-                                .corner_radius(6)
-                                .inner_margin(10)
-                                .show(ui, |ui| {
+                        if let Some(reason) = match item["kind"].as_str() {
+                            Some("occupied") => Some("对应位置已有新版修改。"),
+                            Some("missing_table") => Some("新版底稿中找不到原文本表。"),
+                            Some("unsupported_table") => Some("原文本表无法自动核对。"),
+                            Some("unavailable") => Some("未找到候选文本。"),
+                            _ => None,
+                        } {
+                            ui.colored_label(ORANGE, reason);
+                        }
+                        if !is_confirmed {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_enabled(!busy, egui::TextEdit::singleline(&mut form.keyword)
+                                    .hint_text("输入新版原文中的文字").desired_width(205.));
+                                let available = !busy && !form.keyword.trim().is_empty();
+                                if secondary(ui, available, "查找新版文本").clicked() {
+                                    let item = form.groups[index].members[0];
+                                    self.submit("migration_find", json!({"nonce":form.plan["nonce"],"revision":form.plan["revision"],"item":item,"keyword":form.keyword.trim()}), "正在查找新版文本…");
+                                }
+                            });
+                            if !form.search_message.is_empty() {
+                                ui.colored_label(MUTED, &form.search_message);
+                            }
+                        }
+                        if new_count > 0 && !equal {
+                            ui.label(format!("最多选择 {old_count} 处新版文本。"));
+                        }
+                        let page = &mut form.groups[index].candidate_page;
+                        let page_count = new_count.div_ceil(20);
+                        if page_count > 1 {
+                            ui.horizontal(|ui| {
+                                if secondary(ui, *page > 0, "上一页").clicked() { *page -= 1; }
+                                ui.label(format!("第 {} / {page_count} 页", *page + 1));
+                                if secondary(ui, *page + 1 < page_count, "下一页").clicked() { *page += 1; }
+                            });
+                        }
+                        let start = *page * 20;
+                        for candidate in start..new_count.min(start + 20) {
+                                let entry = &item["candidates"][candidate];
+                                let row = &entry["row"];
+                                let context = text(entry, "context");
+                                let proposal = &item["proposals"][candidate];
+                                let reserved = form.reserved(index, candidate);
+                                let mut checked = form.groups[index].chosen.contains(&candidate);
+                                let selectable = !busy && !is_confirmed && !reserved
+                                    && (checked || form.groups[index].chosen.len() < old_count);
+                                let label = format!("{} · 记录 {} · 字段 {}", bajptr_project::model::title(row[0].as_str().unwrap_or_default()),
+                                    row[1].as_str().map(str::to_owned).unwrap_or_else(|| row[1].to_string()), row[2]);
+                                egui::Frame::new().fill(BG).corner_radius(6).inner_margin(10).show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
-                                    ui.push_id(bucket, |ui| {
-                                        if !equal {
-                                            let mut value = checked;
-                                            if ui
-                                                .add_enabled(
-                                                    selectable,
-                                                    egui::Checkbox::new(
-                                                        &mut value,
-                                                        format!("{} 处", candidates.len()),
-                                                    ),
-                                                )
-                                                .changed()
-                                            {
-                                                form.toggle_context(index, candidates, value);
-                                            }
-                                        } else if candidates.len() > 1 {
-                                            ui.colored_label(
-                                                MUTED,
-                                                format!("{} 处上下文相同", candidates.len()),
-                                            );
+                                    ui.push_id(candidate, |ui| {
+                                        if equal {
+                                            ui.colored_label(MUTED, &label);
+                                        } else if ui.add_enabled(selectable, egui::Checkbox::new(&mut checked, &label)).changed() {
+                                            form.toggle_context(index, &[candidate], checked);
                                         }
-                                        ui.add(
-                                            egui::Label::new(if context.is_empty() {
-                                                "没有其他文本可供区分。"
-                                            } else {
-                                                context.as_str()
-                                            })
-                                            .wrap()
-                                            .selectable(true),
-                                        );
+                                        ui.add(egui::Label::new(row[3].as_str().unwrap_or_default()).wrap().selectable(true));
+                                        if !context.is_empty() {
+                                            ui.add(egui::Label::new(RichText::new(context).color(MUTED)).wrap().selectable(true));
+                                        }
                                         if reserved {
                                             ui.colored_label(ORANGE, "已分配给另一组修改。");
-                                        } else if !equal && candidates.len() > old_count {
-                                            ui.colored_label(
-                                                ORANGE,
-                                                "相同上下文无法区分具体位置，此组暂不迁移。",
-                                            );
+                                        }
+                                        if proposal.is_null() { return; }
+                                        let reason = text(proposal, "reason");
+                                        if !reason.is_empty() { ui.add(egui::Label::new(RichText::new(reason).color(ORANGE)).wrap()); }
+                                        let group = &mut form.groups[index];
+                                        if checked && proposal["editable"] == true {
+                                            let mut input = group.edits.get(&candidate).cloned().unwrap_or_else(|| text(proposal, "input"));
+                                            if ui.add_enabled(!busy && !is_confirmed, egui::TextEdit::multiline(&mut input)
+                                                .desired_rows(2).desired_width(ui.available_width()).hint_text("输入迁移后的文字")).changed() {
+                                                group.edits.insert(candidate, input);
+                                            }
+                                            if proposal["input"].is_null() && !group.edits.contains_key(&candidate)
+                                                && secondary(ui, !busy && !is_confirmed, "使用空文本").clicked() {
+                                                group.edits.insert(candidate, String::new());
+                                            }
+                                        }
+                                        let replaced = if let Some(input) = group.edits.get(&candidate) {
+                                            if let Some(old) = proposal["batch_old"].as_str() {
+                                                input.contains(old).then(|| input.replace(old, &text(proposal, "batch_new")))
+                                            } else { Some(input.clone()) }
+                                        } else { proposal["replacement"].as_str().map(str::to_owned) };
+                                        if let Some(result) = replaced {
+                                            ui.colored_label(MUTED, "迁移后文本");
+                                            ui.add(egui::Label::new(RichText::new(if result.is_empty() { "（空文本）".into() } else { result }).color(BLUE)).wrap().selectable(true));
                                         }
                                     });
                                 });
-                            ui.add_space(5.);
+                                ui.add_space(5.);
                         }
                     });
             } else {

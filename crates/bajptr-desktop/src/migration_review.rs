@@ -1,6 +1,6 @@
 use crate::state::{slice, text};
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub struct ReviewGroup {
     pub members: Vec<usize>,
@@ -8,10 +8,40 @@ pub struct ReviewGroup {
     pub targets: Vec<String>,
     pub chosen: BTreeSet<usize>,
     pub confirmed: bool,
+    pub edits: BTreeMap<usize, String>,
+    pub candidate_page: usize,
 }
 impl ReviewGroup {
     pub fn equal_count(&self) -> bool {
-        !self.targets.is_empty() && self.targets.len() == self.members.len()
+        !self.targets.is_empty()
+            && self.targets.len() == self.members.len()
+            && self.item["kind"] != "manual"
+            && slice(&self.item, "proposals").iter().all(Value::is_null)
+    }
+}
+
+fn targets(item: &Value) -> Vec<String> {
+    slice(item, "candidates")
+        .iter()
+        .map(|candidate| {
+            let row = &candidate["row"];
+            json!([row[0], row[1], row[2]]).to_string()
+        })
+        .collect()
+}
+
+impl ReviewGroup {
+    pub fn result_ready(&self, candidate: usize) -> bool {
+        let proposal = &self.item["proposals"][candidate];
+        if proposal.is_null() {
+            return true;
+        }
+        if let Some(edited) = self.edits.get(&candidate) {
+            return proposal["batch_old"]
+                .as_str()
+                .is_none_or(|old| edited.contains(old));
+        }
+        proposal["replacement"].is_string()
     }
 }
 
@@ -23,22 +53,22 @@ pub struct MigrationForm {
     pub filter: String,
     pub show_confirmed: bool,
     pub error: String,
+    pub keyword: String,
+    pub search_message: String,
 }
 impl MigrationForm {
     pub fn new(plan: Value) -> Self {
         let mut groups: Vec<ReviewGroup> = Vec::new();
         let mut positions = HashMap::<(String, Vec<String>), usize>::new();
         for (index, item) in slice(&plan, "items").iter().enumerate() {
-            let targets: Vec<_> = slice(item, "candidates")
-                .iter()
-                .map(|c| {
-                    let row = &c["row"];
-                    json!([row[0], row[1], row[2]]).to_string()
-                })
-                .collect();
+            let targets = targets(item);
             let key = text(item, "group_key");
             let signature = (
-                if key.is_empty() {
+                if key.is_empty()
+                    || targets.is_empty()
+                    || slice(item, "proposals").iter().any(|p| !p.is_null())
+                    || item["equivalent_group"] == false
+                {
                     format!("ungrouped-{index}")
                 } else {
                     key
@@ -55,6 +85,8 @@ impl MigrationForm {
                     targets,
                     chosen: BTreeSet::new(),
                     confirmed: false,
+                    edits: BTreeMap::new(),
+                    candidate_page: 0,
                 });
             }
         }
@@ -67,6 +99,8 @@ impl MigrationForm {
             filter: String::new(),
             show_confirmed: false,
             error: String::new(),
+            keyword: String::new(),
+            search_message: String::new(),
         }
     }
     pub fn visible(&self) -> Vec<usize> {
@@ -125,7 +159,9 @@ impl MigrationForm {
         !group.confirmed
             && !selected.is_empty()
             && selected.len() <= group.members.len()
-            && selected.iter().all(|&c| !self.reserved(index, c))
+            && selected
+                .iter()
+                .all(|&c| !self.reserved(index, c) && group.result_ready(c))
     }
     pub fn confirm(&mut self, index: usize) -> bool {
         if !self.can_confirm(index) {
@@ -153,26 +189,72 @@ impl MigrationForm {
             .iter()
             .filter(|g| g.confirmed)
             .flat_map(|g| {
-                g.members
-                    .iter()
-                    .zip(&g.chosen)
-                    .map(|(&item, &candidate)| json!({"item":item,"candidate":candidate}))
+                g.members.iter().zip(&g.chosen).map(|(&item, &candidate)| {
+                    let mut choice = json!({"item":item,"candidate":candidate});
+                    if let Some(edit) = g.edits.get(&candidate) {
+                        choice["text"] = json!(edit);
+                    }
+                    choice
+                })
             })
             .collect();
         json!({"nonce":self.plan["nonce"],"revision":self.plan["revision"],"choices":choices})
     }
-    pub fn context_groups(&self, index: usize) -> Vec<(String, Vec<usize>)> {
-        let group = &self.groups[index];
-        let mut buckets: Vec<(String, Vec<usize>)> = Vec::new();
-        for (candidate, value) in slice(&group.item, "candidates").iter().enumerate() {
-            let context = text(value, "context");
-            if let Some((_, indices)) = buckets.iter_mut().find(|(c, _)| c == &context) {
-                indices.push(candidate);
-            } else {
-                buckets.push((context, vec![candidate]));
-            }
+    pub fn apply_search_result(&mut self, data: &Value) {
+        if data["nonce"] != self.plan["nonce"] {
+            return;
         }
-        buckets
+        let Some(item_index) = data["item"].as_u64().map(|n| n as usize) else {
+            return;
+        };
+        let Some(index) = self
+            .groups
+            .iter()
+            .position(|g| g.members.contains(&item_index) && !g.confirmed)
+        else {
+            return;
+        };
+        let added = data["added"].as_u64().unwrap_or_default();
+        let total = data["total"].as_u64().unwrap_or_default();
+        let occupied = data["occupied"].as_u64().unwrap_or_default();
+        self.search_message = if total == 0 {
+            "新版底稿中没有匹配文本。".into()
+        } else if total > 30 {
+            format!("找到 {total} 段，已加入 {added} 个候选。可输入更具体的文字。")
+        } else if occupied > 0 {
+            format!("已加入 {added} 个候选，{occupied} 段已有新版修改。")
+        } else {
+            format!("已加入 {added} 个候选。")
+        };
+        if added == 0 {
+            return;
+        }
+        let item = data["value"].clone();
+        self.plan["items"][item_index] = item.clone();
+        let group = &mut self.groups[index];
+        if group.members.len() > 1 {
+            group.members.retain(|&member| member != item_index);
+            group.item = self.plan["items"][group.members[0]].clone();
+            group.chosen.clear();
+            self.groups.insert(
+                index + 1,
+                ReviewGroup {
+                    members: vec![item_index],
+                    targets: targets(&item),
+                    item,
+                    chosen: BTreeSet::new(),
+                    confirmed: false,
+                    edits: BTreeMap::new(),
+                    candidate_page: 0,
+                },
+            );
+            self.selected = Some(index + 1);
+        } else {
+            group.targets = targets(&item);
+            group.item = item;
+            group.candidate_page = (group.targets.len().saturating_sub(added as usize)) / 20;
+            self.selected = Some(index);
+        }
     }
     pub fn toggle_context(&mut self, index: usize, candidates: &[usize], checked: bool) {
         if self.groups[index].confirmed {

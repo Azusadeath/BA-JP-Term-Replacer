@@ -1,13 +1,98 @@
 use crate::{
     Control, Result, combined,
-    model::{self, Edit},
+    model::{self, Edit, PreviousBatchScope},
+    storage,
 };
 use bajptr_core::{
-    database,
-    rules::{Rule, Rules},
+    database::{self, RowId, TextRow},
+    fields,
+    rules::{Evidence, Rule, Rules, View},
 };
 use serde::Serialize;
+use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub(crate) fn review_path(data: &Path, game: &str, version: &str, skip: bool) -> PathBuf {
+    let key = storage::digest(json!([game, version, skip]).to_string().as_bytes());
+    data.join(".gui").join(format!("batch-review-{key}.json"))
+}
+
+pub(crate) fn review_key(old: &str, new: &str, row: &TextRow) -> String {
+    storage::digest(json!([old, new, row]).to_string().as_bytes())
+}
+
+pub(crate) fn read_review(path: &Path) -> Result<BTreeSet<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) struct TableEvaluator<'a> {
+    rules: &'a Rules,
+    view: View,
+    edits: HashMap<(&'a RowId, usize), &'a Edit>,
+    evidence: Evidence,
+    skip: bool,
+}
+impl<'a> TableEvaluator<'a> {
+    pub(crate) fn new(
+        table: &str,
+        rules: &'a Rules,
+        edits: &'a [Edit],
+        game: &str,
+        version: &str,
+        skip: bool,
+    ) -> Self {
+        let mut indexed = HashMap::new();
+        for edit in edits
+            .iter()
+            .filter(|edit| edit.game == game && edit.version == version && edit.table == table)
+        {
+            let previous: &mut &Edit = indexed.entry((&edit.row_id, edit.slot)).or_insert(edit);
+            if edit.batch >= previous.batch {
+                *previous = edit;
+            }
+        }
+        Self {
+            rules,
+            view: rules.view(table),
+            edits: indexed,
+            evidence: Evidence::new(rules.values.len(), false),
+            skip,
+        }
+    }
+
+    fn apply<'row>(&'row mut self, row: &'row TextRow) -> Result<Cow<'row, str>> {
+        if let Some(edit) = self.edits.get(&(&row.1, row.2)) {
+            if edit.original != row.3 {
+                return Err(crate::invalid("定位记录的底稿原文已变化，请重新查找。"));
+            }
+            return Ok(Cow::Borrowed(&edit.replacement));
+        }
+        if self.skip && fields::has_kana(&row.3) {
+            return Ok(Cow::Borrowed(&row.3));
+        }
+        self.evidence.hits.fill(0);
+        Ok(
+            match self.view.apply(
+                self.rules,
+                &row.3,
+                &mut self.evidence,
+                !fields::has_cjk(&row.3),
+            )? {
+                Some(text) => Cow::Owned(text),
+                None => Cow::Borrowed(&row.3),
+            },
+        )
+    }
+}
 
 #[derive(Serialize)]
 pub struct Item {
@@ -17,6 +102,13 @@ pub struct Item {
     pub new: String,
     pub count: usize,
     pub reason: String,
+    pub missing: usize,
+    pub attention: usize,
+    pub quiet: bool,
+    #[serde(skip)]
+    pub previous_scopes: BTreeSet<PreviousBatchScope>,
+    #[serde(skip)]
+    pub missing_rows: Vec<TextRow>,
 }
 pub struct Plan {
     pub items: Vec<Item>,
@@ -124,9 +216,16 @@ fn relocate(
                 "多条旧记录指向同一段文本，无法确定对应关系。请核对后移除重复旧记录。".into()
             } else {
                 let (row_id, slot) = &matches[0];
+                let anchor = database::location_at(
+                    con,
+                    &(table.into(), row_id.clone(), *slot, edit.original.clone()),
+                    control,
+                )?
+                .and_then(|located| located.anchor);
                 for index in group {
                     values[index].row_id = row_id.clone();
                     values[index].slot = *slot;
+                    values[index].anchor.clone_from(&anchor);
                 }
                 moved = true;
                 format!(
@@ -196,6 +295,11 @@ pub fn plan(
     let tables = database::tables(con, &database::default_tables())?;
     let (located, relocations) = relocate(con, edits, game, version, &tables, control)?;
     let edits = located.as_slice();
+    let single_addresses = edits
+        .iter()
+        .filter(|edit| edit.game == game && edit.version == version && !edit.batch)
+        .map(|edit| (edit.table.as_str(), &edit.row_id, edit.slot))
+        .collect::<HashSet<_>>();
     let blocked = relocations
         .iter()
         .filter(|item| !item.moved)
@@ -232,6 +336,11 @@ pub fn plan(
             new: new.clone(),
             count: members.len(),
             reason: String::new(),
+            missing: 0,
+            attention: 0,
+            quiet: false,
+            previous_scopes: BTreeSet::new(),
+            missing_rows: Vec::new(),
         };
         if old == new {
             item.reason = "替换前后文字相同，无需转换。".into();
@@ -242,9 +351,7 @@ pub fn plan(
                 "本表仍有无法确定位置的修改，保留指定文本；具体原因和处理方法见位置核对日志。"
                     .into();
         } else if members.iter().any(|member| {
-            edits
-                .iter()
-                .any(|edit| !edit.batch && edit.same_address(member))
+            single_addresses.contains(&(member.table.as_str(), &member.row_id, member.slot))
         }) {
             item.reason = "包含单条修改，保留现有优先级。".into();
         }
@@ -278,6 +385,10 @@ pub fn plan(
             source: String::new(),
             table: table.clone(),
         }])?;
+        let mut before =
+            TableEvaluator::new(&table, &before_rules, &result.edits, game, version, skip);
+        let mut after = TableEvaluator::new(&table, &after_rules, &next_edits, game, version, skip);
+        let mut scope = TableEvaluator::new(&table, &scope_rule, &[], game, version, skip);
         let addresses = members
             .iter()
             .map(|edit| ((edit.row_id.clone(), edit.slot), *edit))
@@ -285,16 +396,15 @@ pub fn plan(
         let mut unseen = addresses.clone();
         let mut invalid_originals = Vec::new();
         let mut seen = 0;
-        let mut missing = 0;
+        let mut missing_rows = Vec::new();
         let mut outside = 0;
         let mut changed = 0;
         let mut same = true;
         database::visit_table(con, &table, control, |row| {
             let member = addresses.get(&(row.1.clone(), row.2));
-            let expected =
-                model::effective(&row, &[], game, version, &scope_rule, skip)?.0 != row.3;
+            let expected = scope.apply(&row)? != row.3.as_str();
             if expected && member.is_none() {
-                missing += 1;
+                missing_rows.push(row.clone());
             }
             if !expected && member.is_some() {
                 outside += 1;
@@ -309,9 +419,7 @@ pub fn plan(
                     return Ok(());
                 }
             }
-            if model::effective(&row, &result.edits, game, version, &before_rules, skip)?.0
-                != model::effective(&row, &next_edits, game, version, &after_rules, skip)?.0
-            {
+            if before.apply(&row)? != after.apply(&row)? {
                 same = false;
             }
             Ok(())
@@ -343,9 +451,16 @@ pub fn plan(
             item.reason = format!(
                 "{outside} 段指定文本不在整表替换范围内（含假名的文本会受跳过设置影响）。保留指定文本即可；若需整表替换，请先核对「跳过日文假名的文本」设置和原文字。"
             );
-        } else if missing > 0 {
+        } else if !missing_rows.is_empty() {
+            item.missing = missing_rows.len();
+            item.missing_rows = missing_rows;
+            item.previous_scopes = members
+                .iter()
+                .filter_map(|edit| edit.batch_operation.as_ref()?.previous_scope.clone())
+                .collect();
             item.reason = format!(
-                "本表还有 {missing} 段匹配文本未包含在本批修改中。仅修改部分文本时无需处理；若需整表替换，请在「查找」中选中遗漏文本，以相同内容批量修改后再次整理。"
+                "本表还有 {} 段匹配文本未包含在本批修改中，已保留指定文本范围。",
+                item.missing
             );
         } else if !same {
             item.reason = "转换会改变当前结果，保留原批量修改。若需调整，请先预览并核对同一文本表的其他词条。".into();
@@ -357,6 +472,112 @@ pub fn plan(
     }
     result.relocations = relocations;
     Ok(result)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviousMatch {
+    Absent,
+    Unselected,
+    Uncertain,
+}
+
+impl Item {
+    pub(crate) fn compare_previous(
+        &self,
+        con: &rusqlite::Connection,
+        selected: &[&Edit],
+        current: &[Edit],
+        control: &Control<'_>,
+    ) -> Result<Vec<PreviousMatch>> {
+        use PreviousMatch::*;
+        if !database::tables(con, &database::default_tables())?.contains(&self.table) {
+            return Ok(vec![Absent; self.missing_rows.len()]);
+        }
+        let mut hits = HashMap::<&str, HashMap<usize, Vec<RowId>>>::new();
+        for row in &self.missing_rows {
+            hits.entry(&row.3).or_default().entry(row.2).or_default();
+        }
+        database::visit_table(con, &self.table, control, |row| {
+            if let Some(addresses) = hits
+                .get_mut(row.3.as_str())
+                .and_then(|slots| slots.get_mut(&row.2))
+                && addresses.len() < 2
+            {
+                addresses.push(row.1);
+            }
+            Ok(())
+        })?;
+        let mut current_counts = HashMap::new();
+        for row in &self.missing_rows {
+            *current_counts
+                .entry((row.2, row.3.as_str()))
+                .or_insert(0usize) += 1;
+        }
+        for edit in current.iter().filter(|edit| edit.table == self.table) {
+            if let Some(count) = current_counts.get_mut(&(edit.slot, edit.original.as_str())) {
+                *count += 1;
+            }
+        }
+        Ok(self
+            .missing_rows
+            .iter()
+            .map(|row| {
+                let key = (row.2, row.3.as_str());
+                match hits[row.3.as_str()][&row.2].as_slice() {
+                    [] => Absent,
+                    [one]
+                        if current_counts[&key] == 1
+                            && !selected.iter().any(|edit| {
+                                edit.slot == row.2
+                                    && (&edit.row_id == one || edit.original == row.3)
+                            }) =>
+                    {
+                        Unselected
+                    }
+                    _ => Uncertain,
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn retain_review_rows(
+        &mut self,
+        previous: &[Vec<PreviousMatch>],
+        mut current: TableEvaluator<'_>,
+        reviewed: &BTreeSet<String>,
+        control: &Control<'_>,
+    ) -> Result<()> {
+        self.attention = 0;
+        for (index, row) in std::mem::take(&mut self.missing_rows)
+            .into_iter()
+            .enumerate()
+        {
+            control.check()?;
+            let all =
+                |kind| !previous.is_empty() && previous.iter().all(|source| source[index] == kind);
+            if all(PreviousMatch::Unselected)
+                || (!reviewed.is_empty()
+                    && reviewed.contains(&review_key(&self.old, &self.new, &row)))
+                || current.edits.contains_key(&(&row.1, row.2))
+                || !current.apply(&row)?.contains(&self.old)
+            {
+                continue;
+            }
+            self.attention += usize::from(all(PreviousMatch::Absent));
+            self.missing_rows.push(row);
+        }
+        self.missing = self.missing_rows.len();
+        self.quiet = self.missing == 0;
+        self.reason = if self.quiet {
+            "已保留指定文本范围。".into()
+        } else {
+            format!(
+                "本表还有 {} 段文本可补改，已保留指定文本范围。",
+                self.missing
+            )
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -398,11 +619,13 @@ mod tests {
             original: text.into(),
             replacement: text.replace("任务", "委托"),
             batch: true,
+            anchor: None,
             batch_operation: Some(BatchOperation {
                 id: "1".repeat(32),
                 old: "任务".into(),
                 new: "委托".into(),
                 before: text.into(),
+                previous_scope: None,
             }),
         }
     }
@@ -429,6 +652,109 @@ mod tests {
     }
 
     #[test]
+    fn cached_table_evaluation_matches_existing_results_and_errors() {
+        let version = "a".repeat(64);
+        let mut values = vec![rule("任务", "委托")];
+        values.push(Rule {
+            old: "ASCII".into(),
+            new: "ascii-exact".into(),
+            mode: "exact".into(),
+            source: String::new(),
+            table: String::new(),
+        });
+        values.push(Rule {
+            old: "任务(\\d+)".into(),
+            new: "编号\\g<1>".into(),
+            mode: "re".into(),
+            source: String::new(),
+            table: "LocalizeSkillDBSchema".into(),
+        });
+        let rules = Rules::new(values).unwrap();
+        let batch = edit("LocalizeDBSchema", 1, "任务あ");
+        let mut single = batch.clone();
+        single.batch = false;
+        single.batch_operation = None;
+        single.replacement = "单条覆盖".into();
+        let mut text_id = single.clone();
+        text_id.row_id = RowId::Text("text-id".into());
+        text_id.original = "任务".into();
+        let mut other_slot = single.clone();
+        other_slot.slot = 1;
+        other_slot.original = "任务".into();
+        let mut other_game = edit("LocalizeDBSchema", 2, "任务");
+        other_game.game = "other-game".into();
+        let mut other_version = edit("LocalizeDBSchema", 3, "任务");
+        other_version.version = "b".repeat(64);
+        for edits in [
+            vec![
+                batch.clone(),
+                single.clone(),
+                text_id.clone(),
+                other_slot.clone(),
+                other_game.clone(),
+                other_version.clone(),
+            ],
+            vec![
+                single,
+                batch,
+                text_id,
+                other_slot,
+                other_game,
+                other_version,
+            ],
+        ] {
+            for skip in [true, false] {
+                for table in ["LocalizeDBSchema", "LocalizeSkillDBSchema"] {
+                    let mut cached =
+                        TableEvaluator::new(table, &rules, &edits, "game", &version, skip);
+                    for _ in 0..3 {
+                        for (id, slot, text) in [
+                            (RowId::Integer(1), 0, "任务あ"),
+                            (RowId::Integer(1), 1, "任务"),
+                            (RowId::Text("text-id".into()), 0, "任务"),
+                            (RowId::Integer(2), 0, "任务"),
+                            (RowId::Integer(3), 0, "任务"),
+                            (RowId::Integer(4), 0, "任务12"),
+                            (RowId::Integer(5), 0, "ASCII"),
+                            (RowId::Integer(1), 0, "原文变化"),
+                        ] {
+                            let row = (table.into(), id, slot, text.into());
+                            let expected =
+                                model::effective(&row, &edits, "game", &version, &rules, skip)
+                                    .map(|value| value.0)
+                                    .map_err(|error| error.to_string());
+                            let actual = cached
+                                .apply(&row)
+                                .map(Cow::into_owned)
+                                .map_err(|error| error.to_string());
+                            assert_eq!(actual, expected, "table={table}, skip={skip}, row={row:?}");
+                        }
+                    }
+                }
+            }
+        }
+        let rules = Rules::new(vec![Rule {
+            old: "(任务.*)".into(),
+            new: "\\g<1>".into(),
+            mode: "re".into(),
+            source: String::new(),
+            table: String::new(),
+        }])
+        .unwrap();
+        let row = (
+            "LocalizeDBSchema".into(),
+            RowId::Integer(1),
+            0,
+            "任务\t".into(),
+        );
+        let expected = model::effective(&row, &[], "game", &version, &rules, false)
+            .unwrap_err()
+            .to_string();
+        let mut cached = TableEvaluator::new(&row.0, &rules, &[], "game", &version, false);
+        assert_eq!(cached.apply(&row).unwrap_err().to_string(), expected);
+    }
+
+    #[test]
     fn complete_table_becomes_a_rule_while_partial_scope_and_other_versions_remain() {
         let con = database(&[
             ("LocalizeDBSchema", 1, "任务一"),
@@ -451,8 +777,9 @@ mod tests {
         assert_eq!(result.edits, vec![edits[2].clone(), prior]);
         assert!(result.items[0].reason.is_empty());
         assert!(result.items[1].reason.contains("还有 1 段匹配文本"));
-        assert!(result.items[1].reason.contains("无需处理"));
-        assert!(result.items[1].reason.contains("再次整理"));
+        assert_eq!(result.items[1].missing, 1);
+        assert_eq!(result.items[1].missing_rows[0].1, RowId::Integer(2));
+        assert_eq!(result.items[1].missing_rows[0].3, "任务乙");
     }
     #[test]
     fn equivalence_includes_existing_rules_and_rejects_precedence_changes() {
@@ -547,7 +874,15 @@ mod tests {
         for (index, edit) in edits.iter().take(2).enumerate() {
             let mut expected = edit.clone();
             expected.row_id = RowId::Integer(5);
-            assert_eq!(result.edits[index], expected);
+            let saved = &result.edits[index];
+            assert!(
+                saved
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.next.is_some())
+            );
+            expected.anchor.clone_from(&saved.anchor);
+            assert_eq!(saved, &expected);
         }
         assert_eq!(&result.edits[2..], &[other_game, other_version]);
     }

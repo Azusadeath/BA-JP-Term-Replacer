@@ -16,6 +16,7 @@ pub fn user_message(action: &str, error: &Error) -> String {
         | "sort_settings" => "保存记录",
         "combined_remove" => "移除替换",
         "combined_open" => "读取替换范围",
+        "promotion_missing_preview" => "预览遗漏文本",
         "promotion_preview" => "核对批量修改",
         "promotion_commit" | "promotion_start" => "整理批量修改",
         "backup_create" => "保存备份",

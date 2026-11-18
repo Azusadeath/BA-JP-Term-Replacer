@@ -3,6 +3,7 @@ use crate::{
     Control, Result, baseline, invalid, migration,
     model::{self, Edit},
     ordering::{Sort, Timeline},
+    promotion,
     service::{self, Config, Engine, PatchJob},
     sources::{self, Inventory, Notice, Sources},
     storage::{self, Store},
@@ -63,6 +64,7 @@ pub struct Project {
     batch_draft: Value,
     combined_draft: Value,
     promotion_draft: Value,
+    promotion_review: Value,
     backup_draft: Value,
     migration_draft: Value,
     pub version: Option<String>,
@@ -99,6 +101,7 @@ impl Project {
             batch_draft: Value::Null,
             combined_draft: Value::Null,
             promotion_draft: Value::Null,
+            promotion_review: Value::Null,
             backup_draft: Value::Null,
             migration_draft: Value::Null,
             version: None,
@@ -226,6 +229,7 @@ impl Project {
         self.batch_draft = Value::Null;
         self.combined_draft = Value::Null;
         self.promotion_draft = Value::Null;
+        self.promotion_review = Value::Null;
         self.backup_draft = Value::Null;
         self.application = "词表已保存，尚未应用".into();
     }
@@ -573,18 +577,17 @@ impl Project {
         self.version = v["version"].as_str().map(str::to_string);
         self.application = v["application"].as_str().unwrap_or("").into();
     }
-    fn find_search(&self, p: &Value) -> Result<Value> {
+    fn find_search(&self, p: &Value) -> Result<&Value> {
         let nonce = text(p, "search_nonce")?;
-        if self.search["nonce"] == nonce && self.search["game"] == model::game_key(&self.game)? {
-            return Ok(self.search.clone());
+        let game = model::game_key(&self.game)?;
+        let matches = |search: &Value| search["nonce"] == nonce && search["game"] == game;
+        if matches(&self.search) {
+            return Ok(&self.search);
         }
         self.searches
             .iter()
             .rev()
-            .find(|s| {
-                s["nonce"] == nonce && s["game"] == model::game_key(&self.game).unwrap_or_default()
-            })
-            .cloned()
+            .find(|search| matches(search))
             .ok_or_else(|| invalid("请先重新查找文本。"))
     }
     pub fn dispatch(&mut self, action: &str, p: &Value, control: &Control<'_>) -> Result<Value> {
@@ -604,12 +607,15 @@ impl Project {
                 | "combined_remove"
                 | "promotion_preview"
                 | "promotion_start"
+                | "promotion_mark_reviewed"
                 | "promotion_commit"
+                | "promotion_missing_preview"
                 | "batch_save"
                 | "preview"
                 | "prepare_patch"
                 | "apply"
                 | "baseline"
+                | "migration_find"
                 | "migration_preview"
                 | "migration_start"
                 | "migration_commit"
@@ -733,6 +739,7 @@ impl Project {
             }
             "promotion_start" => {
                 let plan = self.dispatch("promotion_preview", p, control)?;
+                let mut review = self.promotion_draft["review"].take();
                 let retained = plan["items"].as_array().unwrap().len() as u64
                     - plan["count"].as_u64().unwrap();
                 let mut result = if plan["count"] == 0 && plan["relocated"] == 0 {
@@ -742,16 +749,20 @@ impl Project {
                 };
                 result["retained"] = json!(retained);
                 result["relocations"] = plan["relocations"].clone();
-                result["retained_items"] = json!(
-                    plan["items"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter(|item| item["reason"]
+                let mut items = plan["items"].as_array().cloned().unwrap_or_default();
+                for (index, item) in items.iter_mut().enumerate() {
+                    item["review_item"] = json!(index);
+                }
+                items.retain(|item| {
+                    item["quiet"] != true
+                        && item["reason"]
                             .as_str()
-                            .is_some_and(|reason| !reason.is_empty()))
-                        .collect::<Vec<_>>()
-                );
+                            .is_some_and(|reason| !reason.is_empty())
+                });
+                review["revision"] = json!(self.revision);
+                result["review_nonce"] = review["nonce"].clone();
+                result["retained_items"] = json!(items);
+                self.promotion_review = review;
                 Ok(result)
             }
             "promotion_preview" => {
@@ -782,10 +793,65 @@ impl Project {
                     .filter(|item| item.reason.is_empty())
                     .count();
                 let nonce = nonce();
-                self.promotion_draft = json!({"nonce":nonce,"revision":self.revision,"version":version,"game":model::game_key(&self.game)?,"skip":self.skip,"token":status["token"],"rules":plan.rules,"edits":plan.edits,"count":count,"relocated":plan.relocated});
+                let review_items: Vec<_> = plan.items.iter().map(|item| {
+                    json!({"rows":item.missing_rows,"old":item.old,"new":item.new,"label":item.label})
+                }).collect();
+                let game = model::game_key(&self.game)?;
+                self.promotion_draft = json!({"nonce":nonce,"revision":self.revision,"version":version,"game":game,"skip":self.skip,"token":status["token"],"rules":plan.rules,"edits":plan.edits,"count":count,"relocated":plan.relocated,
+                    "review":{"nonce":nonce,"game":game,"version":version,"token":status["token"],"items":review_items}});
                 Ok(
                     json!({"nonce":nonce,"items":plan.items,"count":count,"relocated":plan.relocated,"relocations":plan.relocations}),
                 )
+            }
+            "promotion_mark_reviewed" => {
+                self.require(p.get("revision"))?;
+                let draft = &self.promotion_draft;
+                if !p["nonce"].is_string()
+                    || draft["nonce"] != p["nonce"]
+                    || draft["version"] != p["version"]
+                    || draft["revision"] != self.revision
+                    || draft["skip"] != self.skip
+                    || draft["game"] != model::game_key(&self.game)?
+                {
+                    return Err(invalid("整理结果已失效，请重新核对。"));
+                }
+                let _rules = storage::Lock::acquire(&self.store.root.join("rules.tsv"))?;
+                let _edits = storage::Lock::acquire(&self.store.root.join("text-edits.json"))?;
+                self.store.check("rules.tsv")?;
+                self.store.check("text-edits.json")?;
+                let status = self.engine.baseline_status(
+                    &self.game,
+                    &self.data.join("backup"),
+                    &self.data,
+                    control,
+                )?;
+                if status["state"] != "ready" || status["token"] != draft["token"] {
+                    return Err(invalid("底稿或游戏资源已变化，请重新整理。"));
+                }
+                let path = promotion::review_path(
+                    &self.data,
+                    text(draft, "game")?,
+                    text(draft, "version")?,
+                    self.skip,
+                );
+                let _lock = storage::Lock::acquire(&path)?;
+                let mut reviewed = promotion::read_review(&path)?;
+                let before = reviewed.len();
+                for item in draft["review"]["items"].as_array().unwrap() {
+                    let old = text(item, "old")?;
+                    let new = text(item, "new")?;
+                    for row in serde_json::from_value::<Vec<TextRow>>(item["rows"].clone())? {
+                        control.check()?;
+                        reviewed.insert(promotion::review_key(old, new, &row));
+                    }
+                }
+                let count = reviewed.len() - before;
+                if count != 0 {
+                    storage::write_locked(&path, &serde_json::to_vec_pretty(&reviewed)?)?;
+                }
+                self.promotion_draft = Value::Null;
+                self.promotion_review = Value::Null;
+                Ok(json!({"reviewed":count}))
             }
             "promotion_commit" => {
                 let draft = self.promotion_draft.clone();
@@ -1064,11 +1130,21 @@ impl Project {
                     .get("token")
                     .filter(|v| v.is_object())
                     .ok_or_else(|| invalid("请先检查游戏目录并确认底稿。"))?;
-                let original = self.engine.initialize(
+                let game = model::game_key(&self.game)?;
+                let keep = self
+                    .edits
+                    .iter()
+                    .filter(|e| {
+                        e.game == game && (e.anchor.is_none() || e.batch_operation.is_some())
+                    })
+                    .map(|e| e.version.clone())
+                    .collect();
+                let original = self.engine.initialize_for_edits(
                     &self.game,
                     &self.data.join("backup"),
                     &self.data,
                     Some(token),
+                    &keep,
                     control,
                 )?;
                 self.version = Some(original.version.clone());
@@ -1093,8 +1169,14 @@ impl Project {
                     &self.data,
                     control,
                 )?;
-                let edits: Vec<_> = self
-                    .edits
+                let mut source = self.edits.clone();
+                self.engine.migration_source_anchors(
+                    &self.game,
+                    &self.data.join("backup"),
+                    &mut source,
+                    control,
+                )?;
+                let existing: Vec<_> = source
                     .iter()
                     .filter(|e| e.game == game && e.version != version)
                     .cloned()
@@ -1102,7 +1184,7 @@ impl Project {
                 let located = self.engine.migration_candidates(
                     &self.game,
                     &self.data.join("backup"),
-                    &edits,
+                    &existing,
                     control,
                 )?;
                 let status = self.engine.baseline_status(
@@ -1117,7 +1199,10 @@ impl Project {
                 {
                     return Err(invalid("底稿已变化，请重新检查后核对迁移。"));
                 }
-                let items = migration::plan(&self.edits, &game, &version, &located);
+                let rules = Rules::new(self.rules.clone())?;
+                let items = migration::plan_candidates(
+                    &source, &game, &version, &located, &rules, self.skip, control,
+                )?;
                 let draft = json!({"nonce":nonce(),"revision":self.revision,"token":status["token"],"game":game,"version":version,"items":items});
                 control.check()?;
                 self.migration_draft = draft.clone();
@@ -1125,26 +1210,113 @@ impl Project {
                     return Ok(draft);
                 }
                 let automatic = migration::automatic_choices(&items);
-                // Once automatic migrations are saved, a late cancel must report that success.
+                let review = if automatic.is_empty() {
+                    items
+                } else {
+                    let projected = migration::apply_choices(
+                        &source,
+                        &items,
+                        &automatic,
+                        &game,
+                        (&version, None),
+                        &rules,
+                        self.skip,
+                    )?;
+                    migration::plan_candidates(
+                        &projected, &game, &version, &located, &rules, self.skip, control,
+                    )?
+                };
+                // Prepare the follow-up review before entering the uncancellable commit.
                 control.check()?;
-                let commit = control.uncancellable();
                 let mut backup = Value::Null;
                 if !automatic.is_empty() {
-                    backup=self.dispatch("migration_commit",&json!({"nonce":draft["nonce"],"revision":self.revision,"choices":automatic}),&commit)?["backup"].clone();
+                    backup=self.dispatch("migration_commit",&json!({"nonce":draft["nonce"],"revision":self.revision,"choices":automatic}),&control.uncancellable())?["backup"].clone();
                 }
-                let remaining = migration::plan(&self.edits, &game, &version, &located);
-                let unavailable = remaining
+                let unavailable = review
                     .iter()
-                    .filter(|item| item.kind == "unavailable")
+                    .filter(|item| item.candidates.is_empty())
                     .count();
-                let review: Vec<_> = remaining
-                    .into_iter()
-                    .filter(|item| matches!(item.kind.as_str(), "relocated" | "ambiguous"))
-                    .collect();
                 let draft = json!({"nonce":nonce(),"revision":self.revision,"token":status["token"],"game":game,"version":version,"items":review});
                 self.migration_draft = draft.clone();
                 Ok(
                     json!({"state":self.state()?,"plan":draft,"automatic_count":automatic.len(),"unavailable_count":unavailable,"backup":backup}),
+                )
+            }
+            "migration_find" => {
+                self.require(p.get("revision"))?;
+                let draft = &self.migration_draft;
+                let game = model::game_key(&self.game)?;
+                if draft.is_null()
+                    || p["nonce"] != draft["nonce"]
+                    || draft["revision"] != self.revision
+                    || draft["game"] != game
+                {
+                    return Err(invalid("迁移核对已失效，请重新打开。"));
+                }
+                let at = index(p, "item")?;
+                let mut item: migration::Item = serde_json::from_value(
+                    draft["items"]
+                        .get(at)
+                        .ok_or_else(|| invalid("迁移条目已变化。"))?
+                        .clone(),
+                )?;
+                let token = draft["token"].clone();
+                let version = text(draft, "version")?.to_owned();
+                let root = self.data.join("backup");
+                let before = self
+                    .engine
+                    .baseline_status(&self.game, &root, &self.data, control)?;
+                if before["state"] != "ready" || before["token"] != token {
+                    return Err(invalid("底稿或游戏资源已变化，请重新核对迁移。"));
+                }
+                let (found, _) = self.engine.scan(
+                    &self.game,
+                    &root,
+                    text(p, "keyword")?,
+                    "",
+                    30,
+                    0,
+                    false,
+                    control,
+                )?;
+                let rows: Vec<TextRow> = serde_json::from_value(found["rows"].clone())?;
+                let candidates = self
+                    .engine
+                    .migration_locations(&self.game, &root, &rows, control)?;
+                let status = self
+                    .engine
+                    .baseline_status(&self.game, &root, &self.data, control)?;
+                if status["state"] != "ready" || status["token"] != token {
+                    return Err(invalid("底稿或游戏资源已变化，请重新核对迁移。"));
+                }
+                let rules = Rules::new(self.rules.clone())?;
+                let layers: Vec<_> = item.indices.iter().map(|&i| &self.edits[i]).collect();
+                let mut added = 0;
+                let mut occupied = 0;
+                for candidate in candidates.into_iter().flatten() {
+                    if self.edits.iter().any(|e| {
+                        e.game == game
+                            && e.version == version
+                            && e.table == candidate.row.0
+                            && e.row_id == candidate.row.1
+                            && e.slot == candidate.row.2
+                    }) {
+                        occupied += 1;
+                        continue;
+                    }
+                    if item.candidates.len() >= 100
+                        || item.candidates.iter().any(|c| c.row == candidate.row)
+                    {
+                        continue;
+                    }
+                    item.add_candidate(candidate, &layers, &rules, self.skip)?;
+                    added += 1;
+                }
+                control.check()?;
+                let item = serde_json::to_value(item)?;
+                self.migration_draft["items"][at] = item.clone();
+                Ok(
+                    json!({"nonce":self.migration_draft["nonce"],"item":at,"value":item,"total":found["total"],"added":added,"occupied":occupied}),
                 )
             }
             "migration_commit" => {
@@ -1169,18 +1341,23 @@ impl Project {
                 let items = serde_json::from_value::<Vec<migration::Item>>(draft["items"].clone())?;
                 let choices =
                     serde_json::from_value::<Vec<migration::Choice>>(p["choices"].clone())?;
-                let edits = migration::apply(
+                self.store.check("rules.tsv")?;
+                let rules = Rules::new(self.rules.clone())?;
+                self.store.check("text-edits.json")?;
+                let bytes = fs::read(self.store.root.join("text-edits.json"))?;
+                let digest = storage::digest(&bytes);
+                let edits = migration::apply_choices(
                     &self.edits,
                     &items,
                     &choices,
                     text(&draft, "game")?,
-                    text(&draft, "version")?,
+                    (text(&draft, "version")?, Some(&digest)),
+                    &rules,
+                    self.skip,
                 )?;
-                self.store.check("text-edits.json")?;
-                let bytes = fs::read(self.store.root.join("text-edits.json"))?;
                 let backup = self.store.root.join(format!(
                     "text-edits-before-migration-{}.json",
-                    &storage::digest(&bytes)[..16]
+                    &digest[..16]
                 ));
                 control.check()?;
                 let commit = control.uncancellable();
@@ -1393,12 +1570,12 @@ impl Project {
                     )
                 } else {
                     let search = self.find_search(p)?;
-                    let rows: Vec<TextRow> = serde_json::from_value(search["rows"].clone())?;
+                    let row = search["rows"]
+                        .get(index(p, "index")?)
+                        .ok_or_else(|| invalid("文本位置已变化。"))?;
                     (
-                        text(&search, "version")?.to_string(),
-                        rows.get(index(p, "index")?)
-                            .ok_or_else(|| invalid("文本位置已变化。"))?
-                            .clone(),
+                        text(search, "version")?.to_string(),
+                        serde_json::from_value(row.clone())?,
                         false,
                     )
                 };
@@ -1448,6 +1625,17 @@ impl Project {
                 let replacement = text(p, "text")?.replace("\r\n", "\n").replace('\r', "\n");
                 if json!(replacement) != draft["initial"] {
                     let row: TextRow = serde_json::from_value(draft["row"].clone())?;
+                    let anchor = self
+                        .engine
+                        .migration_locations(
+                            &self.game,
+                            &self.data.join("backup"),
+                            std::slice::from_ref(&row),
+                            control,
+                        )?
+                        .pop()
+                        .flatten()
+                        .and_then(|entry| entry.anchor);
                     let e = Edit {
                         game: model::game_key(&self.game)?,
                         version: version.into(),
@@ -1458,6 +1646,7 @@ impl Project {
                         replacement,
                         batch: draft["batch"] == true,
                         batch_operation: None,
+                        anchor,
                     };
                     self.commit(
                         Document::Edits(model::update_edits(&self.edits, vec![e])?),
@@ -1476,15 +1665,52 @@ impl Project {
                     json!({"id":operation.id,"old":operation.old,"new":operation.new,"count":entries.len()}),
                 )
             }
-            "batch_preview" => {
+            "batch_preview" | "promotion_missing_preview" => {
                 self.require(None)?;
-                let group_id = p.get("group_id").and_then(Value::as_str).unwrap_or("");
+                let mut review_item = Value::Null;
+                let mut baseline_token = Value::Null;
+                let is_supplement = action == "promotion_missing_preview";
+                let group_id = if is_supplement {
+                    let review = &self.promotion_review;
+                    if review.is_null()
+                        || review["nonce"] != p["nonce"]
+                        || review["revision"] != self.revision
+                        || review["game"] != model::game_key(&self.game)?
+                    {
+                        return Err(invalid("整理结果已失效，请重新整理批量修改。"));
+                    }
+                    let status = self.engine.baseline_status(
+                        &self.game,
+                        &self.data.join("backup"),
+                        &self.data,
+                        control,
+                    )?;
+                    if status["state"] != "ready" || status["token"] != review["token"] {
+                        return Err(invalid("底稿或游戏资源已变化，请重新整理批量修改。"));
+                    }
+                    baseline_token = status["token"].clone();
+                    review_item = review["items"][index(p, "item")?].clone();
+                    if !review_item["rows"]
+                        .as_array()
+                        .is_some_and(|rows| !rows.is_empty())
+                    {
+                        return Err(invalid("这个范围没有可预览的遗漏文本。"));
+                    }
+                    ""
+                } else {
+                    p.get("group_id").and_then(Value::as_str).unwrap_or("")
+                };
                 let existing = if group_id.is_empty() {
                     None
                 } else {
                     Some(self.batch_entries(group_id)?)
                 };
-                let (version, rows) = if let Some(entries) = &existing {
+                let (version, rows) = if is_supplement {
+                    (
+                        text(&self.promotion_review, "version")?.to_string(),
+                        serde_json::from_value::<Vec<TextRow>>(review_item["rows"].take())?,
+                    )
+                } else if let Some(entries) = &existing {
                     (
                         entries[0].version.clone(),
                         entries
@@ -1502,17 +1728,22 @@ impl Project {
                 } else {
                     let search = self.find_search(p)?;
                     (
-                        text(&search, "version")?.to_string(),
+                        text(search, "version")?.to_string(),
                         serde_json::from_value::<Vec<TextRow>>(search["rows"].clone())?,
                     )
                 };
                 self.context(&version, &json!(self.revision), control)?;
-                let old = text(p, "old")?;
-                let new = text(p, "new")?;
+                let terms = if is_supplement { &review_item } else { p };
+                let old = text(terms, "old")?;
+                let new = text(terms, "new")?;
                 if old.is_empty() {
                     return Err(invalid("请填写要替换的文字。"));
                 }
-                let mut indices: Vec<usize> = serde_json::from_value(p["indices"].clone())?;
+                let mut indices: Vec<usize> = if is_supplement {
+                    (0..rows.len()).collect()
+                } else {
+                    serde_json::from_value(p["indices"].clone())?
+                };
                 indices.sort();
                 indices.dedup();
                 if existing.is_some() && indices != (0..rows.len()).collect::<Vec<_>>() {
@@ -1532,7 +1763,8 @@ impl Project {
                     })
                     .collect();
                 let operation_id = matching
-                    .first()
+                    .iter()
+                    .find(|(edit, _)| !is_supplement || edit.table == rows[0].0)
                     .map(|(_, operation)| operation.id.clone())
                     .unwrap_or_else(|| {
                         if group_id.is_empty() {
@@ -1544,11 +1776,17 @@ impl Project {
                 let mut changes = Vec::new();
                 let mut updates = Vec::new();
                 for i in &indices {
+                    if is_supplement {
+                        control.check()?;
+                    }
                     let row = rows
                         .get(*i)
                         .ok_or_else(|| invalid("选中文字位置已变化。"))?;
-                    let (before, _) =
+                    let (before, positioned) =
                         model::effective(row, &self.edits, &key, &version, &rules, self.skip)?;
+                    if is_supplement && (positioned || !before.contains(old)) {
+                        continue;
+                    }
                     let previous = existing
                         .as_ref()
                         .map(|entries| entries[*i].batch_operation.as_ref().unwrap())
@@ -1578,31 +1816,48 @@ impl Project {
                             original: row.3.clone(),
                             replacement: after,
                             batch: true,
+                            anchor: None,
                             batch_operation: Some(model::BatchOperation {
                                 id: operation_id.clone(),
                                 old: old.into(),
                                 new: new.into(),
                                 before: base,
+                                previous_scope: previous
+                                    .filter(|operation| {
+                                        operation.old == old && operation.new == new
+                                    })
+                                    .and_then(|operation| operation.previous_scope.clone()),
                             }),
                         });
                     }
                 }
+                if is_supplement && changes.is_empty() {
+                    self.batch_draft = Value::Null;
+                    return Err(invalid("已没有可补改的文本，请重新整理。"));
+                }
                 let mut edits = model::update_edits(&self.edits, updates)?;
-                // Saving the same replacement extends its selected scope. Keep each
-                // member's original base, including when earlier saves had separate IDs.
-                for edit in &mut edits {
-                    if edit.game == key
-                        && edit.version == version
-                        && let Some(operation) = &mut edit.batch_operation
-                        && operation.old == old
-                        && operation.new == new
-                    {
-                        operation.id.clone_from(&operation_id);
+                if !is_supplement {
+                    // Saving the same replacement extends its selected scope while retaining each member's base text.
+                    for edit in &mut edits {
+                        if edit.game == key
+                            && edit.version == version
+                            && let Some(operation) = &mut edit.batch_operation
+                            && operation.old == old
+                            && operation.new == new
+                        {
+                            operation.id.clone_from(&operation_id);
+                        }
                     }
                 }
                 let nonce = nonce();
                 self.batch_draft =
                     json!({"nonce":nonce,"edits":edits,"revision":self.revision,"version":version});
+                if is_supplement {
+                    self.batch_draft["baseline_token"] = baseline_token;
+                    return Ok(
+                        json!({"nonce":nonce,"changes":changes,"label":review_item["label"],"old":old,"new":new}),
+                    );
+                }
                 Ok(
                     json!({"nonce":nonce,"changes":changes,"draft":{"indices":indices,"old":old,"new":new,"group_id":group_id}}),
                 )
@@ -1612,11 +1867,50 @@ impl Project {
                 if draft.is_null() || p["nonce"] != draft["nonce"] {
                     return Err(invalid("批量预览已失效，请重新预览。"));
                 }
-                self.context(text(&draft, "version")?, &draft["revision"], control)?;
-                self.commit(
-                    Document::Edits(serde_json::from_value(draft["edits"].clone())?),
-                    true,
-                )?;
+                let version = text(&draft, "version")?;
+                self.context(version, &draft["revision"], control)?;
+                if !draft["baseline_token"].is_null() {
+                    let status = self.engine.baseline_status(
+                        &self.game,
+                        &self.data.join("backup"),
+                        &self.data,
+                        control,
+                    )?;
+                    if status["state"] != "ready" || status["token"] != draft["baseline_token"] {
+                        return Err(invalid("底稿或游戏资源已变化，请重新整理批量修改。"));
+                    }
+                }
+                let game = model::game_key(&self.game)?;
+                let mut edits: Vec<Edit> = serde_json::from_value(draft["edits"].clone())?;
+                let pending: Vec<_> = edits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.game == game && e.version == version && e.anchor.is_none())
+                    .map(|(i, e)| {
+                        (
+                            i,
+                            (
+                                e.table.clone(),
+                                e.row_id.clone(),
+                                e.slot,
+                                e.original.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+                if !pending.is_empty() {
+                    let rows: Vec<_> = pending.iter().map(|(_, row)| row.clone()).collect();
+                    let found = self.engine.migration_locations(
+                        &self.game,
+                        &self.data.join("backup"),
+                        &rows,
+                        control,
+                    )?;
+                    for ((i, _), entry) in pending.into_iter().zip(found) {
+                        edits[i].anchor = entry.and_then(|entry| entry.anchor);
+                    }
+                }
+                self.commit(Document::Edits(edits), true)?;
                 self.state()
             }
             "remove_batch_member" => {

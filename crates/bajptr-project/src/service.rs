@@ -4,19 +4,21 @@ use crate::{
     baseline::{self, Baseline, Baselines},
     invalid,
     model::{self, Edit},
+    promotion::{self, TableEvaluator},
     region,
     storage::{self, Lock},
 };
 use bajptr_core::{
     codec, database,
     protocol::{Session, execute},
-    rules::Rule,
+    rules::{Rule, Rules},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque, hash_map::Entry},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -85,7 +87,8 @@ impl Config {
 pub struct Engine {
     pub baselines: Baselines,
     session: Session,
-    source_key: String,
+    source_key: Option<(PathBuf, baseline::Stamp)>,
+    identical_live: Option<Value>,
     search_index: Option<(String, database::SearchIndex)>,
     scope_sources: VecDeque<(String, Value)>,
     previews: VecDeque<(String, Value)>,
@@ -101,6 +104,28 @@ struct PreparedPatch {
     stats: Value,
     seconds: f64,
 }
+fn same_bundle(left: &Path, right: &Path, control: &Control<'_>) -> Result<bool> {
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut remaining = left.metadata()?.len();
+    if remaining != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut a = vec![0; 256 * 1024];
+    let mut b = vec![0; a.len()];
+    while remaining > 0 {
+        control.check()?;
+        let count = remaining.min(a.len() as u64) as usize;
+        left.read_exact(&mut a[..count])?;
+        right.read_exact(&mut b[..count])?;
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
 impl Engine {
     pub fn rebuild_baseline(
         &mut self,
@@ -120,20 +145,84 @@ impl Engine {
             crate::recovery::baseline_plan(&live, root, control)
         }
     }
-    pub fn migration_candidates(
+    pub(crate) fn migration_candidates(
         &mut self,
         game: &str,
         root: &Path,
         edits: &[Edit],
         control: &Control<'_>,
-    ) -> Result<Vec<database::LocatedText>> {
+    ) -> Result<crate::migration::scan::Candidates> {
         let original = self.baseline(game, root, control)?;
         self.open(&original, control)?;
-        database::locate_originals(
+        crate::migration::scan::collect(
             &self.session.database.as_ref().unwrap().con,
-            &edits.iter().map(Edit::core).collect::<Vec<_>>(),
+            edits,
             control,
         )
+    }
+    pub(crate) fn migration_source_anchors(
+        &mut self,
+        game: &str,
+        root: &Path,
+        edits: &mut [Edit],
+        control: &Control<'_>,
+    ) -> Result<()> {
+        let live = region::locate(game)?;
+        let current = region::version(&live.catalog)?;
+        let game = storage::identity(&live.dir)?;
+        let mut versions = std::collections::BTreeMap::<String, Vec<&mut Edit>>::new();
+        for edit in edits
+            .iter_mut()
+            .filter(|edit| edit.anchor.is_none() && edit.game == game && edit.version != current)
+        {
+            versions.entry(edit.version.clone()).or_default().push(edit);
+        }
+        for (version, edits) in versions {
+            let result = (|| -> Result<()> {
+                let Some(source) = self.baselines.read_saved(&live, root, &version, control)?
+                else {
+                    return Ok(());
+                };
+                let db = database::Database::open(
+                    &source.bundle,
+                    true,
+                    &codec::key(region::KEY)?,
+                    control,
+                )?;
+                for edit in edits {
+                    let row = (
+                        edit.table.clone(),
+                        edit.row_id.clone(),
+                        edit.slot,
+                        edit.original.clone(),
+                    );
+                    edit.anchor =
+                        database::location_at(&db.con, &row, control)?.and_then(|row| row.anchor);
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if matches!(error, crate::Error::Cancelled) {
+                    return Err(error);
+                }
+                control.warn(&format!("无法读取旧底稿上下文：{error}"))?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn migration_locations(
+        &mut self,
+        game: &str,
+        root: &Path,
+        rows: &[database::TextRow],
+        control: &Control<'_>,
+    ) -> Result<Vec<Option<database::LocatedText>>> {
+        let original = self.baseline(game, root, control)?;
+        self.open(&original, control)?;
+        let con = &self.session.database.as_ref().unwrap().con;
+        rows.iter()
+            .map(|row| database::location_at(con, row, control))
+            .collect()
     }
     pub fn close(&mut self) {
         self.invalidate_prepared();
@@ -141,18 +230,15 @@ impl Engine {
     }
     fn close_session(&mut self) {
         self.session = Session::default();
-        self.source_key.clear();
+        self.source_key = None;
+        self.identical_live = None;
         self.search_index = None;
         self.scope_sources.clear();
         self.previews.clear();
     }
     fn open(&mut self, original: &Baseline, control: &Control<'_>) -> Result<()> {
-        let key = format!(
-            "{}:{:?}",
-            original.bundle.display(),
-            baseline::stamp(&original.bundle)?
-        );
-        if key != self.source_key {
+        let key = (original.bundle.clone(), baseline::stamp(&original.bundle)?);
+        if self.source_key.as_ref() != Some(&key) {
             self.close_session();
             control.log("正在读取初始底稿…")?;
             execute(
@@ -160,7 +246,7 @@ impl Engine {
                 json!({"op":"open","input":original.bundle,"key":region::KEY,"encrypted":true}),
                 control,
             )?;
-            self.source_key = key;
+            self.source_key = Some(key);
         }
         Ok(())
     }
@@ -245,6 +331,24 @@ impl Engine {
         expected: Option<&Value>,
         control: &Control<'_>,
     ) -> Result<Baseline> {
+        self.initialize_for_edits(
+            game,
+            root,
+            data,
+            expected,
+            &std::collections::HashSet::new(),
+            control,
+        )
+    }
+    pub(crate) fn initialize_for_edits(
+        &mut self,
+        game: &str,
+        root: &Path,
+        data: &Path,
+        expected: Option<&Value>,
+        keep: &std::collections::HashSet<String>,
+        control: &Control<'_>,
+    ) -> Result<Baseline> {
         let live = region::locate(game)?;
         let _lock = Lock::acquire(&live.catalog)?;
         let status = self.baseline_status_locked(&live, root, data, control)?;
@@ -258,7 +362,7 @@ impl Engine {
             Some("missing" | "update" | "changed") => {
                 self.close();
                 self.baselines
-                    .capture(&live, root, status["state"] == "changed", control)
+                    .capture(&live, root, status["state"] == "changed", keep, control)
             }
             _ => Err(invalid(
                 "当前资源是本工具修改后的内容，不能作为初始底稿。请先通过游戏修复资源，或找回原底稿。",
@@ -450,19 +554,131 @@ impl Engine {
         data: &Path,
         config: &Config,
         control: &Control<'_>,
-    ) -> Result<crate::promotion::Plan> {
+    ) -> Result<promotion::Plan> {
         config.check_documents()?;
         let original = self.baseline(game, &data.join("backup"), control)?;
         self.open(&original, control)?;
-        crate::promotion::plan(
+        let live = region::locate(game)?;
+        let game_key = storage::identity(&live.dir)?;
+        let mut plan = promotion::plan(
             &self.session.database.as_ref().unwrap().con,
             &config.rules,
             &config.edits,
-            &storage::identity(&region::locate(game)?.dir)?,
+            &game_key,
             &original.version,
             config.skip_kana,
             control,
-        )
+        )?;
+        let mut databases = HashMap::<String, Option<database::Database>>::new();
+        let mut snapshots = HashMap::<String, Vec<Edit>>::new();
+        let current: Vec<_> = plan
+            .edits
+            .iter()
+            .filter(|edit| edit.game == game_key && edit.version == original.version)
+            .cloned()
+            .collect();
+        let rules = Rules::new(plan.rules.clone())?;
+        let reviewed = promotion::read_review(&promotion::review_path(
+            data,
+            &game_key,
+            &original.version,
+            config.skip_kana,
+        ))?;
+        for item in &mut plan.items {
+            if item.missing_rows.is_empty() {
+                continue;
+            }
+            let comparison = (|| -> Result<_> {
+                let mut previous = Vec::new();
+                for source in &item.previous_scopes {
+                    control.check()?;
+                    if !model::is_version(&source.snapshot) || source.version == original.version {
+                        return Ok(None);
+                    }
+                    let entries = match snapshots.entry(source.snapshot.clone()) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let path = data.join(".gui").join(format!(
+                                "text-edits-before-migration-{}.json",
+                                &source.snapshot[..16]
+                            ));
+                            let bytes = match fs::read(path) {
+                                Ok(bytes) => bytes,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    return Ok(None);
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
+                            if storage::digest(&bytes) != source.snapshot {
+                                return Ok(None);
+                            }
+                            entry.insert(model::parse_edits(&bytes)?)
+                        }
+                    };
+                    let selected: Vec<_> = entries
+                        .iter()
+                        .filter(|edit| {
+                            edit.table == item.table
+                                && crate::combined::batch_matches(
+                                    edit,
+                                    &game_key,
+                                    &source.version,
+                                    &item.old,
+                                    &item.new,
+                                )
+                        })
+                        .collect();
+                    if selected.is_empty() {
+                        return Ok(None);
+                    }
+                    let db = match databases.entry(source.version.clone()) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let baseline = self.baselines.read_saved(
+                                &live,
+                                &data.join("backup"),
+                                &source.version,
+                                control,
+                            )?;
+                            let db = baseline
+                                .map(|baseline| {
+                                    database::Database::open(
+                                        &baseline.bundle,
+                                        true,
+                                        &codec::key(region::KEY)?,
+                                        control,
+                                    )
+                                })
+                                .transpose()?;
+                            entry.insert(db)
+                        }
+                    };
+                    let Some(db) = db else {
+                        return Ok(None);
+                    };
+                    previous.push(item.compare_previous(&db.con, &selected, &current, control)?);
+                }
+                Ok(Some(previous))
+            })();
+            let previous = match comparison {
+                Ok(previous) => previous.unwrap_or_default(),
+                Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
+                Err(error) => {
+                    control.warn(&format!("无法核对批量修改的旧版选区：{error}"))?;
+                    Vec::new()
+                }
+            };
+            let evaluator = TableEvaluator::new(
+                &item.table,
+                &rules,
+                &current,
+                &game_key,
+                &original.version,
+                config.skip_kana,
+            );
+            item.retain_review_rows(&previous, evaluator, &reviewed, control)?;
+        }
+        Ok(plan)
     }
     pub fn export(
         &mut self,
@@ -514,11 +730,21 @@ impl Engine {
         let mut stats = if let Some((_, stats)) = self.previews.iter().find(|(k, _)| k == &key) {
             stats.clone()
         } else {
-            let mut value = execute(
-                &mut self.session,
-                json!({"op":"preview","rules":config.rules,"options":options,"current":live.bundle,"current_identity":identity.to_string(),"key":region::KEY}),
-                control,
-            )?;
+            let mut request = json!({"op":"preview","rules":config.rules,"options":options});
+            if self.identical_live.as_ref() != Some(&identity) {
+                let eligible = original.bundle.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .ends_with(&format!("_{}", live.entry.crc))
+                });
+                if eligible && same_bundle(&live.bundle, &original.bundle, control)? {
+                    self.identical_live = Some(identity.clone());
+                } else {
+                    request["current"] = json!(live.bundle);
+                    request["current_identity"] = json!(identity.to_string());
+                    request["key"] = json!(region::KEY);
+                }
+            }
+            let mut value = execute(&mut self.session, request, control)?;
             value["comparison_identity"] = identity.clone();
             value["zero_reasons"] = json!(
                 value["zero_reasons"]
@@ -723,7 +949,6 @@ impl Engine {
                 ));
             }
         }
-        self.close_session();
         let stage_root = config.work_dir.clone().unwrap_or_else(|| data.join("work"));
         fs::create_dir_all(&stage_root)?;
         let stage = stage_root.join(format!("patch-{}", uuid::Uuid::new_v4().simple()));
@@ -734,7 +959,24 @@ impl Engine {
             let plain = stage.join("working.db");
             control.log("正在从初始底稿重建…")?;
             let key = codec::key(region::KEY)?;
-            let info = codec::decrypt(&original.bundle, &plain, &key, control)?;
+            let cached =
+                if self.source_key.as_ref() == Some(&(original.bundle.clone(), source_stat)) {
+                    self.session
+                        .database
+                        .as_ref()
+                        .unwrap()
+                        .copy_decrypted(&plain)?
+                } else {
+                    None
+                };
+            let decrypted;
+            let info = if let Some(info) = cached {
+                control.check()?;
+                info
+            } else {
+                decrypted = codec::decrypt(&original.bundle, &plain, &key, control)?;
+                &decrypted
+            };
             let options = config.options(&storage::identity(&live.dir)?, &original.version)?;
             let stats = execute(
                 &mut Session::default(),

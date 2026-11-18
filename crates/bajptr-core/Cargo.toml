@@ -9,6 +9,7 @@ rust-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
+memchr.workspace = true
 fancy-regex = "0.18"
 regex-syntax = "0.8"
 rusqlite.workspace = true

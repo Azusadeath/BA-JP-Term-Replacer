@@ -10,7 +10,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -263,7 +263,7 @@ pub fn tables(con: &Connection, pattern: &str) -> Result<Vec<String>> {
 
 pub struct Database {
     pub con: Connection,
-    _temporary: Option<tempfile::TempDir>,
+    decrypted: Option<(tempfile::TempDir, crate::codec::Info)>,
 }
 impl Database {
     pub fn open(
@@ -272,17 +272,13 @@ impl Database {
         key: &[u8; 32],
         control: &Control<'_>,
     ) -> Result<Self> {
-        let temporary = if encrypted {
-            Some(tempfile::tempdir()?)
+        let (plain, decrypted) = if encrypted {
+            let temporary = tempfile::tempdir()?;
+            let plain = temporary.path().join("read.db");
+            let info = crate::codec::decrypt(path, &plain, key, control)?;
+            (plain, Some((temporary, info)))
         } else {
-            None
-        };
-        let plain = if let Some(tmp) = &temporary {
-            let plain = tmp.path().join("read.db");
-            crate::codec::decrypt(path, &plain, key, control)?;
-            plain
-        } else {
-            path.to_path_buf()
+            (path.to_path_buf(), None)
         };
         let con = Connection::open_with_flags(&plain, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // Keep the decrypted database on the temporary file and let SQLite's
@@ -290,10 +286,15 @@ impl Database {
         // a second in-memory connection adds latency and resident memory while
         // providing no reliable scan benefit on the target workload.
         con.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-65536;")?;
-        Ok(Self {
-            con,
-            _temporary: temporary,
-        })
+        Ok(Self { con, decrypted })
+    }
+
+    pub fn copy_decrypted(&self, output: &Path) -> Result<Option<&crate::codec::Info>> {
+        let Some((temporary, info)) = &self.decrypted else {
+            return Ok(None);
+        };
+        std::fs::copy(temporary.path().join("read.db"), output)?;
+        Ok(Some(info))
     }
 }
 
@@ -871,19 +872,164 @@ pub fn visit_table(
     Ok(())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LocationAnchor {
+    pub siblings: Option<String>,
+    pub previous: Option<String>,
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocatedText {
     pub row: TextRow,
     pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<LocationAnchor>,
 }
 
-/// Stream candidate tables once; retain only exact originals needed for migration.
+fn field_digest<'a>(texts: impl Iterator<Item = &'a str>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut any = false;
+    for text in texts {
+        hash.update((text.len() as u64).to_le_bytes());
+        hash.update(text);
+        any = true;
+    }
+    any.then(|| format!("{:x}", hash.finalize()))
+}
+
+pub struct LocationRow {
+    pub id: RowId,
+    pub fields: Vec<(usize, String)>,
+    digest: Option<String>,
+}
+impl LocationRow {
+    pub fn locate(
+        &self,
+        table: &str,
+        slot: usize,
+        text: &str,
+        previous: Option<&str>,
+        next: Option<&str>,
+    ) -> LocatedText {
+        let siblings = || {
+            self.fields
+                .iter()
+                .filter(|(s, _)| *s != slot)
+                .map(|(_, t)| t.as_str())
+        };
+        LocatedText {
+            row: (table.into(), self.id.clone(), slot, text.into()),
+            context: siblings().collect::<Vec<_>>().join("\n"),
+            anchor: Some(LocationAnchor {
+                siblings: field_digest(siblings()),
+                previous: previous.map(str::to_owned),
+                next: next.map(str::to_owned),
+            }),
+        }
+    }
+}
+
+fn location_row(
+    row: &rusqlite::Row<'_>,
+    table: &str,
+    diagnostics: &mut Stats,
+    control: &Control<'_>,
+) -> Result<LocationRow> {
+    let id = RowId::from_sql(row.get_ref(0)?)?;
+    let fields = match row.get_ref(1)?.as_blob() {
+        Ok(blob) => read_fields(blob, table, &id, diagnostics, control)?.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let digest = field_digest(fields.iter().map(|field| field.text));
+    let fields = fields
+        .into_iter()
+        .map(|field| (field.slot, field.text.into()))
+        .collect();
+    Ok(LocationRow { id, fields, digest })
+}
+
+/// Context is tied to one verified database and physical row order in that database.
+pub fn visit_locations(
+    con: &Connection,
+    table: &str,
+    control: &Control<'_>,
+    mut visit: impl FnMut(&LocationRow, Option<&str>, Option<&str>) -> Result<()>,
+) -> Result<()> {
+    let key = key_name(con, table)?;
+    let mut query = con.prepare(&format!(
+        "SELECT {key},Bytes FROM {} ORDER BY 1",
+        quote(table)
+    ))?;
+    let mut rows = query.query([])?;
+    let mut diagnostics = Stats::default();
+    let mut previous = None;
+    let mut pending: Option<LocationRow> = None;
+    while let Some(row) = rows.next()? {
+        control.check()?;
+        let next = location_row(row, table, &mut diagnostics, control)?;
+        if let Some(current) = pending.replace(next) {
+            visit(
+                &current,
+                previous.as_deref(),
+                pending.as_ref().and_then(|row| row.digest.as_deref()),
+            )?;
+            previous = current.digest;
+        }
+    }
+    if let Some(current) = pending {
+        visit(&current, previous.as_deref(), None)?;
+    }
+    report_skips(&diagnostics, control)
+}
+
+pub fn location_at(
+    con: &Connection,
+    (table, id, slot, original): &TextRow,
+    control: &Control<'_>,
+) -> Result<Option<LocatedText>> {
+    control.check()?;
+    let key = key_name(con, table)?;
+    let table_sql = quote(table);
+    let mut diagnostics = Stats::default();
+    let mut read = |op: &str, order: &str| -> Result<Option<LocationRow>> {
+        let mut query = con.prepare_cached(&format!(
+            "SELECT {key},Bytes FROM {table_sql} WHERE {key}{op}?1 ORDER BY 1 {order} LIMIT 1"
+        ))?;
+        let mut rows = query.query([id.value()])?;
+        rows.next()?
+            .map(|row| location_row(row, table, &mut diagnostics, control))
+            .transpose()
+    };
+    let Some(current) = read("=", "ASC")? else {
+        return Ok(None);
+    };
+    if !current
+        .fields
+        .iter()
+        .any(|(s, text)| s == slot && text == original)
+    {
+        return Ok(None);
+    }
+    let previous = read("<", "DESC")?.and_then(|row| row.digest);
+    let next = read(">", "ASC")?.and_then(|row| row.digest);
+    Ok(Some(current.locate(
+        table,
+        *slot,
+        original,
+        previous.as_deref(),
+        next.as_deref(),
+    )))
+}
+
 pub fn locate_originals(
     con: &Connection,
     edits: &[TextEdit],
     control: &Control<'_>,
 ) -> Result<Vec<LocatedText>> {
-    let mut wanted = std::collections::BTreeMap::<&str, HashSet<&str>>::new();
+    use std::collections::{BTreeMap, HashSet};
+    let mut wanted = BTreeMap::<&str, HashSet<&str>>::new();
     for edit in edits {
         wanted
             .entry(&edit.table)
@@ -893,46 +1039,26 @@ pub fn locate_originals(
     let available = tables(con, ".*")?;
     let mut found = Vec::new();
     let mut bytes = 0;
-    let mut diagnostics = Stats::default();
     for (table, originals) in wanted {
-        control.log(&format!("核对旧版修改：{table}"))?;
         if !available.iter().any(|name| name == table) {
             continue;
         }
-        let key = key_name(con, table)?;
-        let mut query = con.prepare(&format!(
-            "SELECT {key},Bytes FROM {} ORDER BY 1",
-            quote(table)
-        ))?;
-        let mut rows = query.query([])?;
-        while let Some(row) = rows.next()? {
-            control.check()?;
-            let rid = RowId::from_sql(row.get_ref(0)?)?;
-            let Ok(blob) = row.get_ref(1)?.as_blob() else {
-                continue;
-            };
-            let Some(fields) = read_fields(blob, table, &rid, &mut diagnostics, control)? else {
-                continue;
-            };
-            for field in fields.iter().filter(|f| originals.contains(f.text)) {
-                let context = fields
-                    .iter()
-                    .filter(|f| f.slot != field.slot)
-                    .map(|f| f.text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                bytes += field.text.len() + context.len();
-                if found.len() >= 50000 || bytes > 64 * 1024 * 1024 {
+        control.log(&format!("核对旧版修改：{table}"))?;
+        visit_locations(con, table, control, |row, previous, next| {
+            for (slot, text) in &row.fields {
+                if !originals.contains(text.as_str()) {
+                    continue;
+                }
+                let candidate = row.locate(table, *slot, text, previous, next);
+                bytes += text.len() + candidate.context.len();
+                if found.len() >= 50_000 || bytes > 64 * 1024 * 1024 {
                     return Err(invalid("对应文本过多，请先清理不再需要的旧版修改后重试。"));
                 }
-                found.push(LocatedText {
-                    row: (table.into(), rid.clone(), field.slot, field.text.into()),
-                    context,
-                });
+                found.push(candidate);
             }
-        }
+            Ok(())
+        })?;
     }
-    report_skips(&diagnostics, control)?;
     Ok(found)
 }
 
@@ -1243,6 +1369,7 @@ pub fn visit_matches(
     let mut total = 0;
     let mut matching_tables = Vec::new();
     let mut diagnostics = Stats::default();
+    let finder = memchr::memmem::Finder::new(keyword.as_bytes());
     for table in tables(con, pattern)? {
         let before = total;
         control.log(&format!("扫描文本表：{table}"))?;
@@ -1277,8 +1404,7 @@ pub fn visit_matches(
             let Ok(blob) = row.get_ref(1)?.as_blob() else {
                 continue;
             };
-            if !keyword.is_empty() && !blob.windows(keyword.len()).any(|b| b == keyword.as_bytes())
-            {
+            if finder.find(blob).is_none() {
                 continue;
             }
             let rid = RowId::from_sql(row.get_ref(0)?)?;

@@ -98,6 +98,9 @@ pub fn update(
             let mut edit = edit.clone();
             if batch_indices.contains(&i) {
                 let op = edit.batch_operation.as_mut().unwrap();
+                if op.old != next_old || op.new != next_new {
+                    op.previous_scope = None;
+                }
                 op.old = next_old.into();
                 op.new = next_new.into();
                 edit.replacement = op.before.replace(next_old, next_new);

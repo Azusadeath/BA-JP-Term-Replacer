@@ -4,7 +4,7 @@ default-members = ["crates/bajptr-core", "crates/bajptr-project", "crates/bajptr
 resolver = "2"
 
 [workspace.package]
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 license = "GPL-3.0-only"
 rust-version = "1.95"
@@ -13,6 +13,7 @@ rust-version = "1.95"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
+memchr = "2"
 rusqlite = { version = "0.41", features = ["bundled"] }
 base64 = "0.22"
 sha2 = "0.10"

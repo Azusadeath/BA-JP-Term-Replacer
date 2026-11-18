@@ -34,16 +34,12 @@ pub fn parse(bytes: &[u8]) -> Result<Entry> {
     let mut prefix = string.clone();
     prefix.push(8);
     prefix.extend_from_slice(&string);
-    let mut found = bytes[5..]
-        .windows(prefix.len())
-        .enumerate()
-        .filter(|(_, b)| *b == prefix);
-    let start = found
-        .next()
+    let finder = memchr::memmem::Finder::new(&prefix);
+    let start = finder
+        .find(&bytes[5..])
         .ok_or_else(|| invalid("资源目录中没有支持布局的 ExcelDB.db 条目。"))?
-        .0
         + 5;
-    if found.next().is_some() {
+    if finder.find(&bytes[start + 1..]).is_some() {
         return Err(invalid("ExcelDB.db 条目不唯一，拒绝猜测。"));
     }
     let at = start + prefix.len();

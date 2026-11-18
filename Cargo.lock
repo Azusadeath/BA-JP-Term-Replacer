@@ -500,14 +500,14 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bajptr-brand"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "embed-resource",
 ]
 
 [[package]]
 name = "bajptr-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aes",
  "base64",
@@ -516,6 +516,7 @@ dependencies = [
  "fancy-regex",
  "getrandom 0.3.4",
  "hmac",
+ "memchr",
  "pbkdf2",
  "regex",
  "regex-syntax",
@@ -529,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "bajptr-desktop"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bajptr-brand",
  "bajptr-core",
@@ -543,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "bajptr-launcher"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bajptr-brand",
  "serde_json",
@@ -552,12 +553,13 @@ dependencies = [
 
 [[package]]
 name = "bajptr-project"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bajptr-core",
  "base64",
  "chrono",
  "fs2",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",
@@ -570,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "bajptr-rs"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bajptr-core",
  "bajptr-project",
@@ -4355,7 +4357,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bajptr-brand",
  "clap",

@@ -87,6 +87,13 @@ pub struct BatchOperation {
     pub old: String,
     pub new: String,
     pub before: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_scope: Option<PreviousBatchScope>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PreviousBatchScope {
+    pub version: String,
+    pub snapshot: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edit {
@@ -101,6 +108,8 @@ pub struct Edit {
     pub batch: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_operation: Option<BatchOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<bajptr_core::database::LocationAnchor>,
 }
 impl Edit {
     pub fn array(&self) -> Value {

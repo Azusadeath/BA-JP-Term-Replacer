@@ -513,6 +513,9 @@ impl Desktop {
                 self.combined_form = None;
             } else if self.text_form.is_some() {
                 self.text_form = None;
+            } else if self.show_promotion_result {
+                self.show_promotion_result = false;
+                self.promotion_missing = None;
             } else if self.batch_scope.is_some() {
                 self.batch_scope = None;
             } else if self.batch_form.is_some() {
@@ -546,6 +549,7 @@ impl Desktop {
         self.template_dialog(ctx);
         self.text_dialog(ctx);
         self.batch_dialog(ctx);
+        self.promotion_result_dialog(ctx);
         self.batch_scope_dialog(ctx);
         self.preview_dialog(ctx);
         self.source_notices_dialog(ctx);
@@ -1273,6 +1277,90 @@ impl Desktop {
             });
         if open {
             self.text_form = Some(form);
+        }
+    }
+    fn promotion_result_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_promotion_result {
+            return;
+        }
+        let mut open = true;
+        let mut back = false;
+        let mut next = None;
+        let mut save = None;
+        let ready = self.busy.is_none() && self.connected && self.healthy();
+        let preview = self.promotion_missing.as_ref();
+        window("整理批量修改结果", ctx, 640.)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if let Some(preview) = preview {
+                    let changes = slice(preview, "changes");
+                    ui.label(format!(
+                        "{} · {} → {}",
+                        text(preview, "label"),
+                        text(preview, "old"),
+                        text(preview, "new")
+                    ));
+                    ui.label(format!("将补改 {} 段。", changes.len()));
+                    egui::ScrollArea::vertical()
+                        .max_height(ctx.content_rect().height() * 0.44)
+                        .show(ui, |ui| {
+                            for change in changes {
+                                ui.label(format!("当前文字　{}", text(change, "before")));
+                                ui.label(format!("补改后　{}", text(change, "after")));
+                                ui.separator();
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        back = ui
+                            .add_enabled(ready, egui::Button::new("返回整理结果"))
+                            .clicked();
+                        if primary(ui, ready && preview["nonce"].is_string(), "保存补改").clicked()
+                        {
+                            save = Some(preview["nonce"].clone());
+                        }
+                    });
+                } else {
+                    ui.label("如果只想修改原来选中的文本，可以保留现有范围。");
+                    egui::ScrollArea::vertical()
+                        .max_height(ctx.content_rect().height() * 0.52)
+                        .show(ui, |ui| {
+                            for item in slice(&self.promotion_result, "items") {
+                                ui.strong(format!(
+                                    "{} · {} → {}",
+                                    text(item, "label"),
+                                    text(item, "old"),
+                                    text(item, "new")
+                                ));
+                                ui.label(text(item, "reason"));
+                                if count(item, "missing") > 0
+                                    && ui
+                                        .add_enabled(ready, egui::Button::new("预览补改…"))
+                                        .clicked()
+                                {
+                                    next = Some(item["review_item"].clone());
+                                }
+                                ui.separator();
+                            }
+                        });
+                }
+                if self.busy.is_some() {
+                    ui.spinner();
+                }
+                if !self.promotion_error.is_empty() {
+                    ui.colored_label(RED, &self.promotion_error);
+                }
+            });
+        if !open && !self.write_busy() {
+            self.show_promotion_result = false;
+            self.promotion_missing = None;
+        } else if back {
+            self.promotion_missing = None;
+            self.promotion_error.clear();
+        } else if let Some(item) = next {
+            self.preview_promotion_missing(item);
+        } else if let Some(nonce) = save {
+            self.promotion_error.clear();
+            self.submit("batch_save", json!({"nonce":nonce}), "正在保存补改…");
         }
     }
     fn batch_dialog(&mut self, ctx: &egui::Context) {

@@ -6,7 +6,7 @@ use crate::{
 use bajptr_core::codec;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -19,7 +19,7 @@ pub struct Baseline {
     pub version: String,
     pub origin: String,
 }
-type Stamp = (u64, SystemTime, SystemTime);
+pub(crate) type Stamp = (u64, SystemTime, SystemTime);
 #[derive(Default)]
 pub struct Baselines {
     verified: HashMap<PathBuf, (Stamp, u32)>,
@@ -65,9 +65,54 @@ impl Baselines {
         }
         Ok(())
     }
+    pub(crate) fn read_saved(
+        &mut self,
+        game: &Game,
+        root: &Path,
+        version: &str,
+        control: &Control<'_>,
+    ) -> Result<Option<Baseline>> {
+        if !model::is_version(version) {
+            return Err(invalid("旧底稿版本无效。"));
+        }
+        let game_id = storage::digest(storage::identity(&game.dir)?.as_bytes());
+        let destination = root.join("_baselines").join(&game_id[..24]).join(version);
+        let record_path = destination.join("baseline.json");
+        if !record_path.is_file() {
+            return Ok(None);
+        }
+        let record: Value = serde_json::from_slice(&fs::read(&record_path)?)?;
+        let name = record["db_file"]
+            .as_str()
+            .ok_or_else(|| invalid("底稿数据库记录无效。"))?;
+        if record["format"] != 2
+            || !storage::safe_name(name)
+            || record["version"] != version
+            || storage::identity(Path::new(record["game_dir"].as_str().unwrap_or("")))?
+                != storage::identity(&game.dir)?
+        {
+            return Err(invalid("底稿记录与当前游戏不匹配。"));
+        }
+        let catalog = destination.join("TableCatalog.bytes");
+        if region::version(&catalog)? != version {
+            return Err(invalid("底稿资源版本不匹配。"));
+        }
+        let entry = region::parse(&fs::read(&catalog)?)?;
+        if !name.ends_with(&format!("_{}", entry.crc)) {
+            return Err(invalid("底稿记录与数据库名称不匹配。"));
+        }
+        let bundle = destination.join(name);
+        self.checked(&bundle, &entry, control)?;
+        Ok(Some(Baseline {
+            bundle,
+            catalog,
+            version: version.into(),
+            origin: record["origin"].as_str().unwrap_or("").into(),
+        }))
+    }
     /// Requires the live catalog lock. Never creates or retires a baseline.
     pub fn resolve(&mut self, game: &Game, root: &Path, control: &Control<'_>) -> Result<Baseline> {
-        self.resolve_locked(game, root, control, false, false)
+        self.resolve_locked(game, root, control, false, false, &HashSet::new())
     }
     /// Called only after explicit confirmation. The live catalog lock is held by the caller.
     pub fn capture(
@@ -75,10 +120,11 @@ impl Baselines {
         game: &Game,
         root: &Path,
         replace: bool,
+        keep: &HashSet<String>,
         control: &Control<'_>,
     ) -> Result<Baseline> {
         control.check()?;
-        self.resolve_locked(game, root, control, true, replace)
+        self.resolve_locked(game, root, control, true, replace, keep)
     }
     fn resolve_locked(
         &mut self,
@@ -87,39 +133,13 @@ impl Baselines {
         control: &Control<'_>,
         create: bool,
         replace: bool,
+        keep: &HashSet<String>,
     ) -> Result<Baseline> {
         let version = region::version(&game.catalog)?;
         let destination = location(game, root)?;
         let record_path = destination.join("baseline.json");
-        if record_path.is_file() && !replace {
-            let record: Value = serde_json::from_slice(&fs::read(&record_path)?)?;
-            let name = record["db_file"]
-                .as_str()
-                .ok_or_else(|| invalid("底稿数据库记录无效。"))?;
-            if record["format"] != 2
-                || !storage::safe_name(name)
-                || record["version"] != version
-                || storage::identity(Path::new(record["game_dir"].as_str().unwrap_or("")))?
-                    != storage::identity(&game.dir)?
-            {
-                return Err(invalid("底稿记录与当前游戏不匹配。"));
-            }
-            let catalog = destination.join("TableCatalog.bytes");
-            if region::version(&catalog)? != version {
-                return Err(invalid("底稿资源版本不匹配。"));
-            }
-            let entry = region::parse(&fs::read(&catalog)?)?;
-            if !name.ends_with(&format!("_{}", entry.crc)) {
-                return Err(invalid("底稿记录与数据库名称不匹配。"));
-            }
-            let bundle = destination.join(name);
-            self.checked(&bundle, &entry, control)?;
-            return Ok(Baseline {
-                bundle,
-                catalog,
-                version,
-                origin: record["origin"].as_str().unwrap_or("").into(),
-            });
+        if !replace && let Some(original) = self.read_saved(game, root, &version, control)? {
+            return Ok(original);
         }
         if destination.exists() && (!replace || !record_path.is_file()) {
             return Err(invalid(
@@ -207,7 +227,7 @@ impl Baselines {
             ));
         }
         let _ = control.log("初始底稿已保存，之后从这份底稿重建。");
-        retire_old(&destination, control);
+        retire_old(&destination, keep, control);
         Ok(Baseline {
             bundle: destination.join(name),
             catalog: destination.join("TableCatalog.bytes"),
@@ -224,12 +244,13 @@ pub fn copy_sync(source: &Path, target: &Path) -> Result<()> {
         .sync_all()?;
     Ok(())
 }
-fn retire_old(current: &Path, control: &Control<'_>) {
+fn retire_old(current: &Path, keep: &HashSet<String>, control: &Control<'_>) {
     if let Ok(entries) = fs::read_dir(current.parent().unwrap()) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path == current
                 || !model::is_version(&entry.file_name().to_string_lossy())
+                || keep.contains(entry.file_name().to_string_lossy().as_ref())
                 || !path.join("baseline.json").is_file()
             {
                 continue;

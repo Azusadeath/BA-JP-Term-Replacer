@@ -241,6 +241,39 @@ impl Desktop {
                     });
                 });
             });
+        let retained = slice(&self.promotion_result, "items");
+        if !retained.is_empty() {
+            let attention: u64 = retained.iter().map(|item| count(item, "attention")).sum();
+            let retained_count = retained.len();
+            let direct = retained_count == 1 && attention > 0;
+            let item = retained[0]["review_item"].clone();
+            let ready = can_edit
+                && self.connected
+                && self.sources_ready
+                && !self.path_dirty
+                && self.busy.is_none();
+            ui.horizontal_wrapped(|ui| {
+                if attention > 0 {
+                    ui.colored_label(ORANGE, format!("新版有 {attention} 段匹配文本可供核对。"));
+                } else {
+                    ui.colored_label(MUTED, format!("保留 {retained_count} 个指定范围。"));
+                }
+                let label = if direct {
+                    "查看遗漏并补改…"
+                } else {
+                    "查看整理结果…"
+                };
+                if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
+                    self.promotion_error.clear();
+                    if direct {
+                        self.preview_promotion_missing(item);
+                    } else {
+                        self.show_promotion_result = true;
+                    }
+                }
+            });
+            ui.add_space(6.);
+        }
         let width = ui.available_width() - 12.;
         let widths = [(width - 350.) * 0.5, (width - 350.) * 0.5, 110., 240.];
         table_header(ui, &["原文字", "替换为", "匹配方式", "生效范围"], &widths);

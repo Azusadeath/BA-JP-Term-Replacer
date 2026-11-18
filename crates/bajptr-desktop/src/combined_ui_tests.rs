@@ -14,6 +14,8 @@ fn combined_row_shows_one_summary_and_keeps_later_rule_editing_correct() {
         {"rule":{"old":"其他原词","new":"其他译词","mode":"exact","table":"A"}}
     ],"batches":[{"id":"batch","old":"任务","new":"委托","active":true,"version":"current","count":5}]});
     app.apply_state(state.clone());
+    app.promotion_result =
+        json!({"review_nonce":"report","items":[{"review_item":0,"missing":3,"attention":3} ]});
     app.rule_selection = Some(1);
     let mut frame = 0;
     let mut draw = |app: &mut Desktop, events| {
@@ -76,6 +78,16 @@ fn combined_row_shows_one_summary_and_keeps_later_rule_editing_correct() {
         .unwrap();
     assert!(promotion_button.left() > single_button.right());
     assert!(promotion_clip.contains_rect(*promotion_button));
+    let (_, entry, clip) = labels
+        .iter()
+        .find(|(label, _, _)| label == "查看遗漏并补改…")
+        .unwrap();
+    assert!(clip.contains_rect(*entry));
+    assert!(
+        labels
+            .iter()
+            .any(|(label, _, _)| label.contains("3 段匹配文本"))
+    );
     let mut sorted = state.clone();
     sorted["replacement_sort"] = json!("alphabetical");
     app.apply_state(sorted);

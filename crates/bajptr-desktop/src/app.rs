@@ -60,6 +60,10 @@ pub struct Desktop {
     pub show_edits: bool,
     pub edit_view: EditView,
     pub show_logs: bool,
+    pub promotion_result: Value,
+    pub show_promotion_result: bool,
+    pub promotion_missing: Option<Value>,
+    pub promotion_error: String,
     pub show_about: bool,
     pub confirm_backup: Option<Value>,
     pub confirm_restore: bool,
@@ -153,6 +157,10 @@ impl Desktop {
             show_edits: false,
             edit_view: EditView::default(),
             show_logs: false,
+            promotion_result: Value::Null,
+            show_promotion_result: false,
+            promotion_missing: None,
+            promotion_error: String::new(),
             show_about: false,
             confirm_backup: None,
             confirm_restore: false,
@@ -283,6 +291,7 @@ impl Desktop {
             || self.template_form.is_some()
             || self.text_form.is_some()
             || self.batch_form.is_some()
+            || self.show_promotion_result
             || self.combined_form.is_some()
             || self.batch_scope.is_some()
             || self.preview.is_some()
@@ -384,6 +393,7 @@ impl Desktop {
                 self.template_changed = None;
                 self.text_form = None;
                 self.batch_form = None;
+                self.clear_promotion_result();
                 self.combined_form = None;
                 self.batch_scope = None;
                 self.show_edits = false;
@@ -496,6 +506,9 @@ impl Desktop {
             .get("skip_kana")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        if changed || game_changed {
+            self.clear_promotion_result();
+        }
         if changed {
             self.edit_view.selected = None;
             self.preview = None;
@@ -569,6 +582,21 @@ impl Desktop {
             "migration_start",
             json!({"revision":revision}),
             "正在核对旧版修改…",
+        );
+    }
+    fn clear_promotion_result(&mut self) {
+        self.promotion_result = Value::Null;
+        self.show_promotion_result = false;
+        self.promotion_missing = None;
+        self.promotion_error.clear();
+    }
+    pub fn preview_promotion_missing(&mut self, item: Value) {
+        self.show_promotion_result = true;
+        self.promotion_error.clear();
+        self.submit(
+            "promotion_missing_preview",
+            json!({"nonce":self.promotion_result["review_nonce"],"item":item}),
+            "正在预览遗漏文本…",
         );
     }
     pub fn open_batch(&mut self, entry: &Value) {
@@ -732,7 +760,13 @@ impl Desktop {
                             f.error = message.clone();
                         }
                     }
+                    "promotion_missing_preview" => {
+                        self.promotion_error = message.clone();
+                    }
                     "batch_preview" | "batch_save" => {
+                        if action == "batch_save" && self.show_promotion_result {
+                            self.promotion_error = message.clone();
+                        }
                         if let Some(f) = &mut self.batch_form {
                             f.error = message.clone();
                         }
@@ -740,7 +774,7 @@ impl Desktop {
                             self.restore_context_status();
                         }
                     }
-                    "migration_commit" => {
+                    "migration_find" | "migration_commit" => {
                         if let Some(form) = &mut self.migration_form {
                             form.error = message;
                         }
@@ -800,8 +834,17 @@ impl Desktop {
             }
             let data = event.get("data").cloned().unwrap_or(Value::Null);
             match action.as_str() {
+                "promotion_missing_preview" => {
+                    if self.show_promotion_result {
+                        self.promotion_missing = Some(data);
+                    }
+                    self.restore_context_status();
+                }
                 "promotion_start" => {
                     self.apply_state(data["state"].clone());
+                    self.clear_promotion_result();
+                    self.promotion_result =
+                        json!({"review_nonce":data["review_nonce"],"items":data["retained_items"]});
                     self.status = if count(&data, "relocated") > 0 {
                         format!(
                             "已重新定位 {} 段文本，整理 {} 个整表范围。",
@@ -817,12 +860,11 @@ impl Desktop {
                     } else {
                         "没有可转换的整表范围，现有批量修改已保留。".into()
                     };
-                    if count(&data, "retained") > 0
-                        || slice(&data, "relocations")
-                            .iter()
-                            .any(|item| item["moved"] == false)
+                    if slice(&data, "relocations")
+                        .iter()
+                        .any(|item| item["moved"] == false)
                     {
-                        self.status.push_str("原因与处理方法见日志。");
+                        self.status.push_str("位置核对详情见日志。");
                     }
                     for item in slice(&data, "relocations") {
                         self.log(
@@ -1001,11 +1043,17 @@ impl Desktop {
                     if count(&data, "unavailable_count") > 0 {
                         self.log(
                             format!(
-                                "{} 段原文已变化、缺失或已有新版修改，旧记录已保留。",
+                                "{} 段暂未找到可选目标，可在核对窗口查找新版文本。",
                                 count(&data, "unavailable_count")
                             ),
                             Some(crate::logging::Level::Warning),
                         );
+                    }
+                }
+                "migration_find" => {
+                    if let Some(form) = &mut self.migration_form {
+                        form.error.clear();
+                        form.apply_search_result(&data);
                     }
                 }
                 "migration_commit" => {
@@ -1066,6 +1114,7 @@ impl Desktop {
                 | "remove_batch"
                 | "remove_batch_member"
                 | "import_commit" => {
+                    let supplemented = action == "batch_save" && self.promotion_missing.is_some();
                     self.apply_state(data);
                     if action == "save_rule" {
                         self.rule_form = None;
@@ -1079,7 +1128,11 @@ impl Desktop {
                     if action == "batch_save" {
                         self.batch_form = None;
                     }
-                    self.status = "修改已保存。".into();
+                    self.status = if supplemented {
+                        "补改已保存，可再次整理批量修改。".into()
+                    } else {
+                        "修改已保存。".into()
+                    };
                 }
                 "combined_save" | "combined_remove" => {
                     self.apply_state(data);
@@ -1811,7 +1864,7 @@ mod view_tests {
         };
         let position = labels
             .iter()
-            .find(|(t, ..)| t == "1 处")
+            .find(|(t, ..)| t.ends_with("记录 1 · 字段 0"))
             .unwrap()
             .1
             .center();

@@ -12,6 +12,7 @@ fn edit_documents_have_named_fields_and_reject_positional_rows() {
         replacement: "委托".into(),
         batch: false,
         batch_operation: None,
+        anchor: None,
     };
     let bytes = model::edits_bytes(std::slice::from_ref(&edit)).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -46,6 +47,7 @@ fn single_and_batch_pair_round_trips_but_same_kind_duplicates_are_rejected() {
         replacement: "私人任务".into(),
         batch: false,
         batch_operation: None,
+        anchor: None,
     };
     let mut batch = single.clone();
     batch.batch = true;
@@ -55,6 +57,7 @@ fn single_and_batch_pair_round_trips_but_same_kind_duplicates_are_rejected() {
         old: "任务".into(),
         new: "委托".into(),
         before: single.replacement.clone(),
+        previous_scope: None,
     });
     let pair = vec![single.clone(), batch.clone()];
     assert_eq!(
