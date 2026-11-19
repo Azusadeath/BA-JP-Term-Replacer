@@ -272,20 +272,36 @@ impl Database {
         key: &[u8; 32],
         control: &Control<'_>,
     ) -> Result<Self> {
+        Self::open_inner(path, encrypted, key, control, None)
+    }
+
+    pub fn open_verified(
+        path: &Path,
+        key: &[u8; 32],
+        control: &Control<'_>,
+        size: u64,
+        crc: u32,
+    ) -> Result<Self> {
+        Self::open_inner(path, true, key, control, Some((size, crc)))
+    }
+
+    fn open_inner(
+        path: &Path,
+        encrypted: bool,
+        key: &[u8; 32],
+        control: &Control<'_>,
+        expected: Option<(u64, u32)>,
+    ) -> Result<Self> {
         let (plain, decrypted) = if encrypted {
             let temporary = tempfile::tempdir()?;
             let plain = temporary.path().join("read.db");
-            let info = crate::codec::decrypt(path, &plain, key, control)?;
+            let info = crate::codec::decrypt_temporary(path, &plain, key, control, expected)?;
             (plain, Some((temporary, info)))
         } else {
             (path.to_path_buf(), None)
         };
         let con = Connection::open_with_flags(&plain, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        // Keep the decrypted database on the temporary file and let SQLite's
-        // page cache do the bounded caching. Copying a 200+ MiB database into
-        // a second in-memory connection adds latency and resident memory while
-        // providing no reliable scan benefit on the target workload.
-        con.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-65536;")?;
+        configure_connection(&con, true)?;
         Ok(Self { con, decrypted })
     }
 
@@ -298,6 +314,23 @@ impl Database {
     }
 }
 
+/// Tune the connections used for full-database scans and patch writes.
+/// SQLite keeps the database on disk, while its file mapping avoids copying
+/// the large decrypted file through the pager for every scan.
+pub fn configure_connection(con: &Connection, read_only: bool) -> Result<()> {
+    con.execute_batch(if read_only {
+        "PRAGMA query_only=ON;
+         PRAGMA cache_size=-65536;
+         PRAGMA mmap_size=536870912;
+         PRAGMA temp_store=MEMORY;"
+    } else {
+        "PRAGMA cache_size=-65536;
+         PRAGMA mmap_size=536870912;
+         PRAGMA temp_store=MEMORY;"
+    })?;
+    Ok(())
+}
+
 pub fn patch_blob(
     blob: &[u8],
     rules: &Rules,
@@ -308,6 +341,7 @@ pub fn patch_blob(
 ) -> Result<(Option<Vec<u8>>, BlobStats)> {
     let parsed = fields::parse_with_issues(blob, options.ascii_exact || !overrides.is_empty())?;
     let fields = parsed.fields;
+    let may_match = !fields.is_empty() && rules.may_match_blob(blob);
     let mut shared = HashMap::new();
     if !overrides.is_empty() {
         for f in &fields {
@@ -323,18 +357,22 @@ pub fn patch_blob(
     let mut appended: HashMap<(usize, String), usize> = HashMap::new();
     for f in &fields {
         let explicit = overrides.get(&f.slot);
-        if explicit.is_some() {
+        if explicit.is_some() && may_match {
             view.skipped(rules, f.text, evidence, true)
                 .map_err(|e| field_error(f.slot, e))?;
         }
         if explicit.is_none() && options.skip_kana && fields::has_kana(f.text) {
             stats.kana_skipped += 1;
-            view.skipped(rules, f.text, evidence, false)
-                .map_err(|e| field_error(f.slot, e))?;
+            if may_match {
+                view.skipped(rules, f.text, evidence, false)
+                    .map_err(|e| field_error(f.slot, e))?;
+            }
             continue;
         }
         let new = if let Some(s) = explicit {
             Some(s.clone())
+        } else if !may_match {
+            None
         } else if fields::has_cjk(f.text) {
             view.apply(rules, f.text, evidence, false)
                 .map_err(|e| field_error(f.slot, e))?
@@ -710,7 +748,12 @@ pub fn patch_database(
                         continue;
                     }
                 };
-                let overrides = targets.get(&(table.clone(), rid.clone())).unwrap_or(&empty);
+                let lookup = (!targets.is_empty() || comparison.is_some_and(|map| !map.is_empty()))
+                    .then(|| (table.clone(), rid.clone()));
+                let overrides = lookup
+                    .as_ref()
+                    .and_then(|key| targets.get(key))
+                    .unwrap_or(&empty);
                 let (new, bs) =
                     match patch_blob(blob, rules, &view, &mut evidence, options, overrides) {
                         Ok(v) => v,
@@ -763,8 +806,9 @@ pub fn patch_database(
                             &rid,
                             blob,
                             new.as_deref(),
-                            comparison
-                                .get(&(table.clone(), rid.clone()))
+                            lookup
+                                .as_ref()
+                                .and_then(|key| comparison.get(key))
                                 .unwrap_or(&empty),
                         )
                         .map_err(|e| record_error(table, &rid, e))?;

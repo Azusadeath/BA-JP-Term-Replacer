@@ -100,6 +100,9 @@ impl Desktop {
             )
             .clicked()
             {
+                if self.tab != index {
+                    self.search_more_wheel = SearchMoreWheel::default();
+                }
                 self.tab = index;
                 self.restore_context_status();
             }
@@ -508,6 +511,10 @@ impl Desktop {
         }
         let search = self.search.clone();
         let rows = slice(&search, "rows");
+        let has_more = !rows.is_empty() && rows.len() < count(&search, "total") as usize;
+        let can_load = has_more && self.connected && self.busy.is_none() && !self.modal();
+        let mut load_more = false;
+        let mut wheel_bottom = None;
         let toolbar_position = ui.cursor().min + egui::vec2(8., 0.);
         if !rows.is_empty() {
             ui.add_space(44.);
@@ -536,8 +543,7 @@ impl Desktop {
                         },
                     );
                 } else {
-                    let has_more = rows.len() < count(&self.search, "total") as usize;
-                    egui::ScrollArea::vertical()
+                    let list = egui::ScrollArea::vertical()
                         .id_salt(("search-rows", text(&self.search, "nonce")))
                         .auto_shrink([false, false])
                         .max_height(ui.available_height().max(80.))
@@ -556,26 +562,8 @@ impl Desktop {
                                                     - action_width(ui, "加载更多"))
                                                     * 0.5;
                                                 ui.add_space(inset.max(0.));
-                                                if secondary(
-                                                    ui,
-                                                    self.connected
-                                                        && self.busy.is_none()
-                                                        && !self.modal(),
-                                                    "加载更多",
-                                                )
-                                                .clicked()
-                                                {
-                                                    self.submit(
-                                                        "search_more",
-                                                        json!({
-                                                            "keyword":text(&self.search,"keyword"),
-                                                            "source":text(&self.search,"source"),
-                                                            "search_nonce":text(&self.search,"nonce"),
-                                                            "offset":rows.len()
-                                                        }),
-                                                        "正在加载更多搜索结果…",
-                                                    );
-                                                }
+                                                load_more |=
+                                                    secondary(ui, can_load, "加载更多").clicked();
                                             },
                                         );
                                         continue;
@@ -605,8 +593,34 @@ impl Desktop {
                                 }
                             },
                         );
+                    let end = (list.content_size.y - list.inner_rect.height()).max(0.);
+                    if can_load
+                        && self.busy.is_none()
+                        && !self.modal()
+                        && !self.show_logs
+                        && !egui::Popup::is_any_open(ui.ctx())
+                        && ui.is_enabled()
+                        && ui.rect_contains_pointer(list.inner_rect)
+                        && list.state.clamped_offset().y >= end - 1.
+                    {
+                        wheel_bottom = Some((list.id, rows.len()));
+                    }
                 }
             });
+        let wheel_load = ui.input(|input| self.search_more_wheel.update(wheel_bottom, input));
+        if (load_more || wheel_load) && self.busy.is_none() && !self.modal() {
+            self.search_more_wheel = SearchMoreWheel::default();
+            self.submit(
+                "search_more",
+                json!({
+                    "keyword":text(&search,"keyword"),
+                    "source":text(&search,"source"),
+                    "search_nonce":text(&search,"nonce"),
+                    "offset":rows.len()
+                }),
+                "正在加载更多搜索结果…",
+            );
+        }
         if !rows.is_empty()
             && !self.selection.rows.is_empty()
             && !self.modal()

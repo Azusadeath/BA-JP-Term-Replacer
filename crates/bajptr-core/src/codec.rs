@@ -2,7 +2,9 @@
 use crate::{Control, Result, invalid};
 use aes::Aes256;
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::NoPadding};
+use cbc::cipher::{
+    BlockDecryptMut, BlockEncryptMut, InnerIvInit, KeyInit, block_padding::NoPadding,
+};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha512;
@@ -15,6 +17,7 @@ use std::{
 pub const PAGE: usize = 4096;
 pub const USABLE: usize = 4016;
 const HEADER: &[u8; 16] = b"SQLite format 3\0";
+const IO_BUFFER: usize = 1024 * 1024;
 type Hmac512 = Hmac<Sha512>;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,8 +51,8 @@ fn hkey(key: &[u8; 32], salt: &[u8]) -> [u8; 32] {
     pbkdf2::pbkdf2_hmac::<Sha512>(key, &masked, 2, &mut result);
     result
 }
-fn mac(hkey: &[u8; 32], cipher: &[u8], iv: &[u8], page: u32) -> Hmac512 {
-    let mut mac = Hmac512::new_from_slice(hkey).unwrap();
+fn page_mac(keyed: &Hmac512, cipher: &[u8], iv: &[u8], page: u32) -> Hmac512 {
+    let mut mac = keyed.clone();
     mac.update(cipher);
     mac.update(iv);
     mac.update(&page.to_le_bytes());
@@ -65,9 +68,9 @@ fn pages(path: &Path) -> Result<u64> {
 
 pub fn inspect(path: &Path, key: &[u8; 32], control: &Control<'_>) -> Result<Inspection> {
     let count = pages(path)?;
-    let mut stream = BufReader::new(File::open(path)?);
+    let mut stream = BufReader::with_capacity(IO_BUFFER, File::open(path)?);
     let mut page = [0u8; PAGE];
-    let mut key_mac = [0; 32];
+    let mut keyed = None;
     let mut crc = crc32fast::Hasher::new();
     let mut result = Inspection {
         ok: 0,
@@ -81,14 +84,12 @@ pub fn inspect(path: &Path, key: &[u8; 32], control: &Control<'_>) -> Result<Ins
         }
         stream.read_exact(&mut page)?;
         crc.update(&page);
-        let off = if number == 1 {
-            key_mac = hkey(key, &page[..16]);
-            16
-        } else {
-            0
-        };
-        if mac(
-            &key_mac,
+        let off = if number == 1 { 16 } else { 0 };
+        let keyed = keyed.get_or_insert_with(|| {
+            <Hmac512 as Mac>::new_from_slice(&hkey(key, &page[..16])).unwrap()
+        });
+        if page_mac(
+            keyed,
             &page[off..USABLE],
             &page[USABLE..USABLE + 16],
             number as u32,
@@ -109,16 +110,46 @@ pub fn inspect(path: &Path, key: &[u8; 32], control: &Control<'_>) -> Result<Ins
 }
 
 pub fn decrypt(input: &Path, output: &Path, key: &[u8; 32], control: &Control<'_>) -> Result<Info> {
+    decrypt_inner(input, output, key, control, true, None)
+}
+
+pub(crate) fn decrypt_temporary(
+    input: &Path,
+    output: &Path,
+    key: &[u8; 32],
+    control: &Control<'_>,
+    expected: Option<(u64, u32)>,
+) -> Result<Info> {
+    decrypt_inner(input, output, key, control, false, expected)
+}
+
+fn decrypt_inner(
+    input: &Path,
+    output: &Path,
+    key: &[u8; 32],
+    control: &Control<'_>,
+    sync: bool,
+    expected: Option<(u64, u32)>,
+) -> Result<Info> {
     control.check()?;
     let count = pages(input)?;
     if input == output {
         return Err(invalid("输入和输出文件不能相同。"));
     }
-    let mut stream = BufReader::new(File::open(input)?);
-    let mut out = BufWriter::new(File::create(output)?);
+    let file = File::open(input)?;
+    if let Some((expected_size, _)) = expected
+        && (file.metadata()?.len() != expected_size
+            || !matches!(expected_size % PAGE as u64, 0 | 4))
+    {
+        return Err(invalid("数据库大小与资源目录不符，未接受此资源。"));
+    }
+    let mut crc = expected.map(|_| crc32fast::Hasher::new());
+    let mut stream = BufReader::with_capacity(IO_BUFFER, file);
+    let mut out = BufWriter::with_capacity(IO_BUFFER, File::create(output)?);
     let mut page = [0u8; PAGE];
     let mut salt = [0; 16];
-    let mut key_mac = [0; 32];
+    let mut keyed = None;
+    let aes = Aes256::new(key.into());
     let mut ivs = Vec::with_capacity(count as usize);
     for number in 1..=count {
         if number % 128 == 1 {
@@ -126,36 +157,54 @@ pub fn decrypt(input: &Path, output: &Path, key: &[u8; 32], control: &Control<'_
             control.check()?;
         }
         stream.read_exact(&mut page)?;
+        if let Some(crc) = &mut crc {
+            crc.update(&page);
+        }
         let off = if number == 1 {
             salt.copy_from_slice(&page[..16]);
-            key_mac = hkey(key, &salt);
             16
         } else {
             0
         };
         let iv: [u8; 16] = page[USABLE..USABLE + 16].try_into().unwrap();
-        mac(&key_mac, &page[off..USABLE], &iv, number as u32)
+        let keyed = keyed
+            .get_or_insert_with(|| <Hmac512 as Mac>::new_from_slice(&hkey(key, &salt)).unwrap());
+        page_mac(keyed, &page[off..USABLE], &iv, number as u32)
             .verify_slice(&page[USABLE + 16..])
             .map_err(|_| {
                 invalid(format!(
                     "数据库第 {number} 页 HMAC 校验失败，未接受此资源。"
                 ))
             })?;
-        cbc::Decryptor::<Aes256>::new(key.into(), (&iv).into())
+        cbc::Decryptor::inner_iv_init(aes.clone(), (&iv).into())
             .decrypt_padded_mut::<NoPadding>(&mut page[off..USABLE])
             .map_err(|_| invalid("数据库密文长度无效。"))?;
         if number == 1 {
             if page[16..18] != [0x10, 0] || page[20] != 80 {
                 return Err(invalid("数据库页大小或保留区与支持格式不符。"));
             }
-            out.write_all(HEADER)?;
+            page[..16].copy_from_slice(HEADER);
         }
-        out.write_all(&page[off..USABLE])?;
-        out.write_all(&[0; 80])?;
+        page[USABLE..].fill(0);
+        out.write_all(&page)?;
         ivs.push(B64.encode(iv));
     }
+    if let Some(((size, expected_crc), mut crc)) = expected.zip(crc) {
+        let mut tail = [0; 4];
+        let tail = &mut tail[..(size % PAGE as u64) as usize];
+        stream.read_exact(tail)?;
+        crc.update(tail);
+        if count * PAGE as u64 + tail.len() as u64 != size
+            || stream.read(&mut [0])? != 0
+            || crc.finalize() != expected_crc
+        {
+            return Err(invalid("数据库大小或 CRC 校验失败，未接受此资源。"));
+        }
+    }
     out.flush()?;
-    out.get_ref().sync_all()?;
+    if sync {
+        out.get_ref().sync_all()?;
+    }
     Ok(Info {
         pages: count,
         salt: B64.encode(salt),
@@ -192,9 +241,10 @@ pub fn encrypt_checked(
         return Err(invalid("IV 长度必须是 16 字节。"));
     }
     let count = size / PAGE as u64;
-    let key_mac = hkey(key, salt);
-    let mut stream = BufReader::new(File::open(input)?);
-    let mut out = BufWriter::new(File::create(output)?);
+    let keyed = <Hmac512 as Mac>::new_from_slice(&hkey(key, salt)).unwrap();
+    let aes = Aes256::new(key.into());
+    let mut stream = BufReader::with_capacity(IO_BUFFER, File::open(input)?);
+    let mut out = BufWriter::with_capacity(IO_BUFFER, File::create(output)?);
     let mut page = [0u8; PAGE];
     let mut crc = crc32fast::Hasher::new();
     for number in 1..=count {
@@ -211,22 +261,19 @@ pub fn encrypt_checked(
         }
         let off = if number == 1 { 16 } else { 0 };
         let len = USABLE - off;
-        cbc::Encryptor::<Aes256>::new(key.into(), (&iv).into())
+        cbc::Encryptor::inner_iv_init(aes.clone(), (&iv).into())
             .encrypt_padded_mut::<NoPadding>(&mut page[off..USABLE], len)
             .map_err(|_| invalid("明文页长度无效。"))?;
         if number == 1 {
-            out.write_all(salt)?;
-            crc.update(salt);
+            page[..16].copy_from_slice(salt);
         }
-        out.write_all(&page[off..USABLE])?;
-        crc.update(&page[off..USABLE]);
-        out.write_all(&iv)?;
-        crc.update(&iv);
-        let digest = mac(&key_mac, &page[off..USABLE], &iv, number as u32)
+        let digest = page_mac(&keyed, &page[off..USABLE], &iv, number as u32)
             .finalize()
             .into_bytes();
-        out.write_all(&digest)?;
-        crc.update(&digest);
+        page[USABLE..USABLE + 16].copy_from_slice(&iv);
+        page[USABLE + 16..].copy_from_slice(&digest);
+        out.write_all(&page)?;
+        crc.update(&page);
     }
     out.flush()?;
     out.get_ref().sync_all()?;

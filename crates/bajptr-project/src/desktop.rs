@@ -622,10 +622,11 @@ impl Project {
                 | "restore"
                 | "export_text"
         ) {
-            let status = self.engine.baseline_status(
+            let status = self.engine.baseline_status_for_action(
                 &self.game,
                 &self.data.join("backup"),
                 &self.data,
+                matches!(action, "search" | "preview"),
                 control,
             )?;
             if status["state"] != "ready" {

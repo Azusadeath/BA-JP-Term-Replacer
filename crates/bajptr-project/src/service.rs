@@ -250,6 +250,47 @@ impl Engine {
         }
         Ok(())
     }
+    fn open_baseline(
+        &mut self,
+        game: &region::Game,
+        root: &Path,
+        control: &Control<'_>,
+    ) -> Result<Baseline> {
+        let _lock = Lock::acquire(&game.catalog)?;
+        let (original, entry) = Baselines::entry_for_open(game, root)?;
+        self.open_verified(&original, &entry, control)?;
+        Ok(original)
+    }
+    fn open_verified(
+        &mut self,
+        original: &Baseline,
+        entry: &region::Entry,
+        control: &Control<'_>,
+    ) -> Result<()> {
+        let source_stamp = baseline::stamp(&original.bundle)?;
+        let source_key = (original.bundle.clone(), source_stamp);
+        if self.source_key.as_ref() == Some(&source_key) {
+            self.baselines.checked(&original.bundle, entry, control)?;
+        } else {
+            self.close_session();
+            control.log("正在读取初始底稿…")?;
+            let db = database::Database::open_verified(
+                &original.bundle,
+                &codec::key(region::KEY)?,
+                control,
+                entry.size,
+                entry.crc,
+            )?;
+            if baseline::stamp(&original.bundle)? != source_stamp {
+                return Err(invalid("数据库在读取期间发生变化，请重试。"));
+            }
+            self.baselines
+                .remember_checked(&original.bundle, source_stamp, entry.crc);
+            self.session.database = Some(db);
+            self.source_key = Some(source_key);
+        }
+        Ok(())
+    }
     pub fn baseline(&mut self, game: &str, root: &Path, control: &Control<'_>) -> Result<Baseline> {
         let game = region::locate(game)?;
         let _lock = Lock::acquire(&game.catalog)?;
@@ -262,15 +303,26 @@ impl Engine {
         data: &Path,
         control: &Control<'_>,
     ) -> Result<Value> {
+        self.baseline_status_for_action(game, root, data, false, control)
+    }
+    pub(crate) fn baseline_status_for_action(
+        &mut self,
+        game: &str,
+        root: &Path,
+        data: &Path,
+        open_ready: bool,
+        control: &Control<'_>,
+    ) -> Result<Value> {
         let live = region::locate(game)?;
         let _lock = Lock::acquire(&live.catalog)?;
-        self.baseline_status_locked(&live, root, data, control)
+        self.baseline_status_locked(&live, root, data, open_ready, control)
     }
     fn baseline_status_locked(
         &mut self,
         live: &region::Game,
         root: &Path,
         data: &Path,
+        open_ready: bool,
         control: &Control<'_>,
     ) -> Result<Value> {
         let destination = baseline::location(live, root)?;
@@ -287,14 +339,16 @@ impl Engine {
                 .all(|i| receipt["identity"][*i] == identity[*i]);
         let mut saved = Value::Null;
         let state = if destination.exists() {
-            let original = self.baselines.resolve(live, root, control)?;
-            let entry = region::parse(&fs::read(&original.catalog)?)?;
-            saved = baseline::info(&original)?;
-            if (entry.size, entry.crc) == (live.entry.size, live.entry.crc) || known {
-                "ready"
+            let (original, entry) = Baselines::saved_entry(live, root, &version)?
+                .ok_or_else(|| Baselines::missing(true))?;
+            let ready = (entry.size, entry.crc) == (live.entry.size, live.entry.crc) || known;
+            if open_ready && ready {
+                self.open_verified(&original, &entry, control)?;
             } else {
-                "changed"
+                self.baselines.checked(&original.bundle, &entry, control)?;
             }
+            saved = baseline::info(&original)?;
+            if ready { "ready" } else { "changed" }
         } else if known && receipt["kind"] != "restored" {
             "blocked"
         } else if fs::read_dir(destination.parent().unwrap())
@@ -351,7 +405,7 @@ impl Engine {
     ) -> Result<Baseline> {
         let live = region::locate(game)?;
         let _lock = Lock::acquire(&live.catalog)?;
-        let status = self.baseline_status_locked(&live, root, data, control)?;
+        let status = self.baseline_status_locked(&live, root, data, false, control)?;
         if expected.is_some_and(|v| v != &status["token"]) {
             return Err(invalid(
                 "游戏资源或底稿已变化，请重新检查后确认，未替换原底稿。",
@@ -518,8 +572,7 @@ impl Engine {
         if keyword.is_empty() {
             return Err(invalid("请输入要查找的文字。"));
         }
-        let original = self.baseline(game, root, control)?;
-        self.open(&original, control)?;
+        let original = self.open_baseline(&region::locate(game)?, root, control)?;
         let key = format!("{keyword}\0{skip_kana}");
         if self
             .search_index
@@ -718,8 +771,7 @@ impl Engine {
         config.check_documents()?;
         let live = region::locate(game)?;
         let identity = region::resource_identity(&live)?;
-        let original = self.baseline(game, backup_root, control)?;
-        self.open(&original, control)?;
+        let original = self.open_baseline(&live, backup_root, control)?;
         let options = config.options(&storage::identity(&live.dir)?, &original.version)?;
         let key = storage::digest(&serde_json::to_vec(&json!([
             identity,

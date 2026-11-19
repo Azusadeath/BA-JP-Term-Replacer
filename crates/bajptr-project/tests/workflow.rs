@@ -2051,6 +2051,31 @@ fn generate_fixture_patch(p: &mut Project) -> bajptr_project::Result<Value> {
 }
 
 #[test]
+fn verified_database_open_checks_crc_of_the_legacy_tail() {
+    use bajptr_core::{codec, database::Database};
+
+    let f = Fixture::new();
+    let live = region::locate(f.game.to_str().unwrap()).unwrap();
+    let key = codec::key(region::KEY).unwrap();
+    let mut bytes = fs::read(&live.bundle).unwrap();
+    bytes.truncate(bytes.len() / codec::PAGE * codec::PAGE);
+    bytes.extend_from_slice(&[1, 2, 3, 4]);
+    let copy = f.root.join("legacy-tail.db");
+    fs::write(&copy, &bytes).unwrap();
+    let verified = codec::inspect(&copy, &key, &control()).unwrap();
+    let size = bytes.len() as u64;
+    assert_eq!(verified.bad, 0);
+    assert!(Database::open_verified(&copy, &key, &control(), size, verified.crc).is_ok());
+
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(&copy, bytes).unwrap();
+    let error = Database::open_verified(&copy, &key, &control(), size, verified.crc)
+        .err()
+        .expect("legacy tail must still be covered by the catalog CRC");
+    assert!(error.to_string().contains("CRC"), "{error}");
+}
+
+#[test]
 fn preview_rejects_damaged_live_bytes_with_the_same_catalog_entry() {
     let f = Fixture::new();
     let mut p = f.ready_project();

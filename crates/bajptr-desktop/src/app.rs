@@ -42,6 +42,7 @@ pub struct Desktop {
     pub search: Arc<Value>,
     pub keyword: String,
     pub search_input: SearchInput,
+    pub search_more_wheel: SearchMoreWheel,
     pub search_source: String,
     pub selection: Selection,
     pub tables: Vec<Value>,
@@ -139,6 +140,7 @@ impl Desktop {
             search: Value::Null.into(),
             keyword: String::new(),
             search_input: SearchInput::default(),
+            search_more_wheel: SearchMoreWheel::default(),
             search_source: String::new(),
             selection: Selection::default(),
             tables: Vec::new(),
@@ -2786,6 +2788,92 @@ mod view_tests {
         );
         assert_eq!(form.encode().unwrap(), "A");
         assert!(app.obsolete.contains(&7), "late results must be discarded");
+    }
+
+    #[test]
+    fn search_more_wheel_requires_two_separate_downward_steps_at_the_bottom() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut app = Desktop::initial();
+        app.connected = true;
+        let rows = vec![json!({"text":"result","label":"source"}); 40];
+        app.search = json!({"nonce":"wheel","keyword":"result","total":41,"rows":rows}).into();
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 620.));
+        let pointer = egui::Event::PointerMoved(egui::pos2(420., 300.));
+        let wheel = |delta, unit, source| egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(0., delta),
+            phase: egui::TouchPhase::Move,
+            source,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let down = wheel(
+            -1.,
+            egui::MouseWheelUnit::Line,
+            egui::MouseWheelSource::Unknown,
+        );
+        let mut time = 0.;
+        let mut draw = |app: &mut Desktop, events| {
+            time += 0.1;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(area),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.search_page(ui),
+            );
+        };
+        draw(&mut app, vec![pointer.clone()]);
+        draw(&mut app, vec![down.clone()]);
+        draw(&mut app, vec![down.clone()]);
+        assert!(
+            app.error.is_none(),
+            "scrolling within the list must not load a page"
+        );
+        draw(
+            &mut app,
+            vec![wheel(
+                -500.,
+                egui::MouseWheelUnit::Line,
+                egui::MouseWheelSource::Unknown,
+            )],
+        );
+        for _ in 0..6 {
+            draw(&mut app, vec![]);
+        }
+        draw(&mut app, vec![down.clone(), down.clone()]);
+        assert!(app.error.is_none(), "one input batch counts once");
+        draw(
+            &mut app,
+            vec![wheel(
+                -2.,
+                egui::MouseWheelUnit::Point,
+                egui::MouseWheelSource::Momentum,
+            )],
+        );
+        draw(&mut app, vec![down.clone()]);
+        assert!(app.error.is_none(), "momentum breaks the pair");
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(420., 8.)),
+                down.clone(),
+            ],
+        );
+        assert!(
+            app.error.is_none(),
+            "the pointer must remain inside the list"
+        );
+        draw(&mut app, vec![pointer]);
+        draw(&mut app, vec![down.clone()]);
+        assert!(app.error.is_none());
+        draw(&mut app, vec![down]);
+        assert!(
+            app.error.is_some(),
+            "the second step must attempt the request"
+        );
     }
 
     #[test]

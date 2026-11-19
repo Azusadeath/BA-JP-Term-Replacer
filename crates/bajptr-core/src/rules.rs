@@ -1,5 +1,6 @@
 use crate::fields::{MAX_STRING, forbidden};
 use crate::{Error, Result, invalid};
+use aho_corasick::AhoCorasick;
 use fancy_regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -583,6 +584,7 @@ pub fn regex_sample(old: &str, new: &str, text: &str) -> Result<(String, usize)>
 pub struct Rules {
     pub values: Vec<Rule>,
     scopes: Vec<Option<HashSet<String>>>,
+    candidate: Option<AhoCorasick>,
     regex: Vec<Option<PortableRegex>>,
 }
 pub struct View {
@@ -603,6 +605,30 @@ fn rule_error(index: usize, original: &str, error: Error) -> Error {
             source: Box::new(error),
         },
     }
+}
+
+// Match only required, contiguous UTF-8 bytes. Complex regexes still run on
+// every eligible field, including patterns that can match empty text.
+fn candidate_matcher(rules: &[Rule]) -> Option<AhoCorasick> {
+    let mut needles = Vec::new();
+    for rule in rules {
+        if rule.mode != "re" {
+            needles.push(rule.old.as_str());
+            continue;
+        }
+        let body = rule
+            .old
+            .strip_prefix("(?:")
+            .and_then(|part| part.strip_suffix(')'))
+            .unwrap_or(&rule.old);
+        for alternative in body.split('|') {
+            if alternative.is_empty() || alternative.chars().any(|c| r"\.^$*+?{}[]()".contains(c)) {
+                return None;
+            }
+            needles.push(alternative);
+        }
+    }
+    AhoCorasick::new(needles).ok()
 }
 
 impl Rules {
@@ -660,12 +686,18 @@ impl Rules {
             });
             scopes.push(scope);
         }
+        let candidate = candidate_matcher(&values);
         Ok(Self {
             values,
             scopes,
             regex,
+            candidate,
         })
     }
+    pub(crate) fn may_match_blob(&self, blob: &[u8]) -> bool {
+        !self.values.is_empty() && self.candidate.as_ref().is_none_or(|m| m.is_match(blob))
+    }
+
     pub fn validate_tables(&self, tables: &[String]) -> Result<()> {
         let mut missing: Vec<_> = self
             .scopes

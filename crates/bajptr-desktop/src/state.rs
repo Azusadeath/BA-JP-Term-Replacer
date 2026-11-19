@@ -240,6 +240,74 @@ impl CombinedForm {
 }
 
 #[derive(Default)]
+pub struct SearchMoreWheel {
+    bottom: Option<(eframe::egui::Id, usize)>,
+    first_down: Option<f64>,
+}
+impl SearchMoreWheel {
+    pub fn update(
+        &mut self,
+        bottom: Option<(eframe::egui::Id, usize)>,
+        input: &eframe::egui::InputState,
+    ) -> bool {
+        use eframe::egui::{Event, MouseWheelSource, MouseWheelUnit};
+
+        let was_at_bottom = bottom.is_some() && self.bottom == bottom;
+        self.bottom = bottom;
+        if !was_at_bottom {
+            self.first_down = None;
+            return false;
+        }
+        let mut down = false;
+        for event in &input.events {
+            if matches!(
+                event,
+                Event::PointerGone | Event::PointerButton { pressed: true, .. }
+            ) {
+                self.first_down = None;
+                return false;
+            }
+            let Event::MouseWheel {
+                unit,
+                delta,
+                source,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let discrete = match source {
+                MouseWheelSource::Wheel => true,
+                MouseWheelSource::Unknown => {
+                    matches!(unit, MouseWheelUnit::Line | MouseWheelUnit::Page)
+                        && delta.y.abs() >= 1.
+                }
+                _ => false,
+            };
+            if !discrete || !modifiers.is_none() || delta.y >= -delta.x.abs() {
+                self.first_down = None;
+                return false;
+            }
+            down = true;
+        }
+        if !down {
+            return false;
+        }
+        // A single input batch can contain multiple wheel events from one motion.
+        if self
+            .first_down
+            .is_some_and(|time| input.time > time && input.time - time <= 0.65)
+        {
+            self.first_down = None;
+            return true;
+        }
+        self.first_down = Some(input.time);
+        false
+    }
+}
+
+#[derive(Default)]
 pub struct SearchInput {
     composing: bool,
 }

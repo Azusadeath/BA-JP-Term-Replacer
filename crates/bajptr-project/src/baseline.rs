@@ -54,10 +54,7 @@ impl Baselines {
             if stamp(path)? != stat {
                 return Err(invalid("数据库在校验期间发生变化，请重试。"));
             }
-            if self.verified.len() >= 32 {
-                self.verified.clear();
-            }
-            self.verified.insert(path.into(), (stat, inspected.crc));
+            self.remember_checked(path, stat, inspected.crc);
             inspected.crc
         };
         if crc != entry.crc {
@@ -75,6 +72,18 @@ impl Baselines {
         if !model::is_version(version) {
             return Err(invalid("旧底稿版本无效。"));
         }
+        let Some((baseline, entry)) = Self::saved_entry(game, root, version)? else {
+            return Ok(None);
+        };
+        self.checked(&baseline.bundle, &entry, control)?;
+        Ok(Some(baseline))
+    }
+
+    pub(crate) fn saved_entry(
+        game: &Game,
+        root: &Path,
+        version: &str,
+    ) -> Result<Option<(Baseline, Entry)>> {
         let game_id = storage::digest(storage::identity(&game.dir)?.as_bytes());
         let destination = root.join("_baselines").join(&game_id[..24]).join(version);
         let record_path = destination.join("baseline.json");
@@ -102,14 +111,32 @@ impl Baselines {
             return Err(invalid("底稿记录与数据库名称不匹配。"));
         }
         let bundle = destination.join(name);
-        self.checked(&bundle, &entry, control)?;
-        Ok(Some(Baseline {
-            bundle,
-            catalog,
-            version: version.into(),
-            origin: record["origin"].as_str().unwrap_or("").into(),
-        }))
+        Ok(Some((
+            Baseline {
+                bundle,
+                catalog,
+                version: version.into(),
+                origin: record["origin"].as_str().unwrap_or("").into(),
+            },
+            entry,
+        )))
     }
+    // The caller checks the resource against the catalog while decrypting it.
+    pub(crate) fn entry_for_open(game: &Game, root: &Path) -> Result<(Baseline, Entry)> {
+        let version = region::version(&game.catalog)?;
+        if let Some(saved) = Self::saved_entry(game, root, &version)? {
+            return Ok(saved);
+        }
+        Err(Self::missing(location(game, root)?.exists()))
+    }
+
+    pub(crate) fn remember_checked(&mut self, path: &Path, stat: Stamp, crc: u32) {
+        if self.verified.len() >= 32 {
+            self.verified.clear();
+        }
+        self.verified.insert(path.into(), (stat, crc));
+    }
+
     /// Requires the live catalog lock. Never creates or retires a baseline.
     pub fn resolve(&mut self, game: &Game, root: &Path, control: &Control<'_>) -> Result<Baseline> {
         self.resolve_locked(game, root, control, false, false, &HashSet::new())
@@ -125,6 +152,13 @@ impl Baselines {
     ) -> Result<Baseline> {
         control.check()?;
         self.resolve_locked(game, root, control, true, replace, keep)
+    }
+    pub(crate) fn missing(incomplete: bool) -> crate::Error {
+        invalid(if incomplete {
+            "初始底稿目录不完整，未用当前已修改内容代替。请检查 backup/_baselines。"
+        } else {
+            "尚未确认当前版本的初始底稿，请先检查游戏目录并确认保存底稿。"
+        })
     }
     fn resolve_locked(
         &mut self,
@@ -142,14 +176,10 @@ impl Baselines {
             return Ok(original);
         }
         if destination.exists() && (!replace || !record_path.is_file()) {
-            return Err(invalid(
-                "初始底稿目录不完整，未用当前已修改内容代替。请检查 backup/_baselines。",
-            ));
+            return Err(Self::missing(true));
         }
         if !create {
-            return Err(invalid(
-                "尚未确认当前版本的初始底稿，请先检查游戏目录并确认保存底稿。",
-            ));
+            return Err(Self::missing(false));
         }
         let identity = region::resource_identity(game)?;
         self.checked(&game.bundle, &game.entry, control)?;

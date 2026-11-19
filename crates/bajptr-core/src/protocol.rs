@@ -204,6 +204,7 @@ pub fn execute(session: &mut Session, v: Value, control: &Control<'_>) -> Result
                 Path::new(text(&v, "input")?),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
             )?;
+            database::configure_connection(&con, false)?;
             Ok(serde_json::to_value(database::patch_database(
                 &con,
                 None,
