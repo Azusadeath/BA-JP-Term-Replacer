@@ -103,7 +103,6 @@ pub(super) fn propose(
     layers: &[&Edit],
     candidate: &LocatedText,
     rules: &Rules,
-    skip: bool,
     manual: Option<&str>,
 ) -> Result<Proposal> {
     let row = &candidate.row;
@@ -136,7 +135,7 @@ pub(super) fn propose(
     } else if manual.is_some() {
         return Err(invalid("这条批量修改需按原操作重放。"));
     } else {
-        proposal.input = Some(model::effective(row, &[], &top.game, &top.version, rules, skip)?.0);
+        proposal.input = Some(model::effective(row, &[], &top.game, &top.version, rules)?.0);
     }
     if let Some(input) = &proposal.input {
         if let Some(op) = batch {

@@ -73,7 +73,6 @@ pub struct Stats {
     pub inplace: u64,
     pub appended: u64,
     pub bytes_appended: u64,
-    pub kana_skipped: u64,
     pub parse_failed: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub tables_skipped: u64,
@@ -175,8 +174,6 @@ fn relative_offset(spos: usize, fpos: usize) -> Result<u32> {
 }
 #[derive(Debug, Deserialize)]
 pub struct Options {
-    #[serde(default = "yes")]
-    pub skip_kana: bool,
     #[serde(default = "yes")]
     pub ascii_exact: bool,
     #[serde(default)]
@@ -358,16 +355,8 @@ pub fn patch_blob(
     for f in &fields {
         let explicit = overrides.get(&f.slot);
         if explicit.is_some() && may_match {
-            view.skipped(rules, f.text, evidence, true)
+            view.overridden(rules, f.text, evidence)
                 .map_err(|e| field_error(f.slot, e))?;
-        }
-        if explicit.is_none() && options.skip_kana && fields::has_kana(f.text) {
-            stats.kana_skipped += 1;
-            if may_match {
-                view.skipped(rules, f.text, evidence, false)
-                    .map_err(|e| field_error(f.slot, e))?;
-            }
-            continue;
         }
         let new = if let Some(s) = explicit {
             Some(s.clone())
@@ -772,7 +761,6 @@ pub fn patch_database(
                         }
                         Err(error) => return Err(record_error(table, &rid, error)),
                     };
-                stats.kana_skipped += bs.kana_skipped;
                 stats.fields_skipped += bs.fields_skipped;
                 for issue in &bs.issues {
                     note(
@@ -1120,7 +1108,6 @@ pub fn source_rule_matches(
     con: &Connection,
     names: &[String],
     rules: &Rules,
-    skip_kana: bool,
     control: &Control<'_>,
 ) -> Result<Vec<SourceRuleMatch>> {
     let mut output = Vec::new();
@@ -1173,9 +1160,6 @@ pub fn source_rule_matches(
                 ));
             }
             for field in parsed.fields {
-                if skip_kana && fields::has_kana(field.text) {
-                    continue;
-                }
                 for index in rules
                     .original_matches(field.text)
                     .map_err(|e| record_error(table, &rid, field_error(field.slot, e)))?
@@ -1273,7 +1257,7 @@ pub fn scan(
     limit: usize,
     control: &Control<'_>,
 ) -> Result<(Vec<TextRow>, u64)> {
-    scan_page(con, pattern, keyword, limit, 0, false, control)
+    scan_page(con, pattern, keyword, limit, 0, control)
 }
 
 /// Scan a bounded page of matches while still counting the complete result.
@@ -1285,10 +1269,9 @@ pub fn scan_page(
     keyword: &str,
     limit: usize,
     offset: usize,
-    skip_kana: bool,
     control: &Control<'_>,
 ) -> Result<(Vec<TextRow>, u64)> {
-    let page = scan_page_with_sources(con, pattern, keyword, limit, offset, skip_kana, control)?;
+    let page = scan_page_with_sources(con, pattern, keyword, limit, offset, control)?;
     Ok((page.rows, page.total))
 }
 
@@ -1306,12 +1289,11 @@ pub fn scan_page_with_sources(
     keyword: &str,
     limit: usize,
     offset: usize,
-    skip_kana: bool,
     control: &Control<'_>,
 ) -> Result<ScanPage> {
     let mut found = Vec::new();
     let mut seen = 0;
-    let sources = visit_matches(con, pattern, keyword, skip_kana, control, |row| {
+    let sources = visit_matches(con, pattern, keyword, control, |row| {
         seen += 1;
         if seen > offset && found.len() < limit {
             found.push(row);
@@ -1335,7 +1317,6 @@ impl SearchIndex {
         source: &Connection,
         pattern: &str,
         keyword: &str,
-        skip_kana: bool,
         control: &Control<'_>,
     ) -> Result<Self> {
         let mut con = Connection::open("")?;
@@ -1347,7 +1328,7 @@ impl SearchIndex {
         let transaction = con.transaction()?;
         let sources = {
             let mut insert = transaction.prepare("INSERT INTO matches(source,row) VALUES (?,?)")?;
-            visit_matches(source, pattern, keyword, skip_kana, control, |row| {
+            visit_matches(source, pattern, keyword, control, |row| {
                 insert.execute(rusqlite::params![row.0, serde_json::to_string(&row)?])?;
                 Ok(())
             })?
@@ -1406,7 +1387,6 @@ pub fn visit_matches(
     con: &Connection,
     pattern: &str,
     keyword: &str,
-    skip_kana: bool,
     control: &Control<'_>,
     mut visit: impl FnMut(TextRow) -> Result<()>,
 ) -> Result<Vec<(String, u64)>> {
@@ -1456,7 +1436,7 @@ pub fn visit_matches(
                 continue;
             };
             for field in fields {
-                if field.text.contains(keyword) && !(skip_kana && fields::has_kana(field.text)) {
+                if field.text.contains(keyword) {
                     total += 1;
                     visit((table.clone(), rid.clone(), field.slot, field.text.into()))?;
                 }

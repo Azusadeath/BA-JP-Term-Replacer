@@ -1826,7 +1826,7 @@ impl Desktop {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.label(
-                        "用备份替换当前词表、单条和批量修改、目录及选项？恢复前会保留当前数据。",
+                        "用备份替换当前词表、单条和批量修改及工作区设置？恢复前会保留当前数据。",
                     );
                     ui.label(format!(
                         "词条 {} 条 · 指定文本修改 {} 条",
@@ -1837,14 +1837,6 @@ impl Desktop {
                     ui.label(format!(
                         "游戏目录：{}",
                         if game.is_empty() { "未设置" } else { &game }
-                    ));
-                    ui.label(format!(
-                        "跳过含日文假名的文本：{}",
-                        if backup["skip_kana"] == true {
-                            "勾选"
-                        } else {
-                            "未勾选"
-                        }
                     ));
                     ui.horizontal(|ui| {
                         if primary(ui, !self.write_busy(), "恢复备份").clicked() {

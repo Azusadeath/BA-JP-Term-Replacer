@@ -5,12 +5,9 @@ use serde::Serialize;
 pub const MAX_STRING: usize = 1 << 20;
 
 pub fn has_cjk(text: &str) -> bool {
-    text.chars()
-        .any(|c| matches!(c as u32, 0x3400..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x2fa1f))
-}
-pub fn has_kana(text: &str) -> bool {
-    text.chars()
-        .any(|c| matches!(c as u32, 0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff66..=0xff9f))
+    text.chars().any(|c| {
+        matches!(c as u32, 0x3040..=0x30ff | 0x31f0..=0x31ff | 0x3400..=0x9fff | 0xf900..=0xfaff | 0xff66..=0xff9f | 0x20000..=0x2fa1f)
+    })
 }
 pub fn forbidden(text: &str) -> bool {
     text.chars().any(|c| matches!(c as u32, 0..=9 | 11..=31))
@@ -133,7 +130,6 @@ pub struct BlobStats {
     pub inplace: u64,
     pub appended: u64,
     pub bytes_appended: u64,
-    pub kana_skipped: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub fields_skipped: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]

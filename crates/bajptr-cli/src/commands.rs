@@ -118,8 +118,6 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
-        keep_kana: bool,
-        #[arg(long)]
         no_ascii_exact: bool,
         #[arg(long)]
         work_dir: Option<PathBuf>,
@@ -192,7 +190,6 @@ pub fn run(control: &Control<'_>) -> Result<()> {
             backup_dir,
             dry_run,
 
-            keep_kana,
             no_ascii_exact,
             work_dir,
         } => {
@@ -205,7 +202,7 @@ pub fn run(control: &Control<'_>) -> Result<()> {
                 })
                 .transpose()?
                 .unwrap_or_default();
-            let mut config = Config::new(rules, vec![], !keep_kana);
+            let mut config = Config::new(rules, vec![]);
             config.rules_path = glossary;
             config.ascii_exact = !no_ascii_exact;
             config.tables = tables;
@@ -258,7 +255,7 @@ fn standalone_patch(
     let encrypted = is_encrypted(input)?;
     let rules = Rules::new(config.rules.clone())?;
     let options: Options = serde_json::from_value(
-        json!({"skip_kana":config.skip_kana,"ascii_exact":config.ascii_exact,"tables":config.tables,"explain":true}),
+        json!({"ascii_exact":config.ascii_exact,"tables":config.tables,"explain":true}),
     )?;
     if dry_run {
         let db = Database::open(input, encrypted, &key, control)?;

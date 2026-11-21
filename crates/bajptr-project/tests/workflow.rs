@@ -155,6 +155,10 @@ fn replacement_sort_preferences_and_times_survive_restart_and_backup_without_reo
 }
 
 fn combined_fixture() -> (Fixture, Project) {
+    combined_fixture_with_batch_scope(false)
+}
+
+fn combined_fixture_with_batch_scope(whole_table: bool) -> (Fixture, Project) {
     let mut f = Fixture::new();
     add_new_source(&mut f, false);
     fs::write(
@@ -168,25 +172,24 @@ fn combined_fixture() -> (Fixture, Project) {
         "search",
         json!({"keyword":"任务","source":"LocalizeDBSchema"}),
     );
+    let indices = if whole_table {
+        (0..search["rows"].as_array().unwrap().len()).collect::<Vec<_>>()
+    } else {
+        vec![0]
+    };
     let draft = call(
         &mut p,
         "batch_preview",
-        json!({"search_nonce":search["nonce"],"indices":[0],"old":"任务","new":"委托"}),
+        json!({"search_nonce":search["nonce"],"indices":indices,"old":"任务","new":"委托"}),
     );
     call(&mut p, "batch_save", json!({"nonce":draft["nonce"]}));
     (f, p)
 }
 
 #[test]
-fn workspace_backup_restores_rules_text_edits_paths_options_and_source_metadata() {
+fn workspace_backup_restores_rules_text_edits_paths_and_source_metadata() {
     let (f, mut p) = combined_fixture();
     call(&mut p, "sources", json!({}));
-    let revision = p.revision;
-    call(
-        &mut p,
-        "settings",
-        json!({"revision":revision,"game":f.game,"skip_kana":false}),
-    );
     let rules = p.rules.clone();
     let edits = p.edits.clone();
     let source = fs::read(f.data.join(".gui/source-history.json")).unwrap();
@@ -204,7 +207,7 @@ fn workspace_backup_restores_rules_text_edits_paths_options_and_source_metadata(
     call(
         &mut p,
         "settings",
-        json!({"revision":revision,"game":f.root.join("其他位置"),"skip_kana":true}),
+        json!({"revision":revision,"game":f.root.join("其他位置")}),
     );
     let previous_settings = fs::read(f.data.join(".gui/settings.json")).unwrap();
     fs::write(
@@ -212,17 +215,26 @@ fn workspace_backup_restores_rules_text_edits_paths_options_and_source_metadata(
         br#"{"format":2,"drafts":{}}"#,
     )
     .unwrap();
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut settings: Value =
+        serde_json::from_str(legacy["files"]["settings.json"].as_str().unwrap()).unwrap();
+    assert!(settings.get("skip_kana").is_none());
+    settings["skip_kana"] = json!(true);
+    legacy["files"]["settings.json"] = json!(settings.to_string());
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let preview = call(&mut p, "backup_read", json!({"path":path}));
     assert_eq!(preview["rule_count"], rules.len());
     assert_eq!(preview["edit_count"], edits.len());
     assert_eq!(preview["game"], f.game.to_str().unwrap());
-    assert_eq!(preview["skip_kana"], false);
+    assert!(preview.get("skip_kana").is_none());
     assert!(p.rules.is_empty());
     let saved = call(&mut p, "backup_restore", json!({"nonce":preview["nonce"]}));
     assert_eq!(p.rules, rules);
     assert_eq!(p.edits, edits);
     assert_eq!(p.game, f.game.to_str().unwrap());
-    assert!(!p.skip);
+    let settings: Value =
+        serde_json::from_slice(&fs::read(f.data.join(".gui/settings.json")).unwrap()).unwrap();
+    assert!(settings.get("skip_kana").is_none());
     assert_eq!(
         fs::read(f.data.join(".gui/source-history.json")).unwrap(),
         source
@@ -240,7 +252,6 @@ fn workspace_backup_restores_rules_text_edits_paths_options_and_source_metadata(
     assert_eq!(reopened.rules, rules);
     assert_eq!(reopened.edits, edits);
     assert_eq!(reopened.game, p.game);
-    assert!(!reopened.skip);
     f.unchanged();
 }
 
@@ -372,7 +383,6 @@ fn workspace_backup_can_restore_damaged_records_and_empty_workspaces_can_be_back
     let preview = call(&mut clean, "backup_read", json!({"path":path}));
     assert_eq!(preview["rule_count"], 0);
     assert_eq!(preview["edit_count"], 0);
-    assert_eq!(preview["skip_kana"], true);
     assert!(
         clean
             .dispatch(
@@ -401,7 +411,7 @@ fn workspace_backup_interrupted_restore_recovers_all_five_documents_on_restart()
         let after = match name {
             "rules.tsv" => b"".to_vec(),
             "text-edits.json" => bajptr_project::model::edits_bytes(&[]).unwrap(),
-            "settings.json" => br#"{"format":2,"game":"elsewhere","skip_kana":false}"#.to_vec(),
+            "settings.json" => br#"{"format":2,"game":"elsewhere"}"#.to_vec(),
             "source-history.json" => br#"{"format":1,"games":{}}"#.to_vec(),
             _ => br#"{"format":2,"drafts":{}}"#.to_vec(),
         };
@@ -419,7 +429,6 @@ fn workspace_backup_interrupted_restore_recovers_all_five_documents_on_restart()
     assert_eq!(reopened.rules, p.rules);
     assert_eq!(reopened.edits, p.edits);
     assert_eq!(reopened.game, p.game);
-    assert_eq!(reopened.skip, p.skip);
     assert!(!root.join("workspace-transaction.json").exists());
     f.unchanged();
 }
@@ -717,7 +726,7 @@ fn promotion_only_prompts_for_new_matches_after_a_partial_batch_migrates() {
 
 #[test]
 fn batch_promotion_preserves_results_backs_up_both_documents_and_undoes_together() {
-    let (f, mut p) = combined_fixture();
+    let (f, mut p) = combined_fixture_with_batch_scope(true);
     let rules = p.rules.clone();
     let edits = p.edits.clone();
     let rule_bytes = fs::read(f.data.join(".gui/rules.tsv")).unwrap();
@@ -867,7 +876,7 @@ fn promotion_relocation_save_failure_keeps_the_old_addresses_and_rules() {
 #[test]
 fn batch_promotion_rejects_cancelled_stale_and_failed_saves_without_losing_records() {
     use std::os::windows::fs::OpenOptionsExt;
-    let (f, mut p) = combined_fixture();
+    let (f, mut p) = combined_fixture_with_batch_scope(true);
     let rules = p.rules.clone();
     let edits = p.edits.clone();
     let plan = call(&mut p, "promotion_preview", json!({}));
@@ -943,13 +952,13 @@ fn combined_replacement_saves_both_scopes_and_undoes_as_one_operation() {
         original_edits[0].batch_operation.as_ref().unwrap().before
     );
     let search = call(&mut p, "search", json!({"keyword":"任务"}));
-    assert!(
-        search["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["text"].as_str().unwrap().contains("差事"))
-    );
+    assert!(search["rows"].as_array().unwrap().iter().all(|row| {
+        if row["original"] == "アロナ任务" {
+            row["text"] == row["original"]
+        } else {
+            row["text"].as_str().unwrap().contains("差事")
+        }
+    }));
     let preview = call(&mut p, "preview", json!({}));
     assert_eq!(preview["total_changes"], 2);
     let saved_rules = p.rules.clone();
@@ -985,7 +994,7 @@ fn combined_scopes_overlap_without_counting_a_text_twice_or_replaying_replacemen
                 .replace("任务", "任务任务")
         );
     }
-    assert_eq!(call(&mut p, "preview", json!({}))["total_changes"], 2);
+    assert_eq!(call(&mut p, "preview", json!({}))["total_changes"], 3);
     f.unchanged();
 }
 
@@ -1426,7 +1435,7 @@ fn invalid_application_state_is_reported_and_never_overwritten() {
             .to_string();
         assert!(error.contains("应用状态文件"), "{error}");
         assert!(error.contains("损坏") || error.contains("格式"));
-        let config = bajptr_project::service::Config::new(p.rules.clone(), vec![], true);
+        let config = bajptr_project::service::Config::new(p.rules.clone(), vec![]);
         assert!(
             bajptr_project::service::record(
                 f.game.to_str().unwrap(),
@@ -1502,7 +1511,7 @@ fn receipt_maintenance_keeps_missing_applied_games_and_live_restored_games() {
         serde_json::to_vec(&json!({"format":2,"games":games})).unwrap(),
     )
     .unwrap();
-    let config = bajptr_project::service::Config::new(project.rules.clone(), vec![], true);
+    let config = bajptr_project::service::Config::new(project.rules.clone(), vec![]);
     bajptr_project::service::record(f.game.to_str().unwrap(), &f.data, &config, "restored", None)
         .unwrap();
     let saved: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -1581,7 +1590,7 @@ fn new_source_notices_freeze_legacy_cache_and_survive_restart_until_acknowledged
     );
     let preview = call(&mut p, "preview", json!({}));
     assert_eq!(
-        preview["total_changes"], 1,
+        preview["total_changes"], 2,
         "new sources must not join replacement automatically"
     );
     assert!(
@@ -1615,7 +1624,7 @@ fn new_source_notices_freeze_legacy_cache_and_survive_restart_until_acknowledged
     );
     assert_eq!(
         call(&mut reopened, "preview", json!({}))["total_changes"],
-        2
+        3
     );
     f.unchanged();
 }
@@ -1788,7 +1797,7 @@ fn corrupt_settings_report_a_visible_warning_and_preserve_the_file_until_saved()
     let saved = call(
         &mut p,
         "settings",
-        json!({"game":f.game,"skip_kana":true,"revision":revision}),
+        json!({"game":f.game,"revision":revision}),
     );
     assert!(saved["settings_warning"].is_null());
 }
@@ -2035,7 +2044,7 @@ fn unchanged_source_inventory_reuses_metadata_without_opening_the_database() {
 }
 
 fn generate_fixture_patch(p: &mut Project) -> bajptr_project::Result<Value> {
-    let config = bajptr_project::service::Config::new(p.rules.clone(), p.edits.clone(), p.skip);
+    let config = bajptr_project::service::Config::new(p.rules.clone(), p.edits.clone());
     p.engine.generate(
         bajptr_project::service::PatchJob {
             game: &p.game,
@@ -2191,8 +2200,8 @@ fn changed_prepared_file_is_rejected_before_game_write() {
 }
 
 #[test]
-fn prepared_patch_rejects_external_inputs_and_option_change_clears_cache() {
-    for external in ["rules", "game", "baseline", "option"] {
+fn prepared_patch_rejects_external_inputs_and_game_change_clears_cache() {
+    for external in ["rules", "game", "baseline", "directory"] {
         let f = Fixture::new();
         let mut p = f.ready_project();
         let preview = call(&mut p, "preview", json!({}));
@@ -2220,7 +2229,7 @@ fn prepared_patch_rejects_external_inputs_and_option_change_clears_cache() {
                 call(
                     &mut p,
                     "settings",
-                    json!({"game":f.game,"revision":revision,"skip_kana":false}),
+                    json!({"game":f.root.join("different-game"),"revision":revision}),
                 );
                 assert!(!Path::new(prepared["prepared_path"].as_str().unwrap()).exists());
             }
@@ -3057,24 +3066,9 @@ fn search_source_choices_follow_completed_keyword_and_survive_paging() {
     assert_eq!(empty["total"], 0);
     let search = call(&mut p, "search", json!({"keyword":"任务"}));
     assert_eq!(search["source_tables"].as_array().unwrap().len(), 1);
-    let revision = p.revision;
-    let settings = call(
-        &mut p,
-        "settings",
-        json!({"game":f.game,"skip_kana":false,"revision":revision}),
-    );
-    assert!(settings["search"].is_null());
-    let unskipped = call(&mut p, "search", json!({"keyword":"アロナ"}));
-    assert_eq!(unskipped["source_tables"].as_array().unwrap().len(), 1);
-    let revision = p.revision;
-    let settings = call(
-        &mut p,
-        "settings",
-        json!({"game":f.game,"skip_kana":true,"revision":revision}),
-    );
-    assert!(settings["search"].is_null());
-    let skipped = call(&mut p, "search", json!({"keyword":"アロナ"}));
-    assert_eq!(skipped["source_tables"], json!([]));
+    let kana = call(&mut p, "search", json!({"keyword":"アロナ"}));
+    assert_eq!(kana["source_tables"].as_array().unwrap().len(), 1);
+    assert_eq!(kana["rows"][0]["text"], "アロナ委托");
     f.unchanged();
 }
 
@@ -3152,7 +3146,7 @@ fn source_filter_keeps_other_matching_tables_available() {
         ("^阿罗娜.*任务$", "re", 2),
         ("老师", "sub", 1),
         ("不存在", "sub", 0),
-        ("アロナ", "sub", 0),
+        ("アロナ", "sub", 1),
     ] {
         let result = call(&mut p, "scope_sources", json!({"old":old,"mode":mode}));
         assert_eq!(result.as_array().unwrap().len(), expected, "{old}/{mode}");
@@ -3165,37 +3159,6 @@ fn source_filter_keeps_other_matching_tables_available() {
     assert!(
         p.dispatch("scope_sources", &json!({"old":"(","mode":"re"}), &control())
             .is_err()
-    );
-    let revision = p.revision;
-    call(
-        &mut p,
-        "settings",
-        json!({"revision":revision,"game":f.game,"skip_kana":false}),
-    );
-    assert_eq!(
-        call(
-            &mut p,
-            "scope_sources",
-            json!({"old":"アロナ","mode":"sub"})
-        )
-        .as_array()
-        .unwrap()
-        .len(),
-        1
-    );
-    let revision = p.revision;
-    call(
-        &mut p,
-        "settings",
-        json!({"revision":revision,"game":f.game,"skip_kana":true}),
-    );
-    assert_eq!(
-        call(
-            &mut p,
-            "scope_sources",
-            json!({"old":"アロナ","mode":"sub"})
-        ),
-        json!([])
     );
     f.unchanged();
 }
@@ -3396,7 +3359,7 @@ fn removing_single_keeps_batch_and_search_editor_does_not_apply_it_twice() {
     assert_eq!(search["rows"][0]["text"], "阿洛娜同学的委托委托");
     call(&mut p, "history", json!({"undo":true}));
     assert_eq!(p.edits.len(), 2);
-    assert_eq!(call(&mut p, "preview", json!({}))["total_changes"], 1);
+    assert_eq!(call(&mut p, "preview", json!({}))["total_changes"], 2);
     f.unchanged();
 }
 
@@ -3404,7 +3367,6 @@ fn removing_single_keeps_batch_and_search_editor_does_not_apply_it_twice() {
 fn removing_one_batch_member_preserves_other_members_and_single_edits() {
     let f = Fixture::new();
     let mut p = f.ready_project();
-    p.skip = false;
     let search = call(&mut p, "search", json!({"keyword":"任务"}));
     let opened = call(
         &mut p,
@@ -3508,7 +3470,6 @@ fn removing_one_batch_member_preserves_other_members_and_single_edits() {
 fn one_batch_operation_is_one_rule_row_with_its_original_selected_scope() {
     let f = Fixture::new();
     let mut p = f.ready_project();
-    p.skip = false;
     call(
         &mut p,
         "save_rule",
@@ -3572,7 +3533,6 @@ fn one_batch_operation_is_one_rule_row_with_its_original_selected_scope() {
 fn repeated_batches_merge_matching_replacements_and_share_history() {
     let f = Fixture::new();
     let mut p = f.ready_project();
-    p.skip = false;
     call(
         &mut p,
         "save_rule",
@@ -3625,7 +3585,6 @@ fn repeated_batches_merge_matching_replacements_and_share_history() {
 fn overlapping_batch_selections_are_a_union_without_replacing_twice() {
     let f = Fixture::new();
     let mut p = f.ready_project();
-    p.skip = false;
     for indices in [json!([0]), json!([0, 1])] {
         let search = call(&mut p, "search", json!({"keyword":"任务"}));
         let preview = call(
@@ -3663,7 +3622,6 @@ fn overlapping_batch_selections_are_a_union_without_replacing_twice() {
 fn batch_merge_preserves_other_games_versions_and_unclassified_legacy_entries() {
     let f = Fixture::new();
     let mut p = f.ready_project();
-    p.skip = false;
     let search = call(&mut p, "search", json!({"keyword":"任务"}));
     let preview = call(
         &mut p,
@@ -3705,7 +3663,6 @@ fn batch_merge_preserves_other_games_versions_and_unclassified_legacy_entries() 
 fn different_batch_replacements_remain_separate_until_edited_to_match() {
     let f = Fixture::new();
     let mut p = f.ready_project();
-    p.skip = false;
     for (index, new) in ["甲", "乙"].iter().enumerate() {
         let search = call(&mut p, "search", json!({"keyword":"任务"}));
         let preview = call(
@@ -3845,20 +3802,12 @@ fn late_cancel_rebases_later_background_snapshots_and_accept_releases_results() 
     result(&worker, 4);
     worker.send(5, "cancel", json!({"target":3})).unwrap();
     worker
-        .send(
-            6,
-            "settings",
-            json!({"game":f.game,"skip_kana":true,"revision":0}),
-        )
+        .send(6, "settings", json!({"game":f.game,"revision":0}))
         .unwrap();
     assert_eq!(result(&worker, 6)["search"]["nonce"], first["nonce"]);
     worker.send(7, "cancel", json!({"target":4})).unwrap();
     worker
-        .send(
-            8,
-            "settings",
-            json!({"game":f.game,"skip_kana":true,"revision":0}),
-        )
+        .send(8, "settings", json!({"game":f.game,"revision":0}))
         .unwrap();
     assert_eq!(result(&worker, 8)["search"]["nonce"], first["nonce"]);
     worker.send(9, "search", json!({"keyword":"老师"})).unwrap();
@@ -3866,11 +3815,7 @@ fn late_cancel_rebases_later_background_snapshots_and_accept_releases_results() 
     worker.send(10, "accept", json!({"target":9})).unwrap();
     worker.send(11, "cancel", json!({"target":9})).unwrap();
     worker
-        .send(
-            12,
-            "settings",
-            json!({"game":f.game,"skip_kana":true,"revision":0}),
-        )
+        .send(12, "settings", json!({"game":f.game,"revision":0}))
         .unwrap();
     assert_eq!(result(&worker, 12)["search"]["nonce"], accepted["nonce"]);
 }
@@ -3908,11 +3853,7 @@ fn late_cancel_after_apply_never_rewinds_committed_state() {
     assert_eq!(applied["application"], "已应用，与当前词表一致");
     worker.send(5, "cancel", json!({"target":4})).unwrap();
     worker
-        .send(
-            6,
-            "settings",
-            json!({"game":f.game,"skip_kana":true,"revision":0}),
-        )
+        .send(6, "settings", json!({"game":f.game,"revision":0}))
         .unwrap();
     assert_eq!(result(&worker, 6)["application"], applied["application"]);
     assert_ne!(fs::read(f.game.join(region::CATALOG)).unwrap(), f.before);
@@ -3966,7 +3907,7 @@ fn unavailable_drive_in_settings_still_allows_reselecting_the_game() {
     let value = call(
         &mut p,
         "settings",
-        json!({"revision":0,"game":r"Z:\bajptr-unavailable-game","skip_kana":true}),
+        json!({"revision":0,"game":r"Z:\bajptr-unavailable-game"}),
     );
     assert_eq!(value["game"], r"Z:\bajptr-unavailable-game");
     assert!(p.dispatch("check", &json!({}), &control()).is_err());
@@ -3976,7 +3917,7 @@ fn unavailable_drive_in_settings_still_allows_reselecting_the_game() {
     call(
         &mut p,
         "settings",
-        json!({"revision":revision,"game":f.game,"skip_kana":true}),
+        json!({"revision":revision,"game":f.game}),
     );
     assert_eq!(call(&mut p, "check", json!({}))["connected"], true);
     f.unchanged();

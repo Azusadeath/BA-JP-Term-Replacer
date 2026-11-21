@@ -812,24 +812,14 @@ impl View {
         }
         Ok(())
     }
-    pub fn skipped(
-        &self,
-        rules: &Rules,
-        text: &str,
-        e: &mut Evidence,
-        targeted: bool,
-    ) -> Result<()> {
+    pub fn overridden(&self, rules: &Rules, text: &str, e: &mut Evidence) -> Result<()> {
         self.observe(rules, text, e, false)?;
         if e.explain {
             for &i in &self.eligible {
                 if rules.matches(i, text)? {
                     e.miss(
                         i,
-                        if targeted {
-                            "这段文本已有单条修改，使用指定的最终文字，不再执行通用词表。"
-                        } else {
-                            "匹配文字所在的整段文本含日文假名，已按当前选项跳过。"
-                        },
+                        "这段文本已有单条修改，使用指定的最终文字，不再执行通用词表。",
                         text,
                         &self.table,
                     );

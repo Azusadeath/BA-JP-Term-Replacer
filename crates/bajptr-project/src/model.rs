@@ -243,7 +243,6 @@ pub fn effective(
     game: &str,
     version: &str,
     rules: &Rules,
-    skip: bool,
 ) -> Result<(String, bool)> {
     if let Some(e) = edits
         .iter()
@@ -260,9 +259,6 @@ pub fn effective(
             return Err(invalid("定位记录的底稿原文已变化，请重新查找。"));
         }
         return Ok((e.replacement.clone(), true));
-    }
-    if skip && fields::has_kana(&row.3) {
-        return Ok((row.3.clone(), false));
     }
     let result = rules.view(&row.0).apply(
         rules,
@@ -320,12 +316,12 @@ pub fn scope_title(scope: &str) -> String {
         Some(n) => n.iter().map(|s| title(s)).collect::<Vec<_>>().join("、"),
     }
 }
-pub fn fingerprint(rules: &[Rule], skip: bool, edits: &[Edit]) -> Result<String> {
+pub fn fingerprint(rules: &[Rule], edits: &[Edit]) -> Result<String> {
     let rules = rules
         .iter()
         .map(|r| Ok(json!([r.old, r.new, r.mode, scopes(&r.table)?])))
         .collect::<Result<Vec<_>>>()?;
     Ok(storage::digest(
-        serde_json::to_string(&json!(["original-spans-v3", skip, edits, rules]))?.as_bytes(),
+        serde_json::to_string(&json!(["original-spans-v4", edits, rules]))?.as_bytes(),
     ))
 }

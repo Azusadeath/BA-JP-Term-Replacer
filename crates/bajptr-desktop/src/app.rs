@@ -27,7 +27,6 @@ pub struct Desktop {
     pub loaded: bool,
     pub connected: bool,
     pub game: String,
-    pub skip: bool,
     pub path_dirty: bool,
     pub tab: usize,
     pub status: String,
@@ -125,7 +124,6 @@ impl Desktop {
             loaded: false,
             connected: false,
             game: String::new(),
-            skip: true,
             path_dirty: false,
             tab: 0,
             status: "正在读取修改记录…".into(),
@@ -476,7 +474,7 @@ impl Desktop {
         self.baseline_check = Value::Null;
         self.submit(
             "settings",
-            json!({"game":self.game,"skip_kana":self.skip,"revision":self.revision()}),
+            json!({"game":self.game,"revision":self.revision()}),
             "正在保存设置…",
         );
     }
@@ -504,10 +502,6 @@ impl Desktop {
         if !self.path_dirty {
             self.game = text(&value, "game");
         }
-        self.skip = value
-            .get("skip_kana")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
         if changed || game_changed {
             self.clear_promotion_result();
         }
@@ -1634,7 +1628,7 @@ mod view_tests {
         std::fs::create_dir_all(data.join(".gui")).unwrap();
         std::fs::write(
             data.join(".gui/settings.json"),
-            br#"{"format":2,"game":"invalid-game","skip_kana":true}"#,
+            br#"{"format":2,"game":"invalid-game"}"#,
         )
         .unwrap();
         std::fs::write(data.join(".gui/rules.tsv"), b"broken").unwrap();
@@ -2815,7 +2809,7 @@ mod view_tests {
         let mut time = 0.;
         let mut draw = |app: &mut Desktop, events| {
             time += 0.1;
-            let _ = ctx.run_ui(
+            let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(area),
                     time: Some(time),
@@ -2824,6 +2818,7 @@ mod view_tests {
                 },
                 |ui| app.search_page(ui),
             );
+            output.textures_delta.clear();
         };
         draw(&mut app, vec![pointer.clone()]);
         draw(&mut app, vec![down.clone()]);
@@ -3114,16 +3109,14 @@ fn backup_controls_and_restore_summary_remain_visible_at_minimum_size() {
             .iter()
             .any(|(text, _, _)| text == "导入词表" || text == "导出词表")
     );
-    app.confirm_backup = Some(
-        json!({"nonce":"test","rule_count":12,"edit_count":34,"game":"D:/日服游戏","skip_kana":false}),
-    );
+    app.confirm_backup =
+        Some(json!({"nonce":"test","rule_count":12,"edit_count":34,"game":"D:/日服游戏"}));
     for _ in 0..3 {
         labels = draw(&mut app, true);
     }
     for label in [
         "词条 12 条 · 指定文本修改 34 条",
         "游戏目录：D:/日服游戏",
-        "跳过含日文假名的文本：未勾选",
         "取消",
     ] {
         let (_, rect, clip) = labels.iter().find(|(text, _, _)| text == label).unwrap();

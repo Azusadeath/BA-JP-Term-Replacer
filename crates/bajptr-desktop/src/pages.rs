@@ -1,6 +1,6 @@
 use crate::{app::*, state::*};
 use eframe::egui::{self, Color32};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::PathBuf;
 
 impl Desktop {
@@ -841,29 +841,6 @@ impl Desktop {
                             );
                         }
                     });
-                    let response = egui::Frame::new()
-                        .fill(Color32::WHITE)
-                        .stroke(egui::Stroke::new(1., LINE))
-                        .corner_radius(7)
-                        .inner_margin(egui::Margin::symmetric(10, 0))
-                        .show(ui, |ui| {
-                            ui.spacing_mut().icon_width = 20.;
-                            ui.spacing_mut().icon_width_inner = 12.;
-                            ui.add_enabled(
-                                can_edit && !self.path_dirty,
-                                egui::Checkbox::new(
-                                    &mut self.skip,
-                                    egui::RichText::new("跳过含日文假名的文本").size(14.5),
-                                ),
-                            )
-                        })
-                        .inner;
-                    if response.changed() {
-                        self.search = Value::Null.into();
-                        self.selection.clear();
-                        self.status = "跳过假名选项已更新，请重新查找".into();
-                        self.save_settings();
-                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(MUTED, "备份");
                         if secondary(ui, can_edit && !self.path_dirty, "导出").clicked()

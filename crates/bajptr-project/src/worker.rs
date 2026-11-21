@@ -286,18 +286,10 @@ mod tests {
             "error"
         );
         worker
-            .send(
-                2,
-                "settings",
-                json!({"revision":0,"game":"","skip_kana":false}),
-            )
+            .send(2, "settings", json!({"revision":0,"game":"saved-game"}))
             .unwrap();
         // A request already queued at failure must not be replayed after recovery.
-        let _ = worker.send(
-            3,
-            "settings",
-            json!({"revision":1,"game":"","skip_kana":true}),
-        );
+        let _ = worker.send(3, "settings", json!({"revision":1,"game":"queued-game"}));
         let saved = worker.events.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(saved["id"], 2);
         assert_eq!(saved["event"], "result");
@@ -321,6 +313,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
         assert_eq!(loaded["event"], "result");
-        assert_eq!(loaded["data"]["skip_kana"], false);
+        assert_eq!(loaded["data"]["game"], "saved-game");
     }
 }

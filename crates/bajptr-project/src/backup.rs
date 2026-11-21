@@ -33,13 +33,8 @@ pub struct Snapshot {
     pub files: BTreeMap<String, Option<Vec<u8>>>,
 }
 pub fn settings(bytes: &[u8]) -> Result<Value> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    if value["format"] != 2
-        || value.get("game").is_some_and(|game| !game.is_string())
-        || value
-            .get("skip_kana")
-            .is_some_and(|skip| !skip.is_boolean())
-    {
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    if value["format"] != 2 || value.get("game").is_some_and(|game| !game.is_string()) {
         return Err(invalid("设置文件格式无效。"));
     }
     if let Some(sort) = value.get("replacement_sort") {
@@ -47,6 +42,9 @@ pub fn settings(bytes: &[u8]) -> Result<Value> {
     }
     if let Some(times) = value.get("replacement_times") {
         serde_json::from_value::<crate::ordering::Timeline>(times.clone())?;
+    }
+    if let Some(settings) = value.as_object_mut() {
+        settings.remove("skip_kana");
     }
     Ok(value)
 }
@@ -82,9 +80,7 @@ impl Snapshot {
                 None => match name {
                     "rules.tsv" => vec![],
                     "text-edits.json" => model::edits_bytes(&[])?,
-                    "settings.json" => {
-                        serde_json::to_vec(&json!({"format":2,"game":"","skip_kana":true}))?
-                    }
+                    "settings.json" => serde_json::to_vec(&json!({"format":2,"game":""}))?,
                     "source-history.json" => serde_json::to_vec(&Sources::default())?,
                     _ => serde_json::to_vec(&json!({"format":2,"drafts":{}}))?,
                 },
@@ -95,15 +91,19 @@ impl Snapshot {
                     .map_err(|_| invalid(format!("{name} 不是有效 UTF-8 文本，无法创建备份。")))?,
             );
         }
-        let result = Bundle {
+        let mut result = Bundle {
             format: 1,
             kind: "bajptr-workspace-backup".into(),
             files,
         };
-        result.decode().map_err(|source| crate::Error::Context {
+        let decoded = result.decode().map_err(|source| crate::Error::Context {
             message: "工作区记录或设置无效，未创建备份。请修复后重试，详细原因见日志。".into(),
             source: Box::new(source),
         })?;
+        result.files.insert(
+            "settings.json".into(),
+            serde_json::to_string(&decoded.settings)?,
+        );
         Ok(result)
     }
     pub fn archive(&self, root: &Path, control: &Control<'_>) -> Result<PathBuf> {

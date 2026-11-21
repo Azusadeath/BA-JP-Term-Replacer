@@ -131,7 +131,6 @@ pub fn execute(session: &mut Session, v: Value, control: &Control<'_>) -> Result
                 text(&v, "keyword")?,
                 v.get("limit").and_then(Value::as_u64).unwrap_or(500) as usize,
                 v.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
-                v.get("skip_kana").and_then(Value::as_bool).unwrap_or(false),
                 control,
             )?;
             Ok(serde_json::to_value(page)?)

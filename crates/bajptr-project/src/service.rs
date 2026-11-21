@@ -27,7 +27,6 @@ pub struct Config {
     pub edits: Vec<Edit>,
     pub rules_path: Option<PathBuf>,
     pub edits_path: Option<PathBuf>,
-    pub skip_kana: bool,
     pub ascii_exact: bool,
     pub tables: String,
     pub work_dir: Option<PathBuf>,
@@ -42,13 +41,12 @@ pub struct PatchJob<'a> {
     pub expected: Option<&'a Value>,
 }
 impl Config {
-    pub fn new(rules: Vec<Rule>, edits: Vec<Edit>, skip_kana: bool) -> Self {
+    pub fn new(rules: Vec<Rule>, edits: Vec<Edit>) -> Self {
         Self {
             rules,
             edits,
             rules_path: None,
             edits_path: None,
-            skip_kana,
             ascii_exact: true,
             tables: database::default_tables(),
             work_dir: None,
@@ -56,7 +54,7 @@ impl Config {
     }
     fn options(&self, game: &str, version: &str) -> Result<Value> {
         Ok(
-            json!({"skip_kana":self.skip_kana,"ascii_exact":self.ascii_exact,"tables":self.tables,"explain":true,"edits":model::final_edits(&self.edits,game,version)?}),
+            json!({"ascii_exact":self.ascii_exact,"tables":self.tables,"explain":true,"edits":model::final_edits(&self.edits,game,version)?}),
         )
     }
     fn check_documents(&self) -> Result<()> {
@@ -432,7 +430,6 @@ impl Engine {
         root: &Path,
         names: &[String],
         rules: &[Rule],
-        skip_kana: bool,
         control: &Control<'_>,
     ) -> Result<Vec<database::SourceRuleMatch>> {
         let original = self.baseline(game, root, control)?;
@@ -446,7 +443,6 @@ impl Engine {
                 .con,
             names,
             &bajptr_core::rules::Rules::new(rules.to_vec())?,
-            skip_kana,
             control,
         )
     }
@@ -456,12 +452,11 @@ impl Engine {
         root: &Path,
         old: &str,
         mode: &str,
-        skip_kana: bool,
         control: &Control<'_>,
     ) -> Result<Value> {
         let original = self.baseline(game, root, control)?;
         self.open(&original, control)?;
-        let key = serde_json::to_string(&(old, mode, skip_kana))?;
+        let key = serde_json::to_string(&(old, mode))?;
         if let Some((_, value)) = self.scope_sources.iter().find(|(k, _)| k == &key) {
             control.check()?;
             return Ok(value.clone());
@@ -484,7 +479,6 @@ impl Engine {
                     source: String::new(),
                     table: String::new(),
                 }],
-                skip_kana,
                 control,
             )?
             .into_iter()
@@ -565,7 +559,6 @@ impl Engine {
         tables: &str,
         limit: usize,
         offset: usize,
-        skip_kana: bool,
         control: &Control<'_>,
     ) -> Result<(Value, String)> {
         let keyword = keyword.trim();
@@ -573,7 +566,7 @@ impl Engine {
             return Err(invalid("请输入要查找的文字。"));
         }
         let original = self.open_baseline(&region::locate(game)?, root, control)?;
-        let key = format!("{keyword}\0{skip_kana}");
+        let key = keyword.to_owned();
         if self
             .search_index
             .as_ref()
@@ -584,7 +577,6 @@ impl Engine {
                 &self.session.database.as_ref().unwrap().con,
                 &database::default_tables(),
                 keyword,
-                skip_kana,
                 control,
             )?;
             self.search_index = Some((key, index));
@@ -619,7 +611,6 @@ impl Engine {
             &config.edits,
             &game_key,
             &original.version,
-            config.skip_kana,
             control,
         )?;
         let mut databases = HashMap::<String, Option<database::Database>>::new();
@@ -631,12 +622,7 @@ impl Engine {
             .cloned()
             .collect();
         let rules = Rules::new(plan.rules.clone())?;
-        let reviewed = promotion::read_review(&promotion::review_path(
-            data,
-            &game_key,
-            &original.version,
-            config.skip_kana,
-        ))?;
+        let reviewed = promotion::read_reviews(data, &game_key, &original.version)?;
         for item in &mut plan.items {
             if item.missing_rows.is_empty() {
                 continue;
@@ -721,14 +707,8 @@ impl Engine {
                     Vec::new()
                 }
             };
-            let evaluator = TableEvaluator::new(
-                &item.table,
-                &rules,
-                &current,
-                &game_key,
-                &original.version,
-                config.skip_kana,
-            );
+            let evaluator =
+                TableEvaluator::new(&item.table, &rules, &current, &game_key, &original.version);
             item.retain_review_rows(&previous, evaluator, &reviewed, control)?;
         }
         Ok(plan)
@@ -1286,13 +1266,7 @@ impl Engine {
             }
             return Err(error);
         }
-        if let Err(e) = record(
-            game,
-            data,
-            &Config::new(vec![], vec![], true),
-            "restored",
-            None,
-        ) {
+        if let Err(e) = record(game, data, &Config::new(vec![], vec![]), "restored", None) {
             let _ = control.warn(&format!("底稿已恢复；状态记录未保存：{e}"));
         }
         Ok(original)
@@ -1429,7 +1403,7 @@ pub fn record(
             || !matches!(fs::metadata(folder), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             || !folder.ancestors().last().is_some_and(|root| root.is_dir())
     });
-    values[&key] = json!({"identity":identity,"fingerprint":model::fingerprint(&config.rules,config.skip_kana,&edits)?,"kind":kind});
+    values[&key] = json!({"identity":identity,"fingerprint":model::fingerprint(&config.rules,&edits)?,"kind":kind});
     storage::write_locked(
         &path,
         &serde_json::to_vec(&json!({"format":2,"games":values}))?,
@@ -1499,8 +1473,7 @@ pub fn status(game: &str, data: &Path, config: &Config) -> Result<String> {
         } else {
             "已恢复底稿；词表尚未应用"
         }
-    } else if receipt["fingerprint"] != model::fingerprint(&config.rules, config.skip_kana, &edits)?
-    {
+    } else if receipt["fingerprint"] != model::fingerprint(&config.rules, &edits)? {
         "词表已保存，尚未应用"
     } else if receipt["kind"] == "applied" {
         "已应用，与当前词表一致"

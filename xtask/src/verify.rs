@@ -363,8 +363,12 @@ pub fn smoke(root: &Path, options: &VerifyOptions) -> Result {
     )?;
     let search = worker.invoke("search", json!({"keyword":"任务"}))?;
     require(
-        search["total"] == 1 && count(&search["rows"]) == 1,
-        "Search must exclude kana-bearing fixture text.",
+        search["total"] == 2
+            && count(&search["rows"]) == 2
+            && search["rows"][1]["original"]
+                .as_str()
+                .is_some_and(|text| text.contains("アロナ")),
+        "Search must include kana-bearing fixture text.",
     )?;
     let opened = worker.invoke(
         "text_open",
@@ -376,7 +380,7 @@ pub fn smoke(root: &Path, options: &VerifyOptions) -> Result {
     )?;
     require(count(&edited["edits"]) == 1, "Targeted edit failed.")?;
     let preview = worker.invoke("preview", json!({}))?;
-    require(preview["total_changes"] == 1, "Preview failed.")?;
+    require(preview["total_changes"] == 2, "Preview failed.")?;
     let guard = fs::OpenOptions::new()
         .read(true)
         .share_mode(1)
@@ -412,7 +416,7 @@ pub fn smoke(root: &Path, options: &VerifyOptions) -> Result {
         "Restore discarded documents.",
     )?;
     worker.stop()?;
-    let report = json!({"passed":true,"baseline_confirmation_required":true,"environment_cleared":true,"separate_user_directories":true,"python_on_child_path":false,"current_format":true,"search":true,"search_skip_kana":true,"targeted_edit":true,"preview":true,"fallback_patch_verified":fallback["verified"],"fallback_warning":true,"apply_retry":true,"apply":true,"export":true,"restore_equal":true,"documents_preserved":true,"game_dir":game,"data_dir":data});
+    let report = json!({"passed":true,"baseline_confirmation_required":true,"environment_cleared":true,"separate_user_directories":true,"python_on_child_path":false,"current_format":true,"search":true,"search_includes_kana":true,"targeted_edit":true,"preview":true,"fallback_patch_verified":fallback["verified"],"fallback_warning":true,"apply_retry":true,"apply":true,"export":true,"restore_equal":true,"documents_preserved":true,"game_dir":game,"data_dir":data});
     files::write(
         &work.join("report.json"),
         &serde_json::to_vec_pretty(&report)?,

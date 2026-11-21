@@ -33,10 +33,9 @@ impl Item {
         candidate: LocatedText,
         layers: &[&Edit],
         rules: &Rules,
-        skip: bool,
     ) -> Result<()> {
         let proposal = if candidate.row.3 != self.original {
-            Some(rebase::propose(layers, &candidate, rules, skip, None)?)
+            Some(rebase::propose(layers, &candidate, rules, None)?)
         } else {
             None
         };
@@ -68,7 +67,6 @@ pub(crate) fn plan_candidates(
     version: &str,
     pool: &scan::Candidates,
     rules: &Rules,
-    skip: bool,
     control: &crate::Control<'_>,
 ) -> Result<Vec<Item>> {
     let occupied: HashSet<_> = edits
@@ -232,7 +230,7 @@ pub(crate) fn plan_candidates(
                     return Err(invalid("迁移候选过多，请分批核对旧版修改。"));
                 }
                 let proposal = if candidate.row.3 != edit.original {
-                    let proposal = rebase::propose(&layers, candidate, rules, skip, None)?;
+                    let proposal = rebase::propose(&layers, candidate, rules, None)?;
                     bytes += proposal.input.as_ref().map_or(0, String::len)
                         + proposal.replacement.as_ref().map_or(0, String::len);
                     Some(proposal)
@@ -405,7 +403,6 @@ pub(crate) fn apply_choices(
     game: &str,
     target: (&str, Option<&str>),
     rules: &Rules,
-    skip: bool,
 ) -> Result<Vec<Edit>> {
     let (version, snapshot) = target;
     if choices.is_empty() {
@@ -461,7 +458,7 @@ pub(crate) fn apply_choices(
             return Err(invalid("原文未变化，请直接确认对应文本。"));
         }
         let proposal = rebased
-            .then(|| rebase::propose(&layers, candidate, rules, skip, choice.text.as_deref()))
+            .then(|| rebase::propose(&layers, candidate, rules, choice.text.as_deref()))
             .transpose()?;
         if let Some(proposal) = &proposal
             && proposal.replacement.is_none()
@@ -537,7 +534,6 @@ mod tests {
                 ..Default::default()
             },
             &Rules::new(vec![]).unwrap(),
-            false,
             &crate::Control::new(&|_| true),
         )
         .unwrap()
@@ -556,7 +552,6 @@ mod tests {
             game,
             (version, None),
             &Rules::new(vec![]).unwrap(),
-            false,
         )
     }
     fn edit(id: i64, original: &str) -> Edit {

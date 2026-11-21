@@ -20,8 +20,8 @@ fn rule(old: &str, new: &str, mode: &str) -> Rule {
         table: String::new(),
     }
 }
-fn options(skip: bool) -> Options {
-    serde_json::from_value(json!({"skip_kana":skip,"explain":true,"tables":"Localize"})).unwrap()
+fn options() -> Options {
+    serde_json::from_value(json!({"explain":true,"tables":"Localize"})).unwrap()
 }
 fn blob(strings: &[&str]) -> Vec<u8> {
     let root = 16usize;
@@ -98,14 +98,14 @@ fn new_source_matches_report_original_text_without_applying_rules() {
     }
     let compiled = Rules::new(rules).unwrap();
     let report =
-        database::source_rule_matches(&con, &["LocalizeDBSchema".into()], &compiled, true, &ctl())
+        database::source_rule_matches(&con, &["LocalizeDBSchema".into()], &compiled, &ctl())
             .unwrap();
     assert_eq!(
         report
             .iter()
             .map(|m| (m.rule_index, m.fields))
             .collect::<Vec<_>>(),
-        vec![(0, 2), (1, 1), (2, 1)]
+        vec![(0, 3), (1, 1), (2, 1)]
     );
     assert!(
         report
@@ -120,10 +120,6 @@ fn new_source_matches_report_original_text_without_applying_rules() {
         )
         .unwrap();
     assert_eq!(fields::parse(&before, false).unwrap()[0].text, "任务开始");
-    let included =
-        database::source_rule_matches(&con, &["LocalizeDBSchema".into()], &compiled, false, &ctl())
-            .unwrap();
-    assert_eq!(included[0].fields, 3);
 }
 
 #[test]
@@ -146,9 +142,9 @@ fn empty_then_nonempty_matches_agree_in_sample_preview_and_written_blob() {
         .unwrap();
     let expected = rules::regex_sample("a*|b", "X", "b中").unwrap();
     let preview =
-        database::patch_database(&con, None, None, &rules, &options(false), false, &ctl()).unwrap();
+        database::patch_database(&con, None, None, &rules, &options(), false, &ctl()).unwrap();
     let written =
-        database::patch_database(&con, None, None, &rules, &options(false), true, &ctl()).unwrap();
+        database::patch_database(&con, None, None, &rules, &options(), true, &ctl()).unwrap();
     assert_eq!(preview.hits, written.hits);
     assert_eq!(written.hits[0], expected.1 as u64);
     let bytes: Vec<u8> = con
@@ -184,10 +180,9 @@ fn replacement_errors_identify_rule_record_and_field_in_preview_and_write() {
             .unwrap();
         let rules =
             Rules::new(vec![rule("任务", "委托", "sub"), rule("攻击", r"\t", "re")]).unwrap();
-        let error =
-            database::patch_database(&con, None, None, &rules, &options(false), write, &ctl())
-                .unwrap_err()
-                .to_string();
+        let error = database::patch_database(&con, None, None, &rules, &options(), write, &ctl())
+            .unwrap_err()
+            .to_string();
         for detail in [
             "LocalizeDBSchema",
             "记录 2",
@@ -217,7 +212,7 @@ fn dynamic_output_limit_is_not_reported_as_a_bad_resource() {
     con.execute("INSERT INTO LocalizeDBSchema VALUES (7,?)", [&original])
         .unwrap();
     let rules = Rules::new(vec![rule("(.+)", r"\1\1", "re")]).unwrap();
-    let error = database::patch_database(&con, None, None, &rules, &options(false), false, &ctl())
+    let error = database::patch_database(&con, None, None, &rules, &options(), false, &ctl())
         .unwrap_err()
         .to_string();
     for detail in [
@@ -240,13 +235,13 @@ fn malformed_records_have_precise_preview_diagnostics_and_stop_writes() {
         .unwrap();
     let rules = Rules::new(vec![rule("攻击", "爆炸", "sub")]).unwrap();
     let preview =
-        database::patch_database(&con, None, None, &rules, &options(false), false, &ctl()).unwrap();
+        database::patch_database(&con, None, None, &rules, &options(), false, &ctl()).unwrap();
     assert_eq!(preview.parse_failed, 1);
     let details = serde_json::to_value(preview).unwrap()["diagnostics"].to_string();
     for detail in ["LocalizeDBSchema", "9", "bad vtable length"] {
         assert!(details.contains(detail), "{details}");
     }
-    let error = database::patch_database(&con, None, None, &rules, &options(false), true, &ctl())
+    let error = database::patch_database(&con, None, None, &rules, &options(), true, &ctl())
         .unwrap_err()
         .to_string();
     for detail in ["LocalizeDBSchema", "记录 9", "bad vtable length"] {
@@ -272,7 +267,7 @@ fn without_rowid_tables_use_their_real_single_primary_key() {
     .unwrap();
     let rules = Rules::new(vec![rule("攻击", "爆炸", "sub")]).unwrap();
     let stats =
-        database::patch_database(&con, None, None, &rules, &options(false), true, &ctl()).unwrap();
+        database::patch_database(&con, None, None, &rules, &options(), true, &ctl()).unwrap();
     assert_eq!(stats.parse_failed, 0);
     assert_eq!(stats.rows_changed, 1);
     let (found, total) = database::scan(&con, "Localize", "爆炸", 10, &ctl()).unwrap();
@@ -301,22 +296,21 @@ fn search_pages_cover_all_matches_and_keep_source_table_filtering_exact() {
         )
         .unwrap();
     }
-    let (first, total) =
-        database::scan_page(&con, "Localize|Skill", "攻击", 2, 0, false, &ctl()).unwrap();
+    let (first, total) = database::scan_page(&con, "Localize|Skill", "攻击", 2, 0, &ctl()).unwrap();
     let (second, total_again) =
-        database::scan_page(&con, "Localize|Skill", "攻击", 2, 2, false, &ctl()).unwrap();
+        database::scan_page(&con, "Localize|Skill", "攻击", 2, 2, &ctl()).unwrap();
     assert_eq!(
         (first.len(), second.len(), total, total_again),
         (2, 2, 5, 5)
     );
     let (localize, local_total) =
-        database::scan_page(&con, "^(?:LocalizeDBSchema)$", "攻击", 10, 0, false, &ctl()).unwrap();
+        database::scan_page(&con, "^(?:LocalizeDBSchema)$", "攻击", 10, 0, &ctl()).unwrap();
     assert_eq!(local_total, 3);
     assert!(localize.iter().all(|row| row.0 == "LocalizeDBSchema"));
 }
 
 #[test]
-fn search_sources_cover_unloaded_pages_and_exclude_nonmatching_or_skipped_tables() {
+fn search_sources_cover_unloaded_pages_and_exclude_nonmatching_tables() {
     let con = Connection::open_in_memory().unwrap();
     con.execute_batch(
         "CREATE TABLE LocalizeDBSchema(Id INTEGER PRIMARY KEY, Bytes BLOB);
@@ -344,44 +338,37 @@ fn search_sources_cover_unloaded_pages_and_exclude_nonmatching_or_skipped_tables
     .unwrap();
     con.execute("INSERT INTO KanaDBSchema VALUES (1,?)", [blob(&["ア任务"])])
         .unwrap();
-    let page =
-        database::scan_page_with_sources(&con, "DBSchema$", "任务", 500, 0, true, &ctl()).unwrap();
-    assert_eq!((page.rows.len(), page.total), (500, 502));
-    assert!(page.rows.iter().all(|r| r.0 == "LocalizeDBSchema"));
+    let page = database::scan_page_with_sources(&con, "DBSchema$", "任务", 500, 0, &ctl()).unwrap();
+    assert_eq!((page.rows.len(), page.total), (500, 503));
+    assert_eq!(page.rows[0].0, "KanaDBSchema");
     assert_eq!(
         page.matching_tables,
-        vec!["LocalizeDBSchema", "SkillDBSchema"]
-    );
-    let metadata =
-        database::scan_page_with_sources(&con, "DBSchema$", "任务", 0, 0, true, &ctl()).unwrap();
-    assert!(metadata.rows.is_empty());
-    assert_eq!(metadata.matching_tables, page.matching_tables);
-    let unskipped =
-        database::scan_page_with_sources(&con, "DBSchema$", "任务", 0, 0, false, &ctl()).unwrap();
-    assert_eq!(
-        unskipped.matching_tables,
         vec!["KanaDBSchema", "LocalizeDBSchema", "SkillDBSchema"]
     );
-    let empty = database::scan_page_with_sources(&con, "DBSchema$", "不存在", 500, 0, true, &ctl())
-        .unwrap();
+    let metadata =
+        database::scan_page_with_sources(&con, "DBSchema$", "任务", 0, 0, &ctl()).unwrap();
+    assert!(metadata.rows.is_empty());
+    assert_eq!(metadata.matching_tables, page.matching_tables);
+    let empty =
+        database::scan_page_with_sources(&con, "DBSchema$", "不存在", 500, 0, &ctl()).unwrap();
     assert!(empty.matching_tables.is_empty());
 
-    let index = database::SearchIndex::build(&con, "DBSchema$", "任务", true, &ctl()).unwrap();
+    let index = database::SearchIndex::build(&con, "DBSchema$", "任务", &ctl()).unwrap();
     con.execute_batch("DROP TABLE LocalizeDBSchema; DROP TABLE SkillDBSchema")
         .unwrap();
     let next = index.page("", 500, 500, &ctl()).unwrap();
-    assert_eq!((next.rows.len(), next.total), (2, 502));
+    assert_eq!((next.rows.len(), next.total), (3, 503));
     assert_eq!(next.matching_tables, page.matching_tables);
     let filtered = index.page("SkillDBSchema", 500, 0, &ctl()).unwrap();
     assert_eq!((filtered.rows.len(), filtered.total), (1, 1));
     assert_eq!(filtered.rows[0].0, "SkillDBSchema");
     assert_eq!(filtered.matching_tables, page.matching_tables);
-    assert!(index.page("", 500, 502, &ctl()).unwrap().rows.is_empty());
+    assert!(index.page("", 500, 503, &ctl()).unwrap().rows.is_empty());
     assert!(index.page("", 500, 0, &Control::new(&|_| false)).is_err());
 }
 
 #[test]
-fn search_skip_kana_matches_the_replacement_option() {
+fn search_includes_text_containing_kana() {
     let con = Connection::open_in_memory().unwrap();
     con.execute_batch("CREATE TABLE LocalizeDBSchema(Id INTEGER PRIMARY KEY, Bytes BLOB)")
         .unwrap();
@@ -390,9 +377,9 @@ fn search_skip_kana_matches_the_replacement_option() {
         [blob(&["攻撃", "ｱｲﾃﾑ攻撃"])],
     )
     .unwrap();
-    let (rows, total) = database::scan_page(&con, "Localize", "攻撃", 10, 0, true, &ctl()).unwrap();
-    assert_eq!(total, 1);
-    assert_eq!(rows[0].3, "攻撃");
+    let (rows, total) = database::scan_page(&con, "Localize", "攻撃", 10, 0, &ctl()).unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(rows[1].3, "ｱｲﾃﾑ攻撃");
 }
 
 #[test]
@@ -417,7 +404,7 @@ fn composite_primary_keys_bind_only_the_selected_record() {
             found[0].1, found[1].1,
             "a partial Key column must not identify both rows"
         );
-        let mut options = options(true);
+        let mut options = options();
         options.edits.push(TextEdit {
             table: "LocalizeDBSchema".into(),
             row_id: found[0].1.clone(),
@@ -461,7 +448,7 @@ fn non_text_tables_are_reported_separately_instead_of_blocking_text_updates() {
     .unwrap();
     let rules = Rules::new(vec![rule("攻击", "爆炸", "sub")]).unwrap();
     let stats =
-        database::patch_database(&con, None, None, &rules, &options(false), true, &ctl()).unwrap();
+        database::patch_database(&con, None, None, &rules, &options(), true, &ctl()).unwrap();
     assert_eq!(stats.parse_failed, 0);
     assert_eq!(stats.rows_changed, 1);
     let stats = serde_json::to_value(stats).unwrap();
@@ -483,7 +470,7 @@ fn one_invalid_slot_does_not_discard_valid_fields_or_other_records() {
         .unwrap();
     let rules = Rules::new(vec![rule("攻击", "爆炸", "sub")]).unwrap();
     let stats =
-        database::patch_database(&con, None, None, &rules, &options(false), true, &ctl()).unwrap();
+        database::patch_database(&con, None, None, &rules, &options(), true, &ctl()).unwrap();
     assert_eq!(stats.rows_changed, 1);
     assert_eq!(stats.parse_failed, 0);
     let details = serde_json::to_value(stats).unwrap();
@@ -505,42 +492,31 @@ fn one_invalid_slot_does_not_discard_valid_fields_or_other_records() {
 }
 
 #[test]
-fn skip_kana_covers_halfwidth_katakana_extensions_and_explicit_edit_override() {
-    for text in ["ｱｲﾃﾑ说明", "ㇰ属性", "アイテム说明"] {
-        assert!(fields::has_kana(text), "{text}");
-        let rules = Rules::new(vec![rule(text, "中文名称", "exact")]).unwrap();
-        let original = blob(&[text]);
+fn kana_text_supports_substring_rules_and_explicit_edit_override() {
+    for prefix in ["ｱｲﾃﾑ", "ㇰ", "アイテム", "ひらがな"] {
+        let text = format!("{prefix}かな");
+        let rules = Rules::new(vec![rule("かな", "中文名称", "sub")]).unwrap();
+        let original = blob(&[&text]);
         let mut evidence = Evidence::new(1, true);
-        let (skipped, stats) = database::patch_blob(
-            &original,
-            &rules,
-            &rules.view("LocalizeDBSchema"),
-            &mut evidence,
-            &options(true),
-            &HashMap::new(),
-        )
-        .unwrap();
-        assert!(skipped.is_none());
-        assert_eq!(stats.kana_skipped, 1);
         let (changed, _) = database::patch_blob(
             &original,
             &rules,
             &rules.view("LocalizeDBSchema"),
             &mut evidence,
-            &options(false),
+            &options(),
             &HashMap::new(),
         )
         .unwrap();
         assert_eq!(
             fields::parse(changed.as_ref().unwrap(), true).unwrap()[0].text,
-            "中文名称"
+            format!("{prefix}中文名称")
         );
         let (explicit, _) = database::patch_blob(
             &original,
             &rules,
             &rules.view("LocalizeDBSchema"),
             &mut evidence,
-            &options(true),
+            &options(),
             &HashMap::from([(0, "指定修改".into())]),
         )
         .unwrap();
@@ -549,7 +525,6 @@ fn skip_kana_covers_halfwidth_katakana_extensions_and_explicit_edit_override() {
             "指定修改"
         );
     }
-    assert!(!fields::has_kana("普通攻击·ABC123"));
 }
 
 #[test]
@@ -601,7 +576,7 @@ fn comparison_cache_handles_composite_keys_and_non_text_tables() {
         Some(&current),
         None,
         &rules,
-        &options(false),
+        &options(),
         false,
         &ctl(),
     )
@@ -611,7 +586,7 @@ fn comparison_cache_handles_composite_keys_and_non_text_tables() {
         None,
         Some(&cached),
         &rules,
-        &options(false),
+        &options(),
         false,
         &ctl(),
     )

@@ -17,8 +17,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) fn review_path(data: &Path, game: &str, version: &str, skip: bool) -> PathBuf {
-    let key = storage::digest(json!([game, version, skip]).to_string().as_bytes());
+pub(crate) fn review_path(data: &Path, game: &str, version: &str) -> PathBuf {
+    review_path_for(data, json!([game, version]))
+}
+
+pub(crate) fn read_reviews(data: &Path, game: &str, version: &str) -> Result<BTreeSet<String>> {
+    let mut reviewed = read_review(&review_path(data, game, version))?;
+    // Older workspaces stored decisions under two separate keys for the same version.
+    for legacy in [json!([game, version, true]), json!([game, version, false])] {
+        reviewed.extend(read_review(&review_path_for(data, legacy))?);
+    }
+    Ok(reviewed)
+}
+
+fn review_path_for(data: &Path, scope: serde_json::Value) -> PathBuf {
+    let key = storage::digest(scope.to_string().as_bytes());
     data.join(".gui").join(format!("batch-review-{key}.json"))
 }
 
@@ -39,7 +52,6 @@ pub(crate) struct TableEvaluator<'a> {
     view: View,
     edits: HashMap<(&'a RowId, usize), &'a Edit>,
     evidence: Evidence,
-    skip: bool,
 }
 impl<'a> TableEvaluator<'a> {
     pub(crate) fn new(
@@ -48,7 +60,6 @@ impl<'a> TableEvaluator<'a> {
         edits: &'a [Edit],
         game: &str,
         version: &str,
-        skip: bool,
     ) -> Self {
         let mut indexed = HashMap::new();
         for edit in edits
@@ -65,7 +76,6 @@ impl<'a> TableEvaluator<'a> {
             view: rules.view(table),
             edits: indexed,
             evidence: Evidence::new(rules.values.len(), false),
-            skip,
         }
     }
 
@@ -75,9 +85,6 @@ impl<'a> TableEvaluator<'a> {
                 return Err(crate::invalid("定位记录的底稿原文已变化，请重新查找。"));
             }
             return Ok(Cow::Borrowed(&edit.replacement));
-        }
-        if self.skip && fields::has_kana(&row.3) {
-            return Ok(Cow::Borrowed(&row.3));
         }
         self.evidence.hits.fill(0);
         Ok(
@@ -288,7 +295,6 @@ pub fn plan(
     edits: &[Edit],
     game: &str,
     version: &str,
-    skip: bool,
     control: &Control<'_>,
 ) -> Result<Plan> {
     model::validate_edits(edits)?;
@@ -385,10 +391,9 @@ pub fn plan(
             source: String::new(),
             table: table.clone(),
         }])?;
-        let mut before =
-            TableEvaluator::new(&table, &before_rules, &result.edits, game, version, skip);
-        let mut after = TableEvaluator::new(&table, &after_rules, &next_edits, game, version, skip);
-        let mut scope = TableEvaluator::new(&table, &scope_rule, &[], game, version, skip);
+        let mut before = TableEvaluator::new(&table, &before_rules, &result.edits, game, version);
+        let mut after = TableEvaluator::new(&table, &after_rules, &next_edits, game, version);
+        let mut scope = TableEvaluator::new(&table, &scope_rule, &[], game, version);
         let addresses = members
             .iter()
             .map(|edit| ((edit.row_id.clone(), edit.slot), *edit))
@@ -449,7 +454,7 @@ pub fn plan(
             );
         } else if outside > 0 {
             item.reason = format!(
-                "{outside} 段指定文本不在整表替换范围内（含假名的文本会受跳过设置影响）。保留指定文本即可；若需整表替换，请先核对「跳过日文假名的文本」设置和原文字。"
+                "{outside} 段指定文本不在整表替换范围内。保留指定文本即可；若需整表替换，请先核对指定文本的原文与词条匹配范围。"
             );
         } else if !missing_rows.is_empty() {
             item.missing = missing_rows.len();
@@ -638,14 +643,13 @@ mod tests {
             table: "LocalizeDBSchema".into(),
         }
     }
-    fn check(con: &Connection, rules: &[Rule], edits: &[Edit], skip: bool) -> Plan {
+    fn check(con: &Connection, rules: &[Rule], edits: &[Edit]) -> Plan {
         plan(
             con,
             rules,
             edits,
             "game",
             &"a".repeat(64),
-            skip,
             &Control::new(&|_| true),
         )
         .unwrap()
@@ -703,32 +707,28 @@ mod tests {
                 other_version,
             ],
         ] {
-            for skip in [true, false] {
-                for table in ["LocalizeDBSchema", "LocalizeSkillDBSchema"] {
-                    let mut cached =
-                        TableEvaluator::new(table, &rules, &edits, "game", &version, skip);
-                    for _ in 0..3 {
-                        for (id, slot, text) in [
-                            (RowId::Integer(1), 0, "任务あ"),
-                            (RowId::Integer(1), 1, "任务"),
-                            (RowId::Text("text-id".into()), 0, "任务"),
-                            (RowId::Integer(2), 0, "任务"),
-                            (RowId::Integer(3), 0, "任务"),
-                            (RowId::Integer(4), 0, "任务12"),
-                            (RowId::Integer(5), 0, "ASCII"),
-                            (RowId::Integer(1), 0, "原文变化"),
-                        ] {
-                            let row = (table.into(), id, slot, text.into());
-                            let expected =
-                                model::effective(&row, &edits, "game", &version, &rules, skip)
-                                    .map(|value| value.0)
-                                    .map_err(|error| error.to_string());
-                            let actual = cached
-                                .apply(&row)
-                                .map(Cow::into_owned)
-                                .map_err(|error| error.to_string());
-                            assert_eq!(actual, expected, "table={table}, skip={skip}, row={row:?}");
-                        }
+            for table in ["LocalizeDBSchema", "LocalizeSkillDBSchema"] {
+                let mut cached = TableEvaluator::new(table, &rules, &edits, "game", &version);
+                for _ in 0..3 {
+                    for (id, slot, text) in [
+                        (RowId::Integer(1), 0, "任务あ"),
+                        (RowId::Integer(1), 1, "任务"),
+                        (RowId::Text("text-id".into()), 0, "任务"),
+                        (RowId::Integer(2), 0, "任务"),
+                        (RowId::Integer(3), 0, "任务"),
+                        (RowId::Integer(4), 0, "任务12"),
+                        (RowId::Integer(5), 0, "ASCII"),
+                        (RowId::Integer(1), 0, "原文变化"),
+                    ] {
+                        let row = (table.into(), id, slot, text.into());
+                        let expected = model::effective(&row, &edits, "game", &version, &rules)
+                            .map(|value| value.0)
+                            .map_err(|error| error.to_string());
+                        let actual = cached
+                            .apply(&row)
+                            .map(Cow::into_owned)
+                            .map_err(|error| error.to_string());
+                        assert_eq!(actual, expected, "table={table}, row={row:?}");
                     }
                 }
             }
@@ -747,10 +747,10 @@ mod tests {
             0,
             "任务\t".into(),
         );
-        let expected = model::effective(&row, &[], "game", &version, &rules, false)
+        let expected = model::effective(&row, &[], "game", &version, &rules)
             .unwrap_err()
             .to_string();
-        let mut cached = TableEvaluator::new(&row.0, &rules, &[], "game", &version, false);
+        let mut cached = TableEvaluator::new(&row.0, &rules, &[], "game", &version);
         assert_eq!(cached.apply(&row).unwrap_err().to_string(), expected);
     }
 
@@ -771,7 +771,7 @@ mod tests {
             edit("LocalizeSkillDBSchema", 1, "任务甲"),
             prior.clone(),
         ];
-        let result = check(&con, &[], &edits, true);
+        let result = check(&con, &[], &edits);
         assert_eq!(result.rules.len(), 1);
         assert_eq!(result.rules[0].table, "LocalizeDBSchema");
         assert_eq!(result.edits, vec![edits[2].clone(), prior]);
@@ -787,26 +787,18 @@ mod tests {
         let mut edit = edit("LocalizeDBSchema", 1, "任务甲");
         edit.batch_operation.as_mut().unwrap().before = "任务乙".into();
         edit.replacement = "委托乙".into();
-        let compatible = check(&con, &[rule("甲", "乙")], &[edit.clone()], true);
+        let compatible = check(&con, &[rule("甲", "乙")], &[edit.clone()]);
         assert!(compatible.edits.is_empty());
-        let conflict = check(&con, &[rule("任务甲", "任务乙")], &[edit.clone()], true);
+        let conflict = check(&con, &[rule("任务甲", "任务乙")], &[edit.clone()]);
         assert_eq!(conflict.edits, vec![edit]);
         assert!(conflict.items[0].reason.contains("改变当前结果"));
     }
     #[test]
-    fn paired_single_edits_and_kana_overrides_keep_their_existing_behavior() {
+    fn batch_promotion_includes_kana_and_preserves_paired_single_edits() {
         let con = database(&[("LocalizeDBSchema", 1, "任务あ")]);
         let edit = edit("LocalizeDBSchema", 1, "任务あ");
-        let skipped = check(&con, &[], std::slice::from_ref(&edit), true);
-        assert_eq!(skipped.edits, vec![edit.clone()]);
         assert!(
-            skipped.items[0]
-                .reason
-                .contains("1 段指定文本不在整表替换范围内")
-        );
-        assert!(skipped.items[0].reason.contains("跳过日文假名"));
-        assert!(
-            check(&con, &[], std::slice::from_ref(&edit), false)
+            check(&con, &[], std::slice::from_ref(&edit))
                 .edits
                 .is_empty()
         );
@@ -815,7 +807,7 @@ mod tests {
         single.batch_operation = None;
         single.replacement = "单条内容".into();
         let paired = vec![edit, single];
-        let result = check(&con, &[], &paired, false);
+        let result = check(&con, &[], &paired);
         assert_eq!(result.edits, paired);
         assert!(result.items[0].reason.contains("单条修改"));
     }
@@ -825,7 +817,7 @@ mod tests {
         let stale = edit("LocalizeDBSchema", 2, "任务乙");
         let changed = edit("LocalizeDBSchema", 1, "任务旧文");
         let edits = vec![stale, changed];
-        let result = check(&con, &[], &edits, true);
+        let result = check(&con, &[], &edits);
         assert!(result.rules.is_empty());
         assert_eq!(result.edits, edits);
         assert_eq!(result.relocations.len(), 2);
@@ -867,7 +859,7 @@ mod tests {
         other_version.version = "b".repeat(64);
         other_version.batch_operation.as_mut().unwrap().id = "3".repeat(32);
         let edits = vec![batch, single, other_game.clone(), other_version.clone()];
-        let result = check(&con, &[], &edits, true);
+        let result = check(&con, &[], &edits);
         assert_eq!(result.relocated, 1);
         assert!(result.rules.is_empty());
         assert_eq!(result.edits.len(), 4);
@@ -893,13 +885,13 @@ mod tests {
             ("LocalizeDBSchema", 6, "任务乙"),
         ]);
         let first = edit("LocalizeDBSchema", 1, "任务甲");
-        let partial = check(&con, &[], std::slice::from_ref(&first), true);
+        let partial = check(&con, &[], std::slice::from_ref(&first));
         assert_eq!(partial.relocated, 1);
         assert!(partial.rules.is_empty());
         assert_eq!(partial.edits[0].row_id, RowId::Integer(5));
         assert!(partial.items[0].reason.contains("还有 1 段"));
         let second = edit("LocalizeDBSchema", 2, "任务乙");
-        let complete = check(&con, &[], &[first, second], true);
+        let complete = check(&con, &[], &[first, second]);
         assert_eq!(complete.relocated, 2);
         assert_eq!(complete.rules.len(), 1);
         assert!(complete.edits.is_empty());
@@ -938,7 +930,7 @@ mod tests {
             ),
         ] {
             let con = database(&rows);
-            let result = check(&con, &[], &edits, true);
+            let result = check(&con, &[], &edits);
             assert_eq!(result.relocated, 0);
             assert_eq!(result.edits, edits);
             assert!(result.rules.is_empty());
@@ -954,17 +946,12 @@ mod tests {
     fn conflicting_scope_and_unclassified_legacy_records_are_not_promoted() {
         let con = database(&[("LocalizeDBSchema", 1, "任务甲")]);
         let edit = edit("LocalizeDBSchema", 1, "任务甲");
-        let result = check(
-            &con,
-            &[rule("任务", "其他")],
-            std::slice::from_ref(&edit),
-            true,
-        );
+        let result = check(&con, &[rule("任务", "其他")], std::slice::from_ref(&edit));
         assert_eq!(result.edits, vec![edit.clone()]);
         assert!(!result.items[0].reason.is_empty());
         let mut legacy = edit;
         legacy.batch_operation = None;
-        let result = check(&con, &[], &[legacy.clone()], true);
+        let result = check(&con, &[], &[legacy.clone()]);
         assert!(result.items.is_empty());
         assert_eq!(result.edits, vec![legacy]);
     }
@@ -980,7 +967,6 @@ mod tests {
                 &[edit("LocalizeDBSchema", 1, "任务甲")],
                 "game",
                 &"a".repeat(64),
-                true,
                 &Control::new(&|_| true)
             )
             .is_err()

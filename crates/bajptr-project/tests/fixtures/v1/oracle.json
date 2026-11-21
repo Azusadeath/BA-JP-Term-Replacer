@@ -1,15 +1,14 @@
 {
-  "oracle": "Python implementation, BAJPTR_ENGINE=python",
+  "oracle": "Captured Python results, with expected preview updated for current text matching",
   "preview": {
     "rows_seen": 3,
-    "rows_changed": 1,
-    "fields_changed": 1,
-    "inplace": 0,
+    "rows_changed": 2,
+    "fields_changed": 2,
+    "inplace": 1,
     "appended": 1,
     "bytes_appended": 30,
-    "kana_skipped": 1,
     "parse_failed": 0,
-    "added": 1,
+    "added": 2,
     "updated": 0,
     "reverted": 0,
     "tables": [
@@ -30,7 +29,7 @@
         "sub",
         "测试",
         "",
-        1
+        2
       ]
     ],
     "changes": [
@@ -42,6 +41,15 @@
         "original": "阿罗娜的任务",
         "before": "阿罗娜的任务",
         "after": "阿洛娜同学的委托"
+      },
+      {
+        "kind": "新增",
+        "table": "LocalizeDBSchema",
+        "row_id": 3,
+        "slot": 0,
+        "original": "アロナ任务",
+        "before": "アロナ任务",
+        "after": "アロナ委托"
       }
     ],
     "zero_reasons": []
