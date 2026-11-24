@@ -339,7 +339,7 @@ impl Project {
         let mut previous = self.source_history.games.get(&key).cloned();
         if previous.is_none() {
             let live = crate::region::locate(&self.game)?;
-            let folder = baseline::location(&live, &self.data.join("backup"))?;
+            let folder = baseline::version_folder(&live, &self.data.join("backup"))?;
             let prefix =
                 storage::identity(folder.parent().unwrap())? + std::path::MAIN_SEPARATOR_STR;
             if let Some(cache) = fs::read(&metadata)
@@ -631,7 +631,7 @@ impl Project {
                 if decoded.settings["game"].as_str().unwrap_or("") != self.game {
                     return Err(invalid("设置已被其他窗口修改，请重新打开工具后备份。"));
                 }
-                bundle.write(Path::new(text(p, "path")?), &self.store.root, control)?;
+                bundle.export(Path::new(text(p, "path")?), &self.data, control)?;
                 Ok(json!({"message":"备份已保存，包含词表、指定文本修改、游戏目录和选项。"}))
             }
             "backup_read" => {

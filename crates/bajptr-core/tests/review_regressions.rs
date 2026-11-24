@@ -53,6 +53,154 @@ fn simple_db() -> Connection {
 }
 
 #[test]
+fn blank_table_filter_uses_the_default_scope_for_preview_and_patch() {
+    let con = simple_db();
+    con.execute_batch(
+        "CREATE TABLE SkillDBSchema(Id INTEGER PRIMARY KEY, Bytes BLOB);
+         CREATE TABLE ItemDBSchema(Id INTEGER PRIMARY KEY, Bytes BLOB);
+         CREATE TABLE SystemDBSchema(Id INTEGER PRIMARY KEY, Bytes BLOB);",
+    )
+    .unwrap();
+    let original = blob(&["攻击"]);
+    for table in [
+        "LocalizeDBSchema",
+        "SkillDBSchema",
+        "ItemDBSchema",
+        "SystemDBSchema",
+    ] {
+        con.execute(&format!("INSERT INTO {table} VALUES(1,?)"), [&original])
+            .unwrap();
+    }
+    assert_eq!(database::tables(&con, ".*").unwrap().len(), 4);
+    let rules = Rules::new(vec![rule("攻击", "爆炸", "sub")]).unwrap();
+    for (pattern, write) in [(" \t", false), ("", true)] {
+        let mut options = options();
+        options.tables = pattern.into();
+        let stats =
+            database::patch_database(&con, None, None, &rules, &options, write, &ctl()).unwrap();
+        assert_eq!(stats.tables, ["LocalizeDBSchema"]);
+        assert_eq!(stats.fields_changed, 1);
+    }
+    for table in ["SkillDBSchema", "ItemDBSchema", "SystemDBSchema"] {
+        let bytes: Vec<u8> = con
+            .query_row(&format!("SELECT Bytes FROM {table}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(bytes, original, "{table}");
+    }
+}
+
+#[test]
+fn incomplete_string_slots_block_full_coverage_with_precise_diagnostics() {
+    let good = blob(&["任务", "待核对"]);
+    let field = fields::parse(&good, true).unwrap()[1].clone();
+    let end = field.spos + 4 + field.text.len();
+    let mut mutations = Vec::new();
+    let mut bad = good.clone();
+    bad[10..12].copy_from_slice(&10u16.to_le_bytes());
+    mutations.push((bad, "字段位置"));
+    let mut bad = good.clone();
+    bad[field.fpos..field.fpos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    mutations.push((bad, "字符串位置"));
+    let mut bad = good.clone();
+    bad[field.spos..field.spos + 4]
+        .copy_from_slice(&((fields::MAX_STRING + 1) as u32).to_le_bytes());
+    mutations.push((bad, "字符串长度"));
+    let mut bad = good.clone();
+    bad.truncate(end);
+    mutations.push((bad, "字符串结束位置"));
+    let mut bad = good.clone();
+    bad[end] = 1;
+    mutations.push((bad, "结束标记"));
+    let mut bad = good.clone();
+    bad[field.spos + 4] = 0xff;
+    mutations.push((bad, "UTF-8"));
+
+    for (bad, reason) in mutations {
+        let con = simple_db();
+        con.execute("INSERT INTO LocalizeDBSchema VALUES (1,?)", [&bad])
+            .unwrap();
+        let error = database::visit_table_with_text_slots(
+            &con,
+            "LocalizeDBSchema",
+            [1],
+            &ctl(),
+            |_| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("记录 1") && error.contains("字段 1") && error.contains(reason),
+            "{error}"
+        );
+        con.execute("INSERT INTO LocalizeDBSchema VALUES (2,?)", [&good])
+            .unwrap();
+        let inferred =
+            database::visit_table(&con, "LocalizeDBSchema", &ctl(), |_| Ok(())).unwrap_err();
+        assert_eq!(inferred.to_string(), error);
+    }
+
+    let con = simple_db();
+    let mut scalar = good.clone();
+    scalar[field.fpos..field.fpos + 4].copy_from_slice(&123456u32.to_le_bytes());
+    con.execute("INSERT INTO LocalizeDBSchema VALUES (1,?)", [&scalar])
+        .unwrap();
+    let mut visited = Vec::new();
+    database::visit_table_with_text_slots(&con, "LocalizeDBSchema", [0], &ctl(), |row| {
+        visited.push(row.3);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(visited, ["任务"]);
+    con.execute("INSERT INTO LocalizeDBSchema VALUES (2,?)", [&scalar])
+        .unwrap();
+    con.execute("INSERT INTO LocalizeDBSchema VALUES (3,?)", [&good])
+        .unwrap();
+    database::visit_table(&con, "LocalizeDBSchema", &ctl(), |_| Ok(())).unwrap();
+}
+
+#[test]
+fn search_export_and_migration_include_non_cjk_text() {
+    let con = simple_db();
+    let originals = ["English only", "한국어 문장"];
+    con.execute(
+        "INSERT INTO LocalizeDBSchema(Bytes) VALUES (?)",
+        [blob(&originals)],
+    )
+    .unwrap();
+    let edits = originals
+        .iter()
+        .enumerate()
+        .map(|(slot, original)| TextEdit {
+            table: "LocalizeDBSchema".into(),
+            row_id: RowId::Integer(1),
+            slot,
+            original: (*original).into(),
+            replacement: "changed".into(),
+        })
+        .collect::<Vec<_>>();
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        database::export(&con, "Localize", directory.path(), &ctl()).unwrap(),
+        2
+    );
+    let exported = std::fs::read_to_string(directory.path().join("LocalizeDBSchema.tsv")).unwrap();
+    let candidates = database::locate_originals(&con, &edits, &ctl()).unwrap();
+    assert_eq!(candidates.len(), originals.len());
+    for (slot, original) in originals.into_iter().enumerate() {
+        let search = database::SearchIndex::build(&con, "Localize", original, &ctl()).unwrap();
+        let page = search.page("", 10, 0, &ctl()).unwrap();
+        assert_eq!(page.total, 1);
+        let row = &page.rows[0];
+        assert_eq!((row.2, row.3.as_str()), (slot, original));
+        assert!(exported.contains(&format!("1\t{slot}\t{original}\n")));
+        let location = database::location_at(&con, row, &ctl()).unwrap().unwrap();
+        assert_eq!(&location.row, row);
+        assert_eq!(&candidates[slot].row, row);
+        assert_eq!(location.context, originals[1 - slot]);
+    }
+}
+
+#[test]
 fn migration_candidates_keep_full_context_and_distinct_addresses() {
     let con = simple_db();
     let prefix = "相同上下文".repeat(30);

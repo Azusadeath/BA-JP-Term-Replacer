@@ -91,6 +91,14 @@ pub struct Engine {
     scope_sources: VecDeque<(String, Value)>,
     previews: VecDeque<(String, Value)>,
     prepared: Option<PreparedPatch>,
+    preparation_stage: Option<tempfile::TempDir>,
+}
+
+#[derive(PartialEq)]
+enum PatchMode {
+    Generate,
+    Prepare,
+    ApplyPrepared,
 }
 
 #[derive(Clone)]
@@ -349,15 +357,7 @@ impl Engine {
             if ready { "ready" } else { "changed" }
         } else if known && receipt["kind"] != "restored" {
             "blocked"
-        } else if fs::read_dir(destination.parent().unwrap())
-            .ok()
-            .is_some_and(|entries| {
-                entries.flatten().any(|e| {
-                    model::is_version(&e.file_name().to_string_lossy())
-                        && e.path().join("baseline.json").is_file()
-                })
-            })
-        {
+        } else if baseline::has_previous(&destination) {
             "update"
         } else {
             "missing"
@@ -814,11 +814,11 @@ impl Engine {
         Ok(stats)
     }
     pub fn invalidate_prepared(&mut self) {
-        if let Some(patch) = self.prepared.take() {
-            crate::cleanup::retire_success(
-                patch.output.parent().unwrap(),
-                &Control::new(&|_| true),
-            );
+        if let Some(patch) = self.prepared.take()
+            && let Err(error) = fs::remove_file(&patch.output)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.preparation_stage = None;
         }
     }
     fn preparation_key(
@@ -840,54 +840,7 @@ impl Engine {
     /// Prepare a private, verified patch without publishing anything to the game
     /// or the user's fallback output directory. Closing the preview keeps it.
     pub fn prepare(&mut self, job: PatchJob<'_>, control: &Control<'_>) -> Result<Value> {
-        job.config.check_documents()?;
-        let live = region::locate(job.game)?;
-        if job.expected.is_some_and(|expected| {
-            region::resource_identity(&live).ok().as_ref() != Some(expected)
-        }) {
-            return Err(invalid("游戏资源已变化，请重新预览。"));
-        }
-        let original = self.baseline(job.game, job.backup_root, control)?;
-        let key = Self::preparation_key(&live, &original, job.config)?;
-        if let Some(patch) = self
-            .prepared
-            .as_ref()
-            .filter(|patch| patch.key == key)
-            .cloned()
-        {
-            self.check_prepared(&patch, control)?;
-            return Ok(
-                json!({"ready":true,"reused":true,"cache_id":patch.output.parent().unwrap().file_name(),"prepared_path":patch.output}),
-            );
-        }
-        self.invalidate_prepared();
-        let private_output = job.data.join("work/prepared");
-        let result = self.generate(
-            PatchJob {
-                output_root: &private_output,
-                install: false,
-                ..job
-            },
-            control,
-        )?;
-        let output = PathBuf::from(
-            result["output"]
-                .as_str()
-                .ok_or_else(|| invalid("补丁准备位置无效。"))?,
-        );
-        let entry = region::parse(&fs::read(output.with_file_name("TableCatalog.bytes"))?)?;
-        crate::cleanup::mark(output.parent().unwrap())?;
-        self.prepared = Some(PreparedPatch {
-            key,
-            output: output.clone(),
-            size: entry.size,
-            crc: entry.crc,
-            stats: result["stats"].clone(),
-            seconds: result["processing_seconds"].as_f64().unwrap_or(0.),
-        });
-        Ok(
-            json!({"ready":true,"reused":false,"cache_id":output.parent().unwrap().file_name(),"prepared_path":output}),
-        )
+        self.generate_inner(job, PatchMode::Prepare, control)
     }
     fn check_prepared(&mut self, patch: &PreparedPatch, control: &Control<'_>) -> Result<()> {
         self.baselines.checked(
@@ -902,15 +855,15 @@ impl Engine {
         )
     }
     pub fn apply_prepared(&mut self, job: PatchJob<'_>, control: &Control<'_>) -> Result<Value> {
-        self.generate_inner(job, true, control)
+        self.generate_inner(job, PatchMode::ApplyPrepared, control)
     }
     pub fn generate(&mut self, job: PatchJob<'_>, control: &Control<'_>) -> Result<Value> {
-        self.generate_inner(job, false, control)
+        self.generate_inner(job, PatchMode::Generate, control)
     }
     fn generate_inner(
         &mut self,
         job: PatchJob<'_>,
-        require_prepared: bool,
+        mode: PatchMode,
         control: &Control<'_>,
     ) -> Result<Value> {
         let PatchJob {
@@ -932,7 +885,8 @@ impl Engine {
         let original = self.baselines.resolve(&live, backup_root, control)?;
         let source_stat = baseline::stamp(&original.bundle)?;
         let cache_key = Self::preparation_key(&live, &original, config)?;
-        if install {
+        let prepare = mode == PatchMode::Prepare;
+        if prepare || install {
             if let Some(patch) = self
                 .prepared
                 .as_ref()
@@ -940,6 +894,11 @@ impl Engine {
                 .cloned()
             {
                 self.check_prepared(&patch, control)?;
+                if prepare {
+                    return Ok(json!({
+                        "ready":true,"reused":true,"cache_id":patch.key,"prepared_path":patch.output
+                    }));
+                }
                 let _rules_lock = config
                     .rules_path
                     .as_ref()
@@ -975,17 +934,42 @@ impl Engine {
                 }
                 return Ok(result);
             }
-            if require_prepared {
+            if mode == PatchMode::ApplyPrepared {
                 return Err(invalid(
                     "补丁尚未准备完成或已失效，请重新预览并等待准备完成。",
                 ));
             }
         }
-        let stage_root = config.work_dir.clone().unwrap_or_else(|| data.join("work"));
+        let stage_root = config
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| data.join(if prepare { "work/prepared" } else { "work" }));
         fs::create_dir_all(&stage_root)?;
-        let stage = stage_root.join(format!("patch-{}", uuid::Uuid::new_v4().simple()));
-        fs::create_dir(&stage)?;
-        crate::cleanup::mark(&stage)?;
+        let stage = if prepare {
+            self.invalidate_prepared();
+            if self.preparation_stage.as_ref().is_some_and(|stage| {
+                stage.path().parent() != Some(stage_root.as_path()) || !stage.path().is_dir()
+            }) {
+                self.preparation_stage = None;
+            }
+            if self.preparation_stage.is_none() {
+                self.preparation_stage = Some(
+                    tempfile::Builder::new()
+                        .prefix("patch-")
+                        .tempdir_in(&stage_root)?,
+                );
+            }
+            self.preparation_stage
+                .as_ref()
+                .unwrap()
+                .path()
+                .to_path_buf()
+        } else {
+            let stage = stage_root.join(format!("patch-{}", uuid::Uuid::new_v4().simple()));
+            fs::create_dir(&stage)?;
+            crate::cleanup::mark(&stage)?;
+            stage
+        };
         let started = std::time::Instant::now();
         let result = (|| -> Result<Value> {
             let plain = stage.join("working.db");
@@ -1074,20 +1058,25 @@ impl Engine {
             // Cancellation is checked before this commit point; publication then finishes.
             control.check()?;
             let commit_control = Control::new(&|_| true);
-            let entry = region::Entry {
-                size_offset: 0,
-                crc_offset: 0,
-                size,
-                crc: checked.crc,
-            };
-            let patch = PreparedPatch {
+            let mut patch = PreparedPatch {
                 key: cache_key.clone(),
                 output: encrypted,
-                size: entry.size,
-                crc: entry.crc,
+                size,
+                crc: checked.crc,
                 stats,
                 seconds: started.elapsed().as_secs_f64(),
             };
+            if prepare {
+                let output = stage.join(&name);
+                fs::rename(&patch.output, &output)?;
+                fs::remove_file(&plain)?;
+                patch.output = output;
+                let result = json!({
+                    "ready":true,"reused":false,"cache_id":patch.key,"prepared_path":patch.output
+                });
+                self.prepared = Some(patch);
+                return Ok(result);
+            }
             self.publish_patch_named(
                 &PatchJob {
                     game,
@@ -1104,9 +1093,16 @@ impl Engine {
                 &commit_control,
             )
         })();
-        // A failed stage is kept for diagnosis/recovery; successful scratch data is retired.
-        if result.is_ok() {
-            crate::cleanup::retire_success(&stage, control);
+        if prepare {
+            if let Err(error) = &result {
+                let stage = self.preparation_stage.take().unwrap();
+                if !matches!(error, crate::Error::Cancelled) {
+                    let path = stage.keep();
+                    let _ = control.warn(&format!("补丁暂存文件保留在 {}。", path.display()));
+                }
+            }
+        } else if result.is_ok() {
+            crate::cleanup::remove_success(&stage, control);
         }
         result
     }
@@ -1171,7 +1167,7 @@ impl Engine {
                     if published
                         && target.is_file()
                         && fs::read(&live.catalog).is_ok_and(|bytes| bytes == live.bytes)
-                        && let Err(cleanup) = storage::retire(&target)
+                        && let Err(cleanup) = fs::remove_file(&target)
                     {
                         let _ = control.warn(&format!(
                             "未启用的资源副本暂未移出 {}：{cleanup}",
@@ -1257,7 +1253,7 @@ impl Engine {
         if let Err(error) = region::publish_catalog(&live, entry.size, entry.crc) {
             if published
                 && fs::read(&live.catalog).is_ok_and(|bytes| bytes == live.bytes)
-                && let Err(cleanup) = storage::retire(&target)
+                && let Err(cleanup) = fs::remove_file(&target)
             {
                 let _ = control.warn(&format!(
                     "未启用的资源副本暂未移出 {}：{cleanup}",

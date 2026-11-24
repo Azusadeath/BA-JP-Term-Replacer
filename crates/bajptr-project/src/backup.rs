@@ -126,7 +126,7 @@ impl Snapshot {
             Some(&None),
         )?;
         if let Ok(bundle) = self.bundle() {
-            bundle.write(&path.join("workspace-backup.json"), root, control)?;
+            bundle.write(&path.join("workspace-backup.json"), control)?;
         }
         Ok(path)
     }
@@ -169,24 +169,27 @@ impl Bundle {
             source: Box::new(source),
         })
     }
-    pub fn write(&self, path: &Path, root: &Path, control: &Control<'_>) -> Result<()> {
-        let target = storage::identity(path)?;
-        if FILES
-            .iter()
-            .chain(
-                [
-                    "application-state.json",
-                    "tables-cache.json",
-                    "sources-transaction.json",
-                    "replacements-transaction.json",
-                    "workspace-transaction.json",
-                ]
-                .iter(),
-            )
-            .any(|name| storage::identity(&root.join(name)).is_ok_and(|path| path == target))
-        {
-            return Err(invalid("备份文件不能覆盖工作区记录，请选择其他文件名。"));
+    pub fn export(&self, path: &Path, data: &Path, control: &Control<'_>) -> Result<()> {
+        let reject = || invalid("工具数据目录中的 .gui、backup 和 work 受保护。请选择其他位置。");
+        let protected = [".gui", "backup", "work"]
+            .map(|name| storage::identity(&data.join(name)))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let absolute = std::path::absolute(path)?;
+        let target = storage::resolved(&absolute)?;
+        for ancestor in std::iter::once(target.as_path()).chain(absolute.ancestors()) {
+            let identity = storage::identity(ancestor)?;
+            if protected
+                .iter()
+                .any(|folder| Path::new(&identity).starts_with(folder))
+            {
+                return Err(reject());
+            }
         }
+        self.write(&target, control)
+    }
+
+    fn write(&self, path: &Path, control: &Control<'_>) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(self)?;
         control.check()?;
         storage::atomic_write(path, &bytes, None)?;

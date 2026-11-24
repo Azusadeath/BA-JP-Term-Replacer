@@ -5,6 +5,7 @@ pub fn user_message(action: &str, error: &Error) -> String {
     let operation = match action {
         "load" => "读取工作区",
         "check" => "检查游戏与底稿",
+        "baseline_commit" | "baseline_rebuild_commit" => "切换初始底稿",
         "search" | "search_more" => "查找文本",
         "export_text" | "export_rules" => "导出文件",
         "apply" => "应用到游戏",

@@ -187,6 +187,37 @@ fn combined_fixture_with_batch_scope(whole_table: bool) -> (Fixture, Project) {
 }
 
 #[test]
+fn workspace_backup_rejects_protected_directories_without_touching_the_baseline() {
+    let f = Fixture::new();
+    let mut project = f.ready_project();
+    let baseline = call(&mut project, "baseline", json!({}));
+    let resource = Path::new(baseline["folder"].as_str().unwrap())
+        .join(baseline["resource"].as_str().unwrap());
+    let bytes = fs::read(&resource).unwrap();
+    let recovery = f.data.join(".gui/recovery/user.json");
+    let scratch = f.data.join("work/new/backup.json");
+    let backup_sibling = f.data.join("backups/backup.json");
+    for protected in [resource.clone(), recovery.clone(), scratch.clone()] {
+        let error = project
+            .dispatch("backup_create", &json!({"path":protected}), &control())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("请选择其他位置"), "{error}");
+    }
+    assert_eq!(fs::read(resource).unwrap(), bytes);
+    assert!(!recovery.exists());
+    assert!(!scratch.exists());
+
+    call(
+        &mut project,
+        "backup_create",
+        json!({"path":backup_sibling}),
+    );
+    assert!(backup_sibling.is_file());
+    assert!(call(&mut project, "backup_read", json!({"path":backup_sibling}))["nonce"].is_string());
+}
+
+#[test]
 fn workspace_backup_restores_rules_text_edits_paths_and_source_metadata() {
     let (f, mut p) = combined_fixture();
     call(&mut p, "sources", json!({}));
@@ -2143,6 +2174,28 @@ fn prepared_preview_never_writes_game_and_reopens_without_rebuilding() {
 }
 
 #[test]
+fn repeated_zero_change_previews_do_not_create_patch_scratch() {
+    let f = Fixture::new();
+    fs::write(f.data.join(".gui/rules.tsv"), "").unwrap();
+    let mut p = f.ready_project();
+    for _ in 0..2 {
+        let preview = call(&mut p, "preview", json!({}));
+        assert_eq!(preview["total_changes"], 0);
+        assert!(
+            p.dispatch(
+                "prepare_patch",
+                &json!({"nonce":preview["nonce"]}),
+                &control()
+            )
+            .is_err()
+        );
+    }
+    assert!(!f.data.join("work").exists());
+    assert!(!f.data.join("output").exists());
+    f.unchanged();
+}
+
+#[test]
 fn editing_invalidates_prepared_patch_and_confirm_requires_ready_patch() {
     let f = Fixture::new();
     let mut p = f.ready_project();
@@ -2175,6 +2228,12 @@ fn editing_invalidates_prepared_patch_and_confirm_requires_ready_patch() {
     let replacement = call(&mut p, "prepare_patch", json!({"nonce":fresh["nonce"]}));
     assert_ne!(replacement["cache_id"], prepared["cache_id"]);
     assert_eq!(replacement["reused"], false);
+    let old_path = Path::new(prepared["prepared_path"].as_str().unwrap());
+    let new_path = Path::new(replacement["prepared_path"].as_str().unwrap());
+    assert_eq!(old_path.parent(), new_path.parent());
+    assert_eq!(fs::read_dir(new_path.parent().unwrap()).unwrap().count(), 1);
+    drop(p);
+    assert!(!new_path.parent().unwrap().exists());
     f.unchanged();
 }
 
@@ -2897,17 +2956,53 @@ fn external_same_version_content_can_only_replace_baseline_after_confirmation() 
         "baseline_commit",
         json!({"token":changed["baseline_status"]["token"]}),
     );
+    let new_folder = Path::new(newest["folder"].as_str().unwrap());
+    assert_ne!(new_folder, folder);
     assert_eq!(
-        fs::read(folder.join(newest["resource"].as_str().unwrap())).unwrap(),
+        fs::read(new_folder.join(newest["resource"].as_str().unwrap())).unwrap(),
         bytes
     );
-    assert_ne!(fs::read(folder.join("baseline.json")).unwrap(), record);
+    assert_eq!(fs::read(folder.join("baseline.json")).unwrap(), record);
+    let mut restarted = f.project();
     assert_eq!(
-        call(&mut reopened, "check", json!({}))["baseline_status"]["state"],
+        call(&mut restarted, "check", json!({}))["baseline_status"]["state"],
         "ready"
     );
-    let search = call(&mut reopened, "search", json!({"keyword":"委托"}));
+    let search = call(&mut restarted, "search", json!({"keyword":"委托"}));
     assert!(search["total"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn a_legacy_rollback_folder_is_recognized_as_the_saved_baseline() {
+    let f = Fixture::new();
+    let saved = call(&mut f.ready_project(), "baseline", json!({}));
+    let original = Path::new(saved["folder"].as_str().unwrap());
+    let version = original.file_name().unwrap().to_string_lossy();
+    let stranded = original.with_file_name(format!(
+        "{version}.superseded-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::rename(original, &stranded).unwrap();
+    let mut restarted = f.project();
+    assert_eq!(
+        call(&mut restarted, "check", json!({}))["baseline_status"]["state"],
+        "ready"
+    );
+    assert_eq!(
+        Path::new(
+            call(&mut restarted, "baseline", json!({}))["folder"]
+                .as_str()
+                .unwrap()
+        ),
+        stranded
+    );
+    assert!(
+        call(&mut restarted, "search", json!({"keyword":"任务"}))["total"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    f.unchanged();
 }
 
 #[test]

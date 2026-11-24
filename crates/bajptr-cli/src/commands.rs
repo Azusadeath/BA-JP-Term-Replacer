@@ -314,7 +314,7 @@ fn standalone_patch(
     fs::create_dir(&folder)?;
     let target = folder.join("patched.db");
     baseline::copy_sync(&result, &target)?;
-    bajptr_project::cleanup::retire_success(&stage, control);
+    bajptr_project::cleanup::remove_success(&stage, control);
     Ok(json!({"output":target,"stats":stats,"verified":true}))
 }
 fn uuid_name() -> String {

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -33,9 +34,111 @@ pub fn stamp(path: &Path) -> Result<Stamp> {
     ))
 }
 pub fn location(game: &Game, root: &Path) -> Result<PathBuf> {
+    active_folder(&version_folder(game, root)?)
+}
+
+pub(crate) fn version_folder(game: &Game, root: &Path) -> Result<PathBuf> {
     let version = region::version(&game.catalog)?;
+    version_folder_for(game, root, &version)
+}
+
+fn version_folder_for(game: &Game, root: &Path, version: &str) -> Result<PathBuf> {
     let game_id = storage::digest(storage::identity(&game.dir)?.as_bytes());
     Ok(root.join("_baselines").join(&game_id[..24]).join(version))
+}
+
+const ACTIVE: &str = ".active";
+const GENERATION: &str = "generation-";
+
+fn is_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+fn legacy_version(name: &str) -> Option<&str> {
+    let (version, suffix) = name.split_once('.')?;
+    let (kind, id) = suffix.split_once('-')?;
+    (model::is_version(version) && matches!(kind, "superseded" | "damaged") && is_id(id))
+        .then_some(version)
+}
+
+fn active_folder(destination: &Path) -> Result<PathBuf> {
+    match fs::read_to_string(destination.join(ACTIVE)) {
+        Ok(name) => {
+            if name.strip_prefix(GENERATION).is_none_or(|id| !is_id(id)) {
+                return Err(invalid("当前底稿指针无效，请检查 backup/_baselines。"));
+            }
+            let folder = destination.join(name);
+            if !folder.is_dir() {
+                return Err(invalid(format!("当前底稿目录丢失：{}", folder.display())));
+            }
+            return Ok(folder);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if destination.join("baseline.json").is_file() {
+        return Ok(destination.into());
+    }
+
+    // Older builds could leave the published directory under either rollback name.
+    let entries = match fs::read_dir(destination.parent().unwrap()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(destination.into()),
+        Err(error) => return Err(error.into()),
+    };
+    let version = destination.file_name().and_then(|name| name.to_str());
+    let mut previous = None;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if entry.file_type()?.is_dir()
+            && name
+                .to_str()
+                .and_then(legacy_version)
+                .is_some_and(|v| Some(v) == version)
+            && previous.replace(entry.path()).is_some()
+        {
+            return Err(invalid(format!(
+                "发现多个旧底稿副本，无法自动确定原底稿。请检查 {}。",
+                destination.parent().unwrap().display()
+            )));
+        }
+    }
+    Ok(previous.unwrap_or_else(|| destination.into()))
+}
+
+pub(crate) fn has_previous(destination: &Path) -> bool {
+    fs::read_dir(destination.parent().unwrap()).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (model::is_version(&name) || legacy_version(&name).is_some())
+                && (entry.path().join("baseline.json").is_file()
+                    || entry.path().join(ACTIVE).is_file())
+        })
+    })
+}
+
+pub(crate) fn new_generation(destination: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(destination)?;
+    let stage = destination.join(format!("{GENERATION}{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir(&stage)?;
+    Ok(stage)
+}
+
+pub(crate) fn publish_generation(destination: &Path, stage: &Path) -> Result<()> {
+    let name = stage.file_name().unwrap().to_str().unwrap();
+    storage::write_locked(&destination.join(ACTIVE), name.as_bytes()).map_err(|source| {
+        crate::Error::Context {
+            message: format!(
+                "{}\n已校验的新副本保留在 {}。",
+                crate::diagnostics::user_message("baseline_commit", &source),
+                stage.display()
+            ),
+            source: Box::new(source),
+        }
+    })?;
+    Ok(())
 }
 impl Baselines {
     pub fn checked(&mut self, path: &Path, entry: &Entry, control: &Control<'_>) -> Result<()> {
@@ -84,8 +187,7 @@ impl Baselines {
         root: &Path,
         version: &str,
     ) -> Result<Option<(Baseline, Entry)>> {
-        let game_id = storage::digest(storage::identity(&game.dir)?.as_bytes());
-        let destination = root.join("_baselines").join(&game_id[..24]).join(version);
+        let destination = active_folder(&version_folder_for(game, root, version)?)?;
         let record_path = destination.join("baseline.json");
         if !record_path.is_file() {
             return Ok(None);
@@ -170,12 +272,13 @@ impl Baselines {
         keep: &HashSet<String>,
     ) -> Result<Baseline> {
         let version = region::version(&game.catalog)?;
-        let destination = location(game, root)?;
-        let record_path = destination.join("baseline.json");
+        let destination = version_folder_for(game, root, &version)?;
+        let previous = active_folder(&destination)?;
+        let record_path = previous.join("baseline.json");
         if !replace && let Some(original) = self.read_saved(game, root, &version, control)? {
             return Ok(original);
         }
-        if destination.exists() && (!replace || !record_path.is_file()) {
+        if previous.exists() && (!replace || !record_path.is_file()) {
             return Err(Self::missing(true));
         }
         if !create {
@@ -191,11 +294,16 @@ impl Baselines {
         );
         let entry = region::parse(&fs::read(&catalog)?)?;
         fs::create_dir_all(destination.parent().unwrap())?;
-        let stage = destination.with_file_name(format!(
-            "{version}.building-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        fs::create_dir(&stage)?;
+        let stage = if replace {
+            new_generation(&destination)?
+        } else {
+            let stage = destination.with_file_name(format!(
+                "{version}.building-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::create_dir(&stage)?;
+            stage
+        };
         let name = source.file_name().unwrap();
         copy_sync(&source, &stage.join(name))?;
         copy_sync(&catalog, &stage.join("TableCatalog.bytes"))?;
@@ -236,31 +344,28 @@ impl Baselines {
                 &json!({"format":2,"id":uuid::Uuid::new_v4().simple().to_string(),"game_dir":game.dir,"version":version,"created":chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),"db_file":name.to_string_lossy(),"origin":origin}),
             )?,
         )?;
-        let previous = destination.with_file_name(format!(
-            "{version}.superseded-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
         control.check()?;
-        if replace {
-            fs::rename(&destination, &previous)?;
-        }
-        if let Err(error) = fs::rename(&stage, &destination) {
-            if replace {
-                fs::rename(&previous, &destination)?;
+        let published = if replace {
+            publish_generation(&destination, &stage)?;
+            // The original layout stores its files in the version directory itself.
+            if previous != destination
+                && let Err(error) = storage::retire(&previous)
+            {
+                let _ = control.warn(&format!(
+                    "新底稿已保存，旧副本仍保留在 {}：{error}",
+                    previous.display()
+                ));
             }
-            return Err(error.into());
-        }
-        if replace && let Err(error) = storage::retire(&previous) {
-            let _ = control.warn(&format!(
-                "新底稿已保存，旧副本仍保留在 {}：{error}",
-                previous.display()
-            ));
-        }
+            stage
+        } else {
+            fs::rename(&stage, &destination)?;
+            destination.clone()
+        };
         let _ = control.log("初始底稿已保存，之后从这份底稿重建。");
         retire_old(&destination, keep, control);
         Ok(Baseline {
-            bundle: destination.join(name),
-            catalog: destination.join("TableCatalog.bytes"),
+            bundle: published.join(name),
+            catalog: published.join("TableCatalog.bytes"),
             version,
             origin,
         })
@@ -281,7 +386,7 @@ fn retire_old(current: &Path, keep: &HashSet<String>, control: &Control<'_>) {
             if path == current
                 || !model::is_version(&entry.file_name().to_string_lossy())
                 || keep.contains(entry.file_name().to_string_lossy().as_ref())
-                || !path.join("baseline.json").is_file()
+                || !(path.join("baseline.json").is_file() || path.join(ACTIVE).is_file())
             {
                 continue;
             }
@@ -312,4 +417,39 @@ pub fn info(original: &Baseline) -> Result<Value> {
     Ok(
         json!({"version":marker,"created":record["created"].as_str().unwrap_or("").replace('T'," "),"verified":true,"folder":original.bundle.parent(),"resource":original.bundle.file_name().unwrap().to_string_lossy(),"origin":original.origin,"version_id":original.version}),
     )
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn occupied_pointer_leaves_the_previous_generation_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("version");
+        let previous = new_generation(&destination).unwrap();
+        let newer = new_generation(&destination).unwrap();
+        publish_generation(&destination, &previous).unwrap();
+        let pointer = destination.join(ACTIVE);
+        let pointer_lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&pointer)
+            .unwrap();
+
+        let error = publish_generation(&destination, &newer).unwrap_err();
+        let crate::Error::Context { source, .. } = error else {
+            panic!("missing publication error context");
+        };
+        assert!(
+            matches!(*source, crate::Error::Io(ref io) if matches!(io.raw_os_error(), Some(5 | 32)))
+        );
+        assert_eq!(active_folder(&destination).unwrap(), previous);
+        assert!(newer.is_dir());
+
+        drop(pointer_lock);
+        publish_generation(&destination, &newer).unwrap();
+        assert_eq!(active_folder(&destination).unwrap(), newer);
+    }
 }

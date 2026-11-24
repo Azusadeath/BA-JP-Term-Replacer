@@ -67,7 +67,7 @@ pub fn baseline_plan(live: &Game, root: &Path, control: &Control<'_>) -> Result<
                 return Ok(
                     json!({"state":"repair","folder":folder,"source":source,"catalog":catalog,"marker":marker,
                 "token":{"game":storage::identity(&live.dir)?,"version":version,
-                    "live":region::resource_identity(live)?,"record":storage::revision(&folder.join("baseline.json"))?,
+                    "live":region::resource_identity(live)?,"folder":folder,"record":storage::revision(&folder.join("baseline.json"))?,
                     "catalog":storage::revision(&catalog)?,"marker":storage::revision(&marker)?,
                     "damaged_catalog":storage::revision(&folder.join("TableCatalog.bytes"))?,"damaged_marker":storage::revision(&folder.join("TableCatalog.hash"))?,
                     "source":source,"source_identity":region::source_identity(live,&source)?}}),
@@ -110,14 +110,11 @@ pub fn rebuild_baseline(
     if expected != &plan["token"] {
         return Err(invalid("游戏资源或底稿已变化，请重新尝试重建。"));
     }
-    let folder = baseline::location(live, root)?;
+    let damaged = baseline::location(live, root)?;
+    let destination = baseline::version_folder(live, root)?;
     let source = Path::new(plan["source"].as_str().unwrap());
     let version = region::version(&live.catalog)?;
-    let stage = folder.with_file_name(format!(
-        "{version}.rebuilding-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    fs::create_dir(&stage)?;
+    let stage = baseline::new_generation(&destination)?;
     let name = source.file_name().unwrap();
     baseline::copy_sync(source, &stage.join(name))?;
     baseline::copy_sync(
@@ -148,23 +145,10 @@ pub fn rebuild_baseline(
         ));
     }
     control.check()?;
-    let damaged = folder.with_file_name(format!(
-        "{version}.damaged-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    fs::rename(&folder, &damaged)?;
-    if let Err(error) = fs::rename(&stage, &folder) {
-        if let Err(rollback) = fs::rename(&damaged, &folder) {
-            return Err(invalid(format!(
-                "重建发布失败：{error}；旧底稿仍保留在 {}，恢复目录失败：{rollback}",
-                damaged.display()
-            )));
-        }
-        return Err(error.into());
-    }
+    baseline::publish_generation(&destination, &stage)?;
     let original = baseline::Baseline {
-        bundle: folder.join(name),
-        catalog: folder.join("TableCatalog.bytes"),
+        bundle: stage.join(name),
+        catalog: stage.join("TableCatalog.bytes"),
         version,
         origin: "从校验通过的原始资源重建".into(),
     };

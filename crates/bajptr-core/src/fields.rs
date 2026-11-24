@@ -41,6 +41,14 @@ pub fn parse(blob: &[u8], allow_ascii: bool) -> Result<Vec<Field<'_>>> {
     Ok(parse_with_issues(blob, allow_ascii)?.fields)
 }
 pub fn parse_with_issues(blob: &[u8], allow_ascii: bool) -> Result<Parsed<'_>> {
+    inspect(blob, allow_ascii, |_, _| {})
+}
+
+pub(crate) fn inspect(
+    blob: &[u8],
+    allow_ascii: bool,
+    mut rejected_string: impl FnMut(usize, &'static str),
+) -> Result<Parsed<'_>> {
     let invalid = |message: &str| Error::Parse(message.into());
     let n = blob.len();
     if n < 16 {
@@ -85,43 +93,52 @@ pub fn parse_with_issues(blob: &[u8], allow_ascii: bool) -> Result<Parsed<'_>> {
             }
             continue;
         }
-        let fpos = root + off;
-        if fpos + 4 > root + object {
-            continue;
+        let slot = k - 2;
+        match read_string(blob, slot, root + off, root + object) {
+            Ok(field) if (allow_ascii || has_cjk(field.text)) && !forbidden(field.text) => {
+                out.push(field)
+            }
+            Ok(_) => {}
+            Err(reason) => rejected_string(slot, reason),
         }
-        let Some(spos) = fpos.checked_add(u32_at(blob, fpos) as usize) else {
-            continue;
-        };
-        if spos < 4 || spos > n - 5 {
-            continue;
-        }
-        let size = u32_at(blob, spos) as usize;
-        if size > MAX_STRING {
-            continue;
-        }
-        let Some(end) = spos.checked_add(4 + size) else {
-            continue;
-        };
-        if end >= n || blob[end] != 0 {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(&blob[spos + 4..end]) else {
-            continue;
-        };
-        if (!allow_ascii && !has_cjk(text)) || forbidden(text) {
-            continue;
-        }
-        out.push(Field {
-            slot: k - 2,
-            fpos,
-            spos,
-            text,
-        });
     }
     Ok(Parsed {
         fields: out,
         issues,
         skipped,
+    })
+}
+
+fn read_string(
+    blob: &[u8],
+    slot: usize,
+    fpos: usize,
+    object_end: usize,
+) -> std::result::Result<Field<'_>, &'static str> {
+    if object_end - fpos < 4 {
+        return Err("字段位置超出表对象。");
+    }
+    let spos = fpos
+        .checked_add(u32_at(blob, fpos) as usize)
+        .filter(|spos| (4..=blob.len() - 5).contains(spos))
+        .ok_or("字符串位置超出记录。")?;
+    let size = u32_at(blob, spos) as usize;
+    if size > MAX_STRING {
+        return Err("字符串长度超出限制。");
+    }
+    let end = spos
+        .checked_add(4 + size)
+        .filter(|end| *end < blob.len())
+        .ok_or("字符串结束位置超出记录。")?;
+    if blob[end] != 0 {
+        return Err("字符串缺少结束标记。");
+    }
+    let text = std::str::from_utf8(&blob[spos + 4..end]).map_err(|_| "字符串不是有效的 UTF-8。")?;
+    Ok(Field {
+        slot,
+        fpos,
+        spos,
+        text,
     })
 }
 

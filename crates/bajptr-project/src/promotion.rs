@@ -173,7 +173,8 @@ fn relocate(
         let mut verified = HashSet::new();
         let exists = available.iter().any(|name| name == table);
         if exists {
-            database::visit_table(con, table, control, |row| {
+            let slots = positions.keys().map(|(_, slot)| *slot);
+            database::visit_table_with_text_slots(con, table, slots, control, |row| {
                 let address = (row.1, row.2);
                 if let Some(&position) = positions.get(&address)
                     && edits[groups[position][0]].original == row.3
@@ -405,7 +406,8 @@ pub fn plan(
         let mut outside = 0;
         let mut changed = 0;
         let mut same = true;
-        database::visit_table(con, &table, control, |row| {
+        let slots = members.iter().map(|edit| edit.slot);
+        database::visit_table_with_text_slots(con, &table, slots, control, |row| {
             let member = addresses.get(&(row.1.clone(), row.2));
             let expected = scope.apply(&row)? != row.3.as_str();
             if expected && member.is_none() {
@@ -502,7 +504,8 @@ impl Item {
         for row in &self.missing_rows {
             hits.entry(&row.3).or_default().entry(row.2).or_default();
         }
-        database::visit_table(con, &self.table, control, |row| {
+        let slots = selected.iter().map(|edit| edit.slot);
+        database::visit_table_with_text_slots(con, &self.table, slots, control, |row| {
             if let Some(addresses) = hits
                 .get_mut(row.3.as_str())
                 .and_then(|slots| slots.get_mut(&row.2))

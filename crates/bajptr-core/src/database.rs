@@ -186,8 +186,10 @@ pub struct Options {
 fn yes() -> bool {
     true
 }
+const DEFAULT_TABLES: &str =
+    "Localize|Dialog|Scenario|Subtitle|Talk|Mail|Name|Emoji|Voice|Messanger|SNSProfile";
 pub fn default_tables() -> String {
-    "Localize|Dialog|Scenario|Subtitle|Talk|Mail|Name|Emoji|Voice|Messanger|SNSProfile".into()
+    DEFAULT_TABLES.into()
 }
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -246,6 +248,11 @@ fn key_name(con: &Connection, table: &str) -> Result<String> {
     }
 }
 pub fn tables(con: &Connection, pattern: &str) -> Result<Vec<String>> {
+    let pattern = if pattern.trim().is_empty() {
+        DEFAULT_TABLES
+    } else {
+        pattern
+    };
     let regex = regex::RegexBuilder::new(pattern)
         .case_insensitive(true)
         .build()
@@ -875,8 +882,28 @@ pub fn visit_table(
     con: &Connection,
     table: &str,
     control: &Control<'_>,
+    visit: impl FnMut(TextRow) -> Result<()>,
+) -> Result<()> {
+    visit_table_with_text_slots(con, table, [], control, visit)
+}
+
+pub fn visit_table_with_text_slots(
+    con: &Connection,
+    table: &str,
+    known_slots: impl IntoIterator<Item = usize>,
+    control: &Control<'_>,
     mut visit: impl FnMut(TextRow) -> Result<()>,
 ) -> Result<()> {
+    let text_slots: std::collections::HashSet<_> = known_slots.into_iter().collect();
+    let mut readable = HashMap::<usize, usize>::new();
+    let mut rejected = HashMap::<usize, (usize, RowId, &'static str)>::new();
+    let incomplete = |rid: &RowId, slot, reason: &str| {
+        record_error(
+            table,
+            rid,
+            field_error(slot, invalid(format!("无法完整核对批量修改范围。{reason}"))),
+        )
+    };
     let key = key_name(con, table)?;
     let mut query = con.prepare(&format!(
         "SELECT {key},Bytes FROM {} ORDER BY 1",
@@ -890,16 +917,34 @@ pub fn visit_table(
             .get_ref(1)?
             .as_blob()
             .map_err(|_| invalid(format!("文本表 {table} 存在非文本记录，无法完整核对范围。")))?;
-        let parsed = fields::parse_with_issues(blob, true)
-            .map_err(|error| record_error(table, &rid, error))?;
-        if parsed.skipped > 0 {
-            return Err(invalid(format!(
-                "文本表 {table} 存在异常字段，无法完整核对批量修改范围。"
-            )));
+        // FlatBuffers vtables carry offsets without types. Scalar fields can
+        // fail the same string checks as damaged text fields.
+        let parsed = fields::inspect(blob, true, |slot, reason| {
+            rejected
+                .entry(slot)
+                .or_insert_with(|| (0, rid.clone(), reason))
+                .0 += 1;
+        })
+        .map_err(|error| record_error(table, &rid, error))?;
+        if let Some(issue) = parsed.issues.first() {
+            return Err(incomplete(&rid, issue.slot, &issue.message));
         }
         for field in parsed.fields {
+            if !field.text.is_empty() {
+                *readable.entry(field.slot).or_default() += 1;
+            }
             visit((table.into(), rid.clone(), field.slot, field.text.into()))?;
         }
+    }
+    // Scalar values occasionally point at valid strings by coincidence.
+    if let Some((slot, (_, rid, reason))) = rejected
+        .iter()
+        .filter(|(slot, (failures, _, _))| {
+            text_slots.contains(slot) || readable.get(slot).is_some_and(|count| count >= failures)
+        })
+        .min_by_key(|(slot, _)| *slot)
+    {
+        return Err(incomplete(rid, *slot, reason));
     }
     Ok(())
 }
@@ -931,6 +976,12 @@ fn field_digest<'a>(texts: impl Iterator<Item = &'a str>) -> Option<String> {
     any.then(|| format!("{:x}", hash.finalize()))
 }
 
+fn location_digest<'a>(texts: impl Iterator<Item = &'a str> + Clone) -> Option<String> {
+    // Preserve digests already stored for rows with CJK text.
+    field_digest(texts.clone().filter(|text| fields::has_cjk(text)))
+        .or_else(|| field_digest(texts.filter(|text| !text.is_empty())))
+}
+
 pub struct LocationRow {
     pub id: RowId,
     pub fields: Vec<(usize, String)>,
@@ -955,7 +1006,7 @@ impl LocationRow {
             row: (table.into(), self.id.clone(), slot, text.into()),
             context: siblings().collect::<Vec<_>>().join("\n"),
             anchor: Some(LocationAnchor {
-                siblings: field_digest(siblings()),
+                siblings: location_digest(siblings()),
                 previous: previous.map(str::to_owned),
                 next: next.map(str::to_owned),
             }),
@@ -974,7 +1025,7 @@ fn location_row(
         Ok(blob) => read_fields(blob, table, &id, diagnostics, control)?.unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let digest = field_digest(fields.iter().map(|field| field.text));
+    let digest = location_digest(fields.iter().map(|field| field.text));
     let fields = fields
         .into_iter()
         .map(|field| (field.slot, field.text.into()))
@@ -1192,7 +1243,7 @@ fn read_fields<'a>(
     diagnostics: &mut Stats,
     control: &Control<'_>,
 ) -> Result<Option<Vec<fields::Field<'a>>>> {
-    match fields::parse_with_issues(blob, false) {
+    match fields::parse_with_issues(blob, true) {
         Ok(parsed) => {
             diagnostics.fields_skipped += parsed.skipped;
             for issue in parsed.issues {
