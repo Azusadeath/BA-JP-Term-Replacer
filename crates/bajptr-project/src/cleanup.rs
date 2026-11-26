@@ -1,82 +1,100 @@
-//! Successful scratch work is deleted independently of the interactive process.
-//! Failed work stays in place for diagnosis. The helper accepts only marked scratch.
+//! Retention for complete snapshots published by the tool.
+use crate::model;
 use crate::{Control, Result, invalid, storage};
 use std::{fs, path::Path};
-const MARKER: &str = ".bajptr-scratch";
-pub fn mark(path: &Path) -> Result<()> {
-    storage::write_locked(
-        &path.join(MARKER),
-        uuid::Uuid::new_v4().simple().to_string().as_bytes(),
-    )?;
-    Ok(())
-}
-pub fn handle_mode() -> Option<i32> {
-    let args: Vec<_> = std::env::args_os().collect();
-    if !args.get(1).is_some_and(|s| s == "--retire-scratch") {
-        return None;
-    }
-    let result = (|| -> Result<()> {
-        if args.len() != 4 {
-            return Err(invalid("清理参数无效。"));
-        }
-        remove_marked(Path::new(&args[2]), &args[3].to_string_lossy())
-    })();
-    if let Err(error) = &result {
-        eprintln!("{error}");
-    }
-    Some(if result.is_ok() { 0 } else { 1 })
-}
-fn remove_marked(path: &Path, token: &str) -> Result<()> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    if !path.is_absolute()
-        || !(name.starts_with("patch-") || name.starts_with("bajptr-standalone-"))
-        || token.len() != 32
-        || !token.bytes().all(|c| c.is_ascii_hexdigit())
-        || !fs::symlink_metadata(path)?.file_type().is_dir()
-        || fs::read(path.join(MARKER))? != token.as_bytes()
-    {
-        return Err(invalid("未接受未标记的清理目录。"));
-    }
-    fs::remove_dir_all(path)?;
+const MANAGED: &str = ".bajptr-managed";
+
+pub(crate) fn mark_managed(path: &Path) -> Result<()> {
+    let files = managed_contents(path)?
+        .into_iter()
+        .map(|name| {
+            let digest = storage::file_digest(&path.join(&name))?;
+            Ok((name, digest))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    storage::write_locked(&path.join(MANAGED), &serde_json::to_vec(&files)?)?;
     Ok(())
 }
 
-pub fn remove_success(path: &Path, control: &Control<'_>) {
-    let remove = || -> Result<()> {
-        let path = std::path::absolute(path)?;
-        let token = fs::read_to_string(path.join(MARKER))?;
-        remove_marked(&path, &token)
+fn managed_contents(path: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Err(invalid("自动备份目录包含其他内容，已保留。"));
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid("文件名无效。"))?;
+        if name != MANAGED {
+            names.push(name);
+        }
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+pub(crate) fn retain_recent(
+    root: &Path,
+    prefix: &str,
+    keep: usize,
+    protected: impl Fn(&str) -> bool,
+    control: &Control<'_>,
+) {
+    let prune = || -> Result<()> {
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let file_name = name.to_string_lossy();
+            let Some(id) = file_name
+                .strip_prefix(prefix)
+                .filter(|id| model::is_version(id))
+            else {
+                continue;
+            };
+            if protected(id) || !storage::is_plain_directory(&entry.path())? {
+                continue;
+            }
+            let path = entry.path();
+            let marker = path.join(MANAGED);
+            if !fs::symlink_metadata(&marker)
+                .is_ok_and(|m| m.file_type().is_file() && m.len() <= 8192)
+            {
+                continue;
+            }
+            let Ok(files) = serde_json::from_slice::<Vec<(String, String)>>(&fs::read(&marker)?)
+            else {
+                continue;
+            };
+            if managed_contents(&path)
+                .is_ok_and(|actual| files.iter().map(|(name, _)| name).eq(actual.iter()))
+            {
+                candidates.push((entry.metadata()?.modified()?, path, files));
+            }
+        }
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        let mut removed = 0;
+        for (_, path, files) in candidates.into_iter().skip(keep) {
+            // Verify an expired directory still contains exactly the files published by the tool.
+            if files.iter().all(|(name, digest)| {
+                storage::file_digest(&path.join(name)).is_ok_and(|actual| &actual == digest)
+            }) {
+                fs::remove_dir_all(&path)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            let _ = control.log(&format!(
+                "已清理 {} 下的 {removed} 份过期自动备份。",
+                root.display()
+            ));
+        }
+        Ok(())
     };
-    let spawn = (|| -> Result<bool> {
-        let exe = std::env::current_exe()?;
-        // Test harnesses clean up synchronously.
-        if !matches!(
-            exe.file_stem().and_then(|s| s.to_str()),
-            Some("bajptr-desktop" | "bajptr-rs")
-        ) {
-            return Ok(false);
-        }
-        let token = fs::read_to_string(path.join(MARKER))?;
-        let mut command = std::process::Command::new(exe);
-        command
-            .arg("--retire-scratch")
-            .arg(std::path::absolute(path)?)
-            .arg(token)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        command.spawn()?;
-        Ok(true)
-    })();
-    if !matches!(spawn, Ok(true))
-        && let Err(error) = remove()
-    {
-        let _ = control.warn(&format!("临时目录清理失败 {}：{error}", path.display()));
+    if let Err(error) = prune() {
+        let _ = control.warn(&format!("自动备份清理未完成 {}：{error}", root.display()));
     }
 }
 
@@ -85,17 +103,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scratch_cleanup_requires_the_matching_marker() {
+    fn retention_respects_references_and_user_changes() {
         let root = tempfile::tempdir().unwrap();
-        let scratch = root.path().join("patch-test");
-        fs::create_dir(&scratch).unwrap();
-        fs::write(scratch.join("working.db"), b"temporary").unwrap();
-        assert!(remove_marked(&scratch, &"0".repeat(32)).is_err());
-        assert!(scratch.join("working.db").is_file());
-
-        mark(&scratch).unwrap();
-        let token = fs::read_to_string(scratch.join(MARKER)).unwrap();
-        remove_marked(&scratch, &token).unwrap();
-        assert!(!scratch.exists());
+        let paths: Vec<_> = (0..5)
+            .map(|index| root.path().join(format!("snapshot-{index:064x}")))
+            .collect();
+        for path in &paths {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("data"), b"snapshot").unwrap();
+        }
+        for path in &paths[..4] {
+            mark_managed(path).unwrap();
+        }
+        fs::write(paths[2].join("data"), b"user change").unwrap();
+        fs::write(paths[3].join("notes"), b"added file").unwrap();
+        retain_recent(
+            root.path(),
+            "snapshot-",
+            0,
+            |id| id.ends_with('1'),
+            &Control::new(&|_| true),
+        );
+        assert!(!paths[0].exists());
+        assert!(paths[1..].iter().all(|path| path.is_dir()));
     }
 }

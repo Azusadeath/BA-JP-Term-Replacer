@@ -19,6 +19,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 fn nonce() -> String {
     uuid::Uuid::new_v4().simple().to_string()
@@ -37,15 +38,52 @@ fn index(value: &Value, key: &str) -> Result<usize> {
 #[derive(Clone)]
 enum Document {
     Rules(Vec<Rule>),
-    Edits(Vec<Edit>),
-    Replacements(Vec<Rule>, Vec<Edit>),
+    Edits(Arc<Vec<Edit>>),
+    Replacements(Vec<Rule>, Arc<Vec<Edit>>),
+}
+#[derive(Clone)]
+pub struct EditSnapshot {
+    entries: Arc<Vec<Edit>>,
+    game: String,
+    version: Option<String>,
+}
+impl EditSnapshot {
+    pub fn same_context(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entries, &other.entries)
+            && self.game == other.game
+            && self.version == other.version
+    }
+    fn active(&self, edit: &Edit) -> bool {
+        self.version
+            .as_deref()
+            .is_none_or(|version| version == edit.version.as_ref())
+    }
+    pub fn inactive_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|edit| edit.game.as_ref() == self.game && !self.active(edit))
+            .count()
+    }
+    pub fn has_active(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|edit| edit.game.as_ref() == self.game && self.active(edit))
+    }
+    pub fn rows(&self) -> Vec<Value> {
+        self.entries.iter().enumerate()
+            .filter(|(_, edit)| edit.game.as_ref() == self.game)
+            .map(|(index, edit)| json!({"index":index,"edit":edit,"label":model::title(&edit.table),"active":self.active(edit)}))
+            .collect()
+    }
 }
 pub struct Project {
     pub data: PathBuf,
     pub store: Store,
     pub engine: Engine,
     pub rules: Vec<Rule>,
-    pub edits: Vec<Edit>,
+    compiled: RefCell<Arc<Rules>>,
+    pub edits: Arc<Vec<Edit>>,
+    pub(crate) shared_edit_state: bool,
     pub game: String,
     sort: Sort,
     times: Timeline,
@@ -76,12 +114,15 @@ pub struct Project {
 impl Project {
     pub fn new(data: PathBuf) -> Self {
         let root = data.join(".gui");
+        let engine = Engine::with_work(data.join("work"));
         Self {
             data,
             store: Store::new(root.clone()),
-            engine: Engine::default(),
+            engine,
             rules: vec![],
-            edits: vec![],
+            compiled: RefCell::new(Arc::new(Rules::default())),
+            edits: Arc::default(),
+            shared_edit_state: false,
             game: String::new(),
             sort: Sort::default(),
             times: Timeline::default(),
@@ -110,11 +151,18 @@ impl Project {
             source_current: None,
         }
     }
-    fn config(&self) -> Config {
-        let mut c = Config::new(self.rules.clone(), self.edits.clone());
-        c.rules_path = Some(self.store.root.join("rules.tsv"));
-        c.edits_path = Some(self.store.root.join("text-edits.json"));
-        c
+    fn compiled_rules(&self) -> Result<Arc<Rules>> {
+        let mut compiled = self.compiled.borrow_mut();
+        if compiled.values != self.rules {
+            *compiled = Arc::new(Rules::new(self.rules.clone())?);
+        }
+        Ok(compiled.clone())
+    }
+    fn config(&self) -> Result<Config> {
+        Ok(
+            Config::from_shared_edits(self.rules.clone(), self.edits.clone())
+                .with_documents(&self.store, self.compiled_rules()?),
+        )
     }
     fn load(&mut self, control: &Control<'_>) -> Result<Value> {
         control.check()?;
@@ -143,8 +191,14 @@ impl Project {
             }
         }
         control.check()?;
-        match self.store.load("rules.tsv", model::parse_rules, vec![]) {
-            Ok(v) => self.rules = v,
+        match self
+            .store
+            .load("rules.tsv", model::parse_compiled_rules, Rules::default())
+        {
+            Ok(rules) => {
+                self.rules.clone_from(&rules.values);
+                *self.compiled.get_mut() = Arc::new(rules);
+            }
             Err(e) => self.errors["rules.tsv"] = json!(e.to_string()),
         }
         control.check()?;
@@ -152,7 +206,7 @@ impl Project {
             .store
             .load("text-edits.json", model::parse_edits, vec![])
         {
-            Ok(v) => self.edits = v,
+            Ok(v) => self.edits = Arc::new(v),
             Err(e) => self.errors["text-edits.json"] = json!(e.to_string()),
         }
         control.check()?;
@@ -254,14 +308,20 @@ impl Project {
         self.require(None)?;
         let previous = match document {
             Document::Replacements(rules, edits) => {
-                let rules = model::normalize(rules)?;
-                let rule_bytes = model::rules_bytes(&rules)?;
+                let rules = model::normalize_scopes(rules)?;
+                let compiled = if rules == self.rules {
+                    self.compiled_rules()?
+                } else {
+                    Arc::new(Rules::new(rules.clone())?)
+                };
+                let rule_bytes = model::normalized_rules_bytes(&rules);
                 let edit_bytes = model::edits_bytes(&edits)?;
                 if rules == self.rules && edits == self.edits {
                     return Ok(());
                 }
                 control.check()?;
                 self.store.save_replacements(&rule_bytes, &edit_bytes)?;
+                *self.compiled.get_mut() = compiled;
                 Document::Replacements(
                     std::mem::replace(&mut self.rules, rules),
                     std::mem::replace(&mut self.edits, edits),
@@ -271,14 +331,20 @@ impl Project {
                 let values = if let Some(names) = &self.source_current {
                     sources::freeze(&values, &names.iter().cloned().collect())?
                 } else {
-                    model::normalize(values)?
+                    model::normalize_scopes(values)?
                 };
-                let bytes = model::rules_bytes(&values)?;
+                let compiled = if values == self.rules {
+                    self.compiled_rules()?
+                } else {
+                    Arc::new(Rules::new(values.clone())?)
+                };
+                let bytes = model::normalized_rules_bytes(&values);
                 control.check()?;
                 self.store.save("rules.tsv", &bytes)?;
                 if values == self.rules {
                     return Ok(());
                 }
+                *self.compiled.get_mut() = compiled;
                 Document::Rules(std::mem::replace(&mut self.rules, values))
             }
             Document::Edits(values) => {
@@ -300,6 +366,38 @@ impl Project {
         }
         self.changed();
         Ok(())
+    }
+    fn prune_migration_snapshots(&self, latest: &str, control: &Control<'_>) {
+        let root = &self.store.root;
+        let prune = || -> Result<()> {
+            let _lock = storage::Lock::acquire(&root.join("text-edits.json"))?;
+            self.store.check("text-edits.json")?;
+            let referenced: std::collections::HashSet<_> =
+                std::iter::once(self.edits.as_slice())
+                    .chain(self.undo.iter().chain(&self.redo).filter_map(
+                        |document| match document {
+                            Document::Edits(edits) | Document::Replacements(_, edits) => {
+                                Some(edits.as_slice())
+                            }
+                            Document::Rules(_) => None,
+                        },
+                    ))
+                    .flatten()
+                    .filter_map(|edit| edit.batch_operation.as_ref()?.previous_scope.as_ref())
+                    .map(|scope| scope.snapshot.as_str())
+                    .collect();
+            let archived = crate::backup::archived_migration_references(root)?;
+            crate::backup::retain_recent(
+                root,
+                "migration-",
+                |id| id == latest || referenced.contains(id) || archived.contains(id),
+                control,
+            );
+            Ok(())
+        };
+        if let Err(error) = prune() {
+            let _ = control.warn(&format!("迁移备份清理未完成：{error}"));
+        }
     }
     fn current_version(&mut self, control: &Control<'_>) -> Result<String> {
         let baseline = self
@@ -384,13 +482,18 @@ impl Project {
             notices: vec![],
         });
         let values = sources::freeze(&self.rules, &history.known)?;
+        let compiled = if values == self.rules {
+            self.compiled_rules()?
+        } else {
+            Arc::new(Rules::new(values.clone())?)
+        };
         let added: Vec<_> = current.difference(&history.known).cloned().collect();
         if !added.is_empty() && !values.is_empty() {
             let matches = self.engine.source_rule_matches(
                 &self.game,
                 &self.data.join("backup"),
                 &added,
-                &values,
+                &compiled,
                 control,
             )?;
             for found in matches {
@@ -425,9 +528,12 @@ impl Project {
             if !recovery.exists() {
                 storage::atomic_write(&recovery, &bytes, Some(&None))?;
             }
-            self.store
-                .save_sources(&model::rules_bytes(&values)?, &serde_json::to_vec(&next)?)?;
+            self.store.save_sources(
+                &model::normalized_rules_bytes(&values),
+                &serde_json::to_vec(&next)?,
+            )?;
             self.rules = values;
+            *self.compiled.get_mut() = compiled;
             // Migration is a compatibility conversion, not an undoable rule edit.
             self.undo.clear();
             self.redo.clear();
@@ -472,7 +578,7 @@ impl Project {
             .as_ref()
             .map(|(_, value)| value["rows"].as_array().cloned().unwrap_or_default())
             .unwrap_or_default();
-        let rules = Rules::new(self.rules.clone())?;
+        let rules = self.compiled_rules()?;
         let key = model::game_key(&self.game)?;
         let version = text(&self.search, "version")?;
         let rows: Vec<TextRow> = self.search["rows"]
@@ -501,7 +607,7 @@ impl Project {
             .edits
             .iter()
             .filter(|e| {
-                e.game == game
+                e.game.as_ref() == game
                     && e.batch_operation
                         .as_ref()
                         .is_some_and(|operation| operation.id == id)
@@ -513,41 +619,59 @@ impl Project {
         }
         Ok(entries)
     }
+    pub(crate) fn edit_snapshot(&self, game: String) -> EditSnapshot {
+        EditSnapshot {
+            entries: self.edits.clone(),
+            game,
+            version: self.version.clone(),
+        }
+    }
     pub fn state(&self) -> Result<Value> {
         let rules=self.rules.iter().enumerate().map(|(index,r)|{let stamp=self.times.rules.get(index).cloned().unwrap_or_default();let (old,new,draft)=if r.mode=="re"{self.templates.display(&r.old,&r.new)}else{(r.old.clone(),r.new.clone(),None)};json!({"rule":r,"scope":if r.table.is_empty(){"待选择文本表".into()}else{model::scope_title(&r.table)},"display_old":old,"display_new":new,"draft":draft,"added":stamp.added,"modified":stamp.modified})}).collect::<Vec<_>>();
         let key = model::game_key(&self.game)?;
-        let edits=self.edits.iter().enumerate().filter(|(_,e)|e.game==key).map(|(i,e)|json!({"index":i,"edit":e,"label":model::title(&e.table),"active":self.version.as_ref().is_none_or(|v|v==&e.version)})).collect::<Vec<_>>();
+        let edits = if self.shared_edit_state {
+            Value::Null
+        } else {
+            Value::Array(self.edit_snapshot(key.clone()).rows())
+        };
         let mut batches: Vec<Value> = Vec::new();
         let mut positions = std::collections::HashMap::new();
         for (index, edit) in self
             .edits
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.game == key && e.batch)
+            .filter(|(_, e)| e.game.as_ref() == key && e.batch)
         {
+            let active = self
+                .version
+                .as_ref()
+                .is_none_or(|v| v == edit.version.as_ref());
+            if let Some(operation) = &edit.batch_operation
+                && let Some(&position) = positions.get(&operation.id)
+            {
+                let row: &mut Value = &mut batches[position];
+                row["count"] = json!(row["count"].as_u64().unwrap_or(0) + 1);
+                row["active"] = json!(row["active"] == true && active);
+                continue;
+            }
             let stamp = self
                 .times
                 .batches
                 .get(&crate::ordering::batch_key(edit))
                 .cloned()
                 .unwrap_or_default();
-            let active = self.version.as_ref().is_none_or(|v| v == &edit.version);
             if let Some(operation) = &edit.batch_operation {
-                if let Some(&position) = positions.get(&operation.id) {
-                    let row: &mut Value = &mut batches[position];
-                    row["count"] = json!(row["count"].as_u64().unwrap_or(0) + 1);
-                    row["active"] = json!(row["active"] == true && active);
-                } else {
-                    positions.insert(operation.id.clone(), batches.len());
-                    batches.push(json!({"id":operation.id,"old":operation.old,"new":operation.new,"count":1,"active":active,"version":edit.version,"added":stamp.added,"modified":stamp.modified}));
-                }
+                positions.insert(&operation.id, batches.len());
+                batches.push(json!({"id":operation.id,"old":operation.old,"new":operation.new,"count":1,"active":active,"version":edit.version,"added":stamp.added,"modified":stamp.modified}));
             } else {
                 batches.push(json!({"index":index,"old":edit.original,"new":edit.replacement,"count":1,"active":active,"label":model::title(&edit.table),"added":stamp.added,"modified":stamp.modified}));
             }
         }
-        Ok(
-            json!({"game":self.game,"version":self.version,"replacement_sort":self.sort,"revision":self.revision,"rules":rules,"edits":edits,"batches":batches,"errors":self.errors,"messages":self.messages,"settings_warning":self.settings_warning,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"templates":templates::metadata(),"search":self.search_state()?,"application":self.application,"source_notices":self.source_notices()?}),
-        )
+        let mut state = json!({"game":self.game,"version":self.version,"replacement_sort":self.sort,"revision":self.revision,"rules":rules,"edits":edits,"batches":batches,"errors":self.errors,"messages":self.messages,"settings_warning":self.settings_warning,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"templates":templates::metadata(),"search":self.search_state()?,"application":self.application,"source_notices":self.source_notices()?});
+        if self.shared_edit_state {
+            state["edit_game_key"] = json!(key);
+        }
+        Ok(state)
     }
     // Only read-operation state is rolled back by cancellation. Persisted edits are never rolled back.
     pub fn snapshot(&self) -> Value {
@@ -686,9 +810,19 @@ impl Project {
                 let commit = control.uncancellable();
                 let recovery = current.archive(&self.store.root, &commit)?;
                 self.store.restore_workspace(&documents, &expected)?;
+                crate::backup::retain_recent(
+                    &self.store.root,
+                    "before-backup-restore-",
+                    |id| {
+                        recovery.file_name().is_some_and(|name| {
+                            name == std::ffi::OsStr::new(&format!("before-backup-restore-{id}"))
+                        })
+                    },
+                    &commit,
+                );
                 self.engine.close();
                 self.rules = decoded.rules;
-                self.edits = decoded.edits;
+                self.edits = Arc::new(decoded.edits);
                 self.game = decoded.settings["game"].as_str().unwrap_or("").into();
                 self.sort = serde_json::from_value(
                     decoded
@@ -763,7 +897,7 @@ impl Project {
                 let version = self.current_version(control)?;
                 let plan =
                     self.engine
-                        .promotion_plan(&self.game, &self.data, &self.config(), control)?;
+                        .promotion_plan(&self.game, &self.data, &self.config()?, control)?;
                 let current = self.engine.baseline_status(
                     &self.game,
                     &self.data.join("backup"),
@@ -857,8 +991,8 @@ impl Project {
                     return Err(invalid("底稿或游戏资源已变化，请重新整理。"));
                 }
                 let rules = serde_json::from_value(draft["rules"].clone())?;
-                let edits = serde_json::from_value(draft["edits"].clone())?;
-                let mut originals = Vec::new();
+                let edits: Vec<Edit> = serde_json::from_value(draft["edits"].clone())?;
+                let mut originals = std::collections::BTreeMap::new();
                 for name in ["rules.tsv", "text-edits.json"] {
                     self.store.check(name)?;
                     let bytes = match fs::read(self.store.root.join(name)) {
@@ -866,29 +1000,28 @@ impl Project {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                         Err(error) => return Err(error.into()),
                     };
-                    originals.push((name, bytes));
+                    originals.insert(name.to_owned(), bytes);
                 }
+                let snapshot = crate::backup::Snapshot { files: originals };
+                let id = storage::serialized_digest(&(
+                    &draft["game"],
+                    &draft["version"],
+                    snapshot.ordered_revisions(),
+                ))?;
                 control.check()?;
                 let commit = control.uncancellable();
-                let backup = self
-                    .store
-                    .root
-                    .join("recovery")
-                    .join(format!("batch-promotion-{}", nonce()));
-                fs::create_dir_all(&backup)?;
-                for (name, bytes) in &originals {
-                    if let Some(bytes) = bytes {
-                        storage::atomic_write(&backup.join(name), bytes, Some(&None))?;
-                    }
-                }
-                storage::atomic_write(
-                    &backup.join("info.json"),
-                    &serde_json::to_vec_pretty(
-                        &json!({"format":1,"game":draft["game"],"version":draft["version"],"files":originals.iter().map(|(name,bytes)|json!({"name":name,"existed":bytes.is_some()})).collect::<Vec<_>>()}),
-                    )?,
-                    Some(&None),
+                let backup = snapshot.archive_as(
+                    &self.store.root, "batch-promotion-", &id,
+                    json!({"kind":"batch-promotion","game":draft["game"],"version":draft["version"],"migration_snapshots":crate::backup::migration_references(&self.edits)}),
+                    &commit,
                 )?;
-                self.commit_controlled(Document::Replacements(rules, edits), true, &commit)?;
+                self.commit_controlled(Document::Replacements(rules, edits.into()), true, &commit)?;
+                crate::backup::retain_recent(
+                    &self.store.root,
+                    "batch-promotion-",
+                    |key| key == id,
+                    &commit,
+                );
                 self.promotion_draft = Value::Null;
                 Ok(
                     json!({"state":self.state()?,"count":draft["count"],"relocated":draft["relocated"],"backup":backup}),
@@ -952,7 +1085,7 @@ impl Project {
                         removed,
                     },
                 )?;
-                self.commit_controlled(Document::Replacements(rules, edits), true, control)?;
+                self.commit_controlled(Document::Replacements(rules, edits.into()), true, control)?;
                 self.combined_draft = Value::Null;
                 self.state()
             }
@@ -977,7 +1110,7 @@ impl Project {
                 if rules.len() == self.rules.len() || edits.len() == self.edits.len() {
                     return Err(invalid("合并替换已变化，请重新选择。"));
                 }
-                self.commit_controlled(Document::Replacements(rules, edits), true, control)?;
+                self.commit_controlled(Document::Replacements(rules, edits.into()), true, control)?;
                 self.state()
             }
             "baseline_rebuild_preview" => {
@@ -1023,7 +1156,7 @@ impl Project {
                 let archived = self.store.archive_failed(name)?;
                 match name {
                     "rules.tsv" => self.rules.clear(),
-                    "text-edits.json" => self.edits.clear(),
+                    "text-edits.json" => self.edits = Arc::default(),
                     "source-history.json" => {
                         self.source_history = Sources::default();
                         self.source_current = None;
@@ -1041,6 +1174,7 @@ impl Project {
             }
             "load" => {
                 let mut loaded = Self::new(self.data.clone());
+                loaded.shared_edit_state = self.shared_edit_state;
                 let state = loaded.load(control)?;
                 control.check()?;
                 *self = loaded;
@@ -1096,10 +1230,10 @@ impl Project {
                 self.version = status["baseline"]["version_id"]
                     .as_str()
                     .map(str::to_string);
-                self.application = service::status(&self.game, &self.data, &self.config())?;
+                self.application = service::status(&self.game, &self.data, &self.config()?)?;
                 let key = model::game_key(&self.game)?;
                 Ok(
-                    json!({"connected":status["state"] == "ready","application":self.application,"baseline_status":status,"migration_count":self.edits.iter().filter(|e|e.game==key && self.version.as_ref().is_some_and(|v|v!=&e.version)).count()}),
+                    json!({"connected":status["state"] == "ready","application":self.application,"baseline_status":status,"migration_count":self.edits.iter().filter(|e|e.game.as_ref() ==key && self.version.as_ref().is_some_and(|v|v!=e.version.as_ref())).count()}),
                 )
             }
             "baseline_commit" => {
@@ -1112,9 +1246,10 @@ impl Project {
                     .edits
                     .iter()
                     .filter(|e| {
-                        e.game == game && (e.anchor.is_none() || e.batch_operation.is_some())
+                        e.game.as_ref() == game
+                            && (e.anchor.is_none() || e.batch_operation.is_some())
                     })
-                    .map(|e| e.version.clone())
+                    .map(|e| e.version.to_string())
                     .collect();
                 let original = self.engine.initialize_for_edits(
                     &self.game,
@@ -1146,7 +1281,7 @@ impl Project {
                     &self.data,
                     control,
                 )?;
-                let mut source = self.edits.clone();
+                let mut source = self.edits.as_ref().clone();
                 self.engine.migration_source_anchors(
                     &self.game,
                     &self.data.join("backup"),
@@ -1155,7 +1290,7 @@ impl Project {
                 )?;
                 let existing: Vec<_> = source
                     .iter()
-                    .filter(|e| e.game == game && e.version != version)
+                    .filter(|e| e.game.as_ref() == game && e.version.as_ref() != version)
                     .cloned()
                     .collect();
                 let located = self.engine.migration_candidates(
@@ -1176,7 +1311,7 @@ impl Project {
                 {
                     return Err(invalid("底稿已变化，请重新检查后核对迁移。"));
                 }
-                let rules = Rules::new(self.rules.clone())?;
+                let rules = self.compiled_rules()?;
                 let items = migration::plan_candidates(
                     &source, &game, &version, &located, &rules, control,
                 )?;
@@ -1258,15 +1393,15 @@ impl Project {
                 if status["state"] != "ready" || status["token"] != token {
                     return Err(invalid("底稿或游戏资源已变化，请重新核对迁移。"));
                 }
-                let rules = Rules::new(self.rules.clone())?;
+                let rules = self.compiled_rules()?;
                 let layers: Vec<_> = item.indices.iter().map(|&i| &self.edits[i]).collect();
                 let mut added = 0;
                 let mut occupied = 0;
                 for candidate in candidates.into_iter().flatten() {
                     if self.edits.iter().any(|e| {
-                        e.game == game
-                            && e.version == version
-                            && e.table == candidate.row.0
+                        e.game.as_ref() == game
+                            && e.version.as_ref() == version
+                            && e.table.as_ref() == candidate.row.0
                             && e.row_id == candidate.row.1
                             && e.slot == candidate.row.2
                     }) {
@@ -1311,7 +1446,7 @@ impl Project {
                 let choices =
                     serde_json::from_value::<Vec<migration::Choice>>(p["choices"].clone())?;
                 self.store.check("rules.tsv")?;
-                let rules = Rules::new(self.rules.clone())?;
+                let rules = self.compiled_rules()?;
                 self.store.check("text-edits.json")?;
                 let bytes = fs::read(self.store.root.join("text-edits.json"))?;
                 let digest = storage::digest(&bytes);
@@ -1323,20 +1458,22 @@ impl Project {
                     (text(&draft, "version")?, Some(&digest)),
                     &rules,
                 )?;
-                let backup = self.store.root.join(format!(
-                    "text-edits-before-migration-{}.json",
-                    &digest[..16]
-                ));
                 control.check()?;
                 let commit = control.uncancellable();
-                if backup.exists() {
-                    if fs::read(&backup)? != bytes {
-                        return Err(invalid("迁移备份与原记录不一致，未保存。"));
-                    }
-                } else {
-                    storage::atomic_write(&backup, &bytes, Some(&None))?;
-                }
-                self.commit_controlled(Document::Edits(edits), true, &commit)?;
+                let snapshot = crate::backup::Snapshot {
+                    files: [("text-edits.json".into(), Some(bytes))].into(),
+                };
+                let backup = snapshot
+                    .archive_as(
+                        &self.store.root,
+                        "migration-",
+                        &digest,
+                        json!({"kind":"migration"}),
+                        &commit,
+                    )?
+                    .join("text-edits.json");
+                self.commit_controlled(Document::Edits(edits.into()), true, &commit)?;
+                self.prune_migration_snapshots(&digest, &commit);
                 Ok(json!({"state":self.state()?,"count":choices.len(),"backup":backup}))
             }
             "sources" => self.synchronize_sources(control),
@@ -1453,7 +1590,7 @@ impl Project {
             }
             "export_rules" => {
                 self.require(None)?;
-                let bytes = model::rules_bytes(&self.rules)?;
+                let bytes = model::normalized_rules_bytes(&self.rules);
                 control.check()?;
                 storage::atomic_write(Path::new(text(p, "path")?), &bytes, None)?;
                 Ok(json!({"message":"词表已导出。"}))
@@ -1521,13 +1658,13 @@ impl Project {
                         .edits
                         .get(index(p, "edit_index")?)
                         .ok_or_else(|| invalid("修改位置已变化。"))?;
-                    if e.game != model::game_key(&self.game)? {
+                    if e.game.as_ref() != model::game_key(&self.game)? {
                         return Err(invalid("这项修改不属于当前游戏。"));
                     }
                     (
-                        e.version.clone(),
+                        e.version.to_string(),
                         (
-                            e.table.clone(),
+                            e.table.to_string(),
                             e.row_id.clone(),
                             e.slot,
                             e.original.clone(),
@@ -1551,9 +1688,9 @@ impl Project {
                     .edits
                     .iter()
                     .filter(|e| {
-                        e.game == key
-                            && e.version == version
-                            && e.table == row.0
+                        e.game.as_ref() == key
+                            && e.version.as_ref() == version
+                            && e.table.as_ref() == row.0
                             && e.row_id == row.1
                             && e.slot == row.2
                     })
@@ -1567,7 +1704,7 @@ impl Project {
                     &self.edits,
                     &model::game_key(&self.game)?,
                     &version,
-                    &Rules::new(self.rules.clone())?,
+                    self.compiled_rules()?.as_ref(),
                 )?;
                 if !batch && let Some(batch_edit) = grouped_batch {
                     value = single.map(|e| e.replacement.clone()).unwrap_or_else(|| {
@@ -1602,9 +1739,9 @@ impl Project {
                         .flatten()
                         .and_then(|entry| entry.anchor);
                     let e = Edit {
-                        game: model::game_key(&self.game)?,
+                        game: model::game_key(&self.game)?.into(),
                         version: version.into(),
-                        table: row.0,
+                        table: row.0.into(),
                         row_id: row.1,
                         slot: row.2,
                         original: row.3,
@@ -1614,7 +1751,7 @@ impl Project {
                         anchor,
                     };
                     self.commit(
-                        Document::Edits(model::update_edits(&self.edits, vec![e])?),
+                        Document::Edits(model::update_edits(&self.edits, vec![e])?.into()),
                         true,
                     )?;
                 }
@@ -1677,12 +1814,12 @@ impl Project {
                     )
                 } else if let Some(entries) = &existing {
                     (
-                        entries[0].version.clone(),
+                        entries[0].version.to_string(),
                         entries
                             .iter()
                             .map(|e| {
                                 (
-                                    e.table.clone(),
+                                    e.table.to_string(),
                                     e.row_id.clone(),
                                     e.slot,
                                     e.original.clone(),
@@ -1714,12 +1851,12 @@ impl Project {
                 if existing.is_some() && indices != (0..rows.len()).collect::<Vec<_>>() {
                     return Err(invalid("批量修改的范围已变化，请重新打开。"));
                 }
-                let rules = Rules::new(self.rules.clone())?;
+                let rules = self.compiled_rules()?;
                 let key = model::game_key(&self.game)?;
                 let matching: Vec<_> = self
                     .edits
                     .iter()
-                    .filter(|e| e.game == key && e.version == version)
+                    .filter(|e| e.game.as_ref() == key && e.version.as_ref() == version)
                     .filter_map(|e| {
                         e.batch_operation
                             .as_ref()
@@ -1729,7 +1866,7 @@ impl Project {
                     .collect();
                 let operation_id = matching
                     .iter()
-                    .find(|(edit, _)| !is_supplement || edit.table == rows[0].0)
+                    .find(|(edit, _)| !is_supplement || edit.table.as_ref() == rows[0].0)
                     .map(|(_, operation)| operation.id.clone())
                     .unwrap_or_else(|| {
                         if group_id.is_empty() {
@@ -1759,7 +1896,9 @@ impl Project {
                             matching
                                 .iter()
                                 .find(|(e, _)| {
-                                    e.table == row.0 && e.row_id == row.1 && e.slot == row.2
+                                    e.table.as_ref() == row.0
+                                        && e.row_id == row.1
+                                        && e.slot == row.2
                                 })
                                 .map(|(_, operation)| *operation)
                         });
@@ -1773,9 +1912,9 @@ impl Project {
                     {
                         changes.push(json!({"label":model::title(&row.0),"row_id":row.1,"slot":row.2,"before":before,"after":after}));
                         updates.push(Edit {
-                            game: key.clone(),
-                            version: version.clone(),
-                            table: row.0.clone(),
+                            game: key.as_str().into(),
+                            version: version.as_str().into(),
+                            table: row.0.as_str().into(),
                             row_id: row.1.clone(),
                             slot: row.2,
                             original: row.3.clone(),
@@ -1804,8 +1943,8 @@ impl Project {
                 if !is_supplement {
                     // Saving the same replacement extends its selected scope while retaining each member's base text.
                     for edit in &mut edits {
-                        if edit.game == key
-                            && edit.version == version
+                        if edit.game.as_ref() == key
+                            && edit.version.as_ref() == version
                             && let Some(operation) = &mut edit.batch_operation
                             && operation.old == old
                             && operation.new == new
@@ -1850,12 +1989,16 @@ impl Project {
                 let pending: Vec<_> = edits
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| e.game == game && e.version == version && e.anchor.is_none())
+                    .filter(|(_, e)| {
+                        e.game.as_ref() == game
+                            && e.version.as_ref() == version
+                            && e.anchor.is_none()
+                    })
                     .map(|(i, e)| {
                         (
                             i,
                             (
-                                e.table.clone(),
+                                e.table.to_string(),
                                 e.row_id.clone(),
                                 e.slot,
                                 e.original.clone(),
@@ -1875,7 +2018,7 @@ impl Project {
                         edits[i].anchor = entry.and_then(|entry| entry.anchor);
                     }
                 }
-                self.commit(Document::Edits(edits), true)?;
+                self.commit(Document::Edits(edits.into()), true)?;
                 self.state()
             }
             "remove_batch_member" => {
@@ -1889,7 +2032,7 @@ impl Project {
                     .edits
                     .get(i)
                     .ok_or_else(|| invalid("该文本段已变化，请重新打开范围。"))?;
-                if entry.game != model::game_key(&self.game)?
+                if entry.game.as_ref() != model::game_key(&self.game)?
                     || !entry.batch
                     || !entry
                         .batch_operation
@@ -1898,9 +2041,9 @@ impl Project {
                 {
                     return Err(invalid("该文本段不属于这项批量修改，未移除任何记录。"));
                 }
-                let mut values = self.edits.clone();
+                let mut values = self.edits.as_ref().clone();
                 values.remove(i);
-                self.commit(Document::Edits(values), true)?;
+                self.commit(Document::Edits(values.into()), true)?;
                 self.state()
             }
             "remove_batch" => {
@@ -1908,11 +2051,11 @@ impl Project {
                 let id = text(p, "id")?;
                 self.batch_entries(id)?;
                 let game = model::game_key(&self.game)?;
-                let values = self
+                let values: Vec<Edit> = self
                     .edits
                     .iter()
                     .filter(|e| {
-                        e.game != game
+                        e.game.as_ref() != game
                             || !e
                                 .batch_operation
                                 .as_ref()
@@ -1920,12 +2063,12 @@ impl Project {
                     })
                     .cloned()
                     .collect();
-                self.commit(Document::Edits(values), true)?;
+                self.commit(Document::Edits(values.into()), true)?;
                 self.state()
             }
             "remove_edit" => {
                 self.require(p.get("revision"))?;
-                let mut values = self.edits.clone();
+                let mut values = self.edits.as_ref().clone();
                 let i = index(p, "index")?;
                 if i >= values.len() {
                     return Err(invalid("修改位置已变化。"));
@@ -1933,7 +2076,7 @@ impl Project {
                 let removed = values.remove(i);
                 if !removed.batch {
                     let row = (
-                        removed.table.clone(),
+                        removed.table.to_string(),
                         removed.row_id.clone(),
                         removed.slot,
                         removed.original.clone(),
@@ -1943,7 +2086,7 @@ impl Project {
                         &[],
                         &removed.game,
                         &removed.version,
-                        &Rules::new(self.rules.clone())?,
+                        self.compiled_rules()?.as_ref(),
                     )?
                     .0;
                     for batch in values
@@ -1956,14 +2099,14 @@ impl Project {
                         }
                     }
                 }
-                self.commit(Document::Edits(values), true)?;
+                self.commit(Document::Edits(values.into()), true)?;
                 self.state()
             }
             "preview" => {
                 self.require(None)?;
-                let stats = self
-                    .engine
-                    .preview(&self.game, &self.data, &self.config(), control)?;
+                let stats =
+                    self.engine
+                        .preview(&self.game, &self.data, &self.config()?, control)?;
                 self.application = if stats["parse_failed"] != 0 {
                     "预览存在错误，无法核对应用状态"
                 } else if service::total(&stats) == 0 {
@@ -1991,7 +2134,7 @@ impl Project {
                 if count == 0 || draft["stats"]["parse_failed"] != 0 {
                     return Err(invalid("当前预览无法应用，请检查结果。"));
                 }
-                let config = self.config();
+                let config = self.config()?;
                 let backup_root = self.data.join("backup");
                 let output_root = self.data.join("output");
                 let job = PatchJob {

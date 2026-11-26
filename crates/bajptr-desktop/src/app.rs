@@ -1,5 +1,6 @@
 pub use crate::theme::*;
 use crate::{state::*, transport::Backend};
+use bajptr_project::{desktop::EditSnapshot, worker::DesktopEvent};
 use eframe::egui::{self, Color32, RichText};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -24,6 +25,8 @@ pub struct Desktop {
     pub obsolete: HashSet<u64>,
     pub busy: Option<Busy>,
     pub state: Arc<Value>,
+    edit_snapshot: Option<EditSnapshot>,
+    edit_rows: std::cell::OnceCell<Arc<Vec<Value>>>,
     pub loaded: bool,
     pub connected: bool,
     pub game: String,
@@ -121,6 +124,8 @@ impl Desktop {
             obsolete: HashSet::new(),
             busy: None,
             state: Value::Null.into(),
+            edit_snapshot: None,
+            edit_rows: std::cell::OnceCell::new(),
             loaded: false,
             connected: false,
             game: String::new(),
@@ -478,7 +483,19 @@ impl Desktop {
             "正在保存设置…",
         );
     }
+    #[cfg(test)]
     pub fn apply_state(&mut self, value: Value) {
+        self.apply_worker_state(value, None);
+    }
+    fn apply_worker_state(&mut self, value: Value, edits: Option<EditSnapshot>) {
+        let keep_rows = edits
+            .as_ref()
+            .zip(self.edit_snapshot.as_ref())
+            .is_some_and(|(next, previous)| next.same_context(previous));
+        if !keep_rows {
+            self.edit_rows.take();
+        }
+        self.edit_snapshot = edits;
         for message in list(&value, "messages") {
             if !slice(&self.state, "messages").contains(&message)
                 && let Some(message) = message.as_str()
@@ -539,10 +556,15 @@ impl Desktop {
             self.search = search.clone().into();
         }
         self.application = text(&value, "application");
-        self.migration_count = slice(&value, "edits")
-            .iter()
-            .filter(|e| e["active"] == false)
-            .count();
+        self.migration_count = self.edit_snapshot.as_ref().map_or_else(
+            || {
+                slice(&value, "edits")
+                    .iter()
+                    .filter(|e| e["active"] == false)
+                    .count()
+            },
+            EditSnapshot::inactive_count,
+        );
         self.state = value.into();
         if sort_changed && !changed && !game_changed {
             self.rule_selection = selected.and_then(|selected| {
@@ -552,6 +574,23 @@ impl Desktop {
             });
             self.reveal_rule = None;
         }
+    }
+    pub(crate) fn edit_rows(&self) -> Option<Arc<Vec<Value>>> {
+        self.edit_snapshot.as_ref().map(|snapshot| {
+            self.edit_rows
+                .get_or_init(|| Arc::new(snapshot.rows()))
+                .clone()
+        })
+    }
+    pub(crate) fn has_active_edits(&self) -> bool {
+        self.edit_snapshot.as_ref().map_or_else(
+            || {
+                slice(&self.state, "edits")
+                    .iter()
+                    .any(|edit| edit["active"] == true)
+            },
+            EditSnapshot::has_active,
+        )
     }
     pub fn open_text(&mut self, index: usize) {
         if !self.connected || self.busy.is_some() || self.modal() {
@@ -663,6 +702,7 @@ impl Desktop {
         let (events, disconnected) = self.backend.as_ref().map(Backend::poll).unwrap_or_default();
         if let Some(event) = events
             .iter()
+            .map(|event| &event.value)
             .find(|event| event["event"] == "backend_closed")
         {
             let detail = text(event, "detail");
@@ -676,7 +716,11 @@ impl Desktop {
             self.backend_failed("项目服务连接已中断。".into());
             return;
         }
-        for event in events {
+        for DesktopEvent {
+            value: event,
+            edits,
+        } in events
+        {
             let id = count(&event, "id");
             let kind = text(&event, "event");
             if kind == "progress" || kind == "detail" {
@@ -837,7 +881,7 @@ impl Desktop {
                     self.restore_context_status();
                 }
                 "promotion_start" => {
-                    self.apply_state(data["state"].clone());
+                    self.apply_worker_state(data["state"].clone(), edits);
                     self.clear_promotion_result();
                     self.promotion_result =
                         json!({"review_nonce":data["review_nonce"],"items":data["retained_items"]});
@@ -897,7 +941,7 @@ impl Desktop {
                     self.status = "正在编辑替换。".into();
                 }
                 "load" => {
-                    self.apply_state(data);
+                    self.apply_worker_state(data, edits);
                     self.loaded = true;
                     if !self.healthy() {
                         let errors = self.state["errors"]
@@ -924,13 +968,13 @@ impl Desktop {
                     }
                 }
                 "settings" => {
-                    self.apply_state(data);
+                    self.apply_worker_state(data, edits);
                     if !self.path_dirty {
                         self.submit("check", json!({}), "正在检查游戏目录…");
                     }
                 }
                 "sort_settings" => {
-                    self.apply_state(data);
+                    self.apply_worker_state(data, edits);
                     self.restore_context_status();
                 }
                 "check" => {
@@ -995,7 +1039,7 @@ impl Desktop {
                     self.submit("check", json!({}), "底稿已保存，正在核对…");
                 }
                 "reset_record" => {
-                    self.apply_state(data["state"].clone());
+                    self.apply_worker_state(data["state"].clone(), edits);
                     self.sources_ready = false;
                     self.selection.clear();
                     self.log(
@@ -1017,7 +1061,7 @@ impl Desktop {
                     self.status = "已核对旧版修改，请选择要迁移的文本。".into();
                 }
                 "migration_start" => {
-                    self.apply_state(data["state"].clone());
+                    self.apply_worker_state(data["state"].clone(), edits);
                     let review = list(&data["plan"], "items");
                     self.migration_form =
                         (!review.is_empty()).then(|| MigrationForm::new(data["plan"].clone()));
@@ -1053,12 +1097,8 @@ impl Desktop {
                     }
                 }
                 "migration_commit" => {
-                    self.apply_state(data["state"].clone());
+                    self.apply_worker_state(data["state"].clone(), edits);
                     self.migration_form = None;
-                    self.migration_count = slice(&self.state, "edits")
-                        .iter()
-                        .filter(|e| e["active"] == false)
-                        .count();
                     self.status = format!("已迁移 {} 段文本。", count(&data, "count"));
                     self.log(
                         format!("迁移前的修改记录已备份：{}", text(&data, "backup")),
@@ -1078,7 +1118,7 @@ impl Desktop {
                     self.restore_context_status();
                 }
                 "sources" => {
-                    self.apply_state(data["state"].clone());
+                    self.apply_worker_state(data["state"].clone(), edits);
                     self.tables = list(&data, "tables");
                     self.sources_ready = data["missing_history"] != true;
                     if !self.sources_ready {
@@ -1098,7 +1138,7 @@ impl Desktop {
                     self.restore_context_status();
                 }
                 "sources_ack" => {
-                    self.apply_state(data);
+                    self.apply_worker_state(data, edits);
                     self.show_source_notices = false;
                 }
                 "save_rule"
@@ -1111,7 +1151,7 @@ impl Desktop {
                 | "remove_batch_member"
                 | "import_commit" => {
                     let supplemented = action == "batch_save" && self.promotion_missing.is_some();
-                    self.apply_state(data);
+                    self.apply_worker_state(data, edits);
                     if action == "save_rule" {
                         self.rule_form = None;
                         if !self.sources_ready {
@@ -1131,7 +1171,7 @@ impl Desktop {
                     };
                 }
                 "combined_save" | "combined_remove" => {
-                    self.apply_state(data);
+                    self.apply_worker_state(data, edits);
                     self.combined_form = None;
                     self.rule_selection = None;
                     self.status = "修改已保存。".into();
@@ -1234,7 +1274,7 @@ impl Desktop {
                 }
                 "backup_restore" => {
                     self.path_dirty = false;
-                    self.apply_state(data["state"].clone());
+                    self.apply_worker_state(data["state"].clone(), edits);
                     self.connected = false;
                     self.sources_ready = false;
                     self.tables.clear();
@@ -1265,7 +1305,10 @@ impl Desktop {
                     self.migration_notice = false;
                     self.migration_prompted.clear();
                     self.log(
-                        format!("恢复备份前的数据已保留：{}", text(&data, "recovery")),
+                        format!(
+                            "恢复前的数据已保留在 {}。再次恢复时可选择该目录的 info.json。",
+                            text(&data, "recovery")
+                        ),
                         None,
                     );
                     self.status = "备份已恢复，请检查游戏目录。".into();

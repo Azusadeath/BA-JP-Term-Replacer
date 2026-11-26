@@ -29,7 +29,7 @@ pub(crate) fn collect(
     let tables: HashSet<_> = database::tables(con, ".*")?.into_iter().collect();
     let mut wanted = BTreeMap::<&str, Vec<&Edit>>::new();
     for edit in edits {
-        if tables.contains(&edit.table) {
+        if tables.contains(edit.table.as_ref()) {
             wanted.entry(&edit.table).or_default().push(edit);
         }
     }

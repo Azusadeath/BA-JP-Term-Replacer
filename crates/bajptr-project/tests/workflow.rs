@@ -283,6 +283,13 @@ fn workspace_backup_restores_rules_text_edits_paths_and_source_metadata() {
     assert_eq!(reopened.rules, rules);
     assert_eq!(reopened.edits, edits);
     assert_eq!(reopened.game, p.game);
+    assert!(!recovery.join("workspace-backup.json").exists());
+    let before_restore = call(
+        &mut p,
+        "backup_read",
+        json!({"path":recovery.join("info.json")}),
+    );
+    assert_eq!(before_restore["rule_count"], 0);
     f.unchanged();
 }
 
@@ -832,7 +839,7 @@ fn promotion_relocates_a_single_edit_without_a_table_conversion_and_undoes_after
     let preview = call(&mut p, "promotion_preview", json!({}));
     assert_eq!(preview["count"], 0);
     assert_eq!(preview["relocated"], 1);
-    assert_eq!(p.edits, vec![stale.clone()]);
+    assert_eq!(*p.edits, vec![stale.clone()]);
     assert_eq!(
         fs::read(f.data.join(".gui/text-edits.json")).unwrap(),
         bytes
@@ -845,24 +852,24 @@ fn promotion_relocates_a_single_edit_without_a_table_conversion_and_undoes_after
         )
         .is_err()
     );
-    assert_eq!(p.edits, vec![stale.clone()]);
+    assert_eq!(*p.edits, vec![stale.clone()]);
     let saved = call(&mut p, "promotion_start", json!({}));
     assert_eq!(saved["count"], 0);
     assert_eq!(saved["relocated"], 1);
     assert_eq!(p.rules, rules);
-    assert_eq!(p.edits, vec![correct.clone()]);
+    assert_eq!(*p.edits, vec![correct.clone()]);
     let backup = Path::new(saved["backup"].as_str().unwrap());
     assert_eq!(fs::read(backup.join("text-edits.json")).unwrap(), bytes);
-    assert_eq!(f.project().edits, vec![correct.clone()]);
+    assert_eq!(*f.project().edits, vec![correct.clone()]);
     let revision = p.revision;
     let repeated = call(&mut p, "promotion_start", json!({}));
     assert_eq!(repeated["relocated"], 0);
     assert!(repeated["backup"].is_null());
     assert_eq!(p.revision, revision);
     call(&mut p, "history", json!({"undo":true}));
-    assert_eq!(p.edits, vec![stale]);
+    assert_eq!(*p.edits, vec![stale]);
     call(&mut p, "history", json!({"undo":false}));
-    assert_eq!(p.edits, vec![correct]);
+    assert_eq!(*p.edits, vec![correct]);
     f.unchanged();
 }
 
@@ -896,7 +903,7 @@ fn promotion_relocation_save_failure_keeps_the_old_addresses_and_rules() {
         )
         .is_err()
     );
-    assert_eq!(p.edits, vec![stale]);
+    assert_eq!(*p.edits, vec![stale]);
     assert_eq!(p.rules, rules);
     assert_eq!(fs::read(&path).unwrap(), bytes);
     drop(held);
@@ -936,7 +943,7 @@ fn batch_promotion_rejects_cancelled_stale_and_failed_saves_without_losing_recor
     assert_eq!(
         bajptr_project::model::parse_edits(&fs::read(f.data.join(".gui/text-edits.json")).unwrap())
             .unwrap(),
-        edits
+        *edits
     );
     drop(held);
     let revision = p.revision;
@@ -1048,9 +1055,9 @@ fn combined_range_removal_and_whole_group_removal_keep_single_and_old_version_re
         json!({"nonce":single["nonce"],"text":"任务【单条】"}),
     );
     let mut prior = p.edits[0].clone();
-    prior.version = "a".repeat(64);
+    prior.version = "a".repeat(64).into();
     prior.batch_operation.as_mut().unwrap().id = "b".repeat(32);
-    p.edits.push(prior.clone());
+    Arc::make_mut(&mut p.edits).push(prior.clone());
     fs::write(
         f.data.join(".gui/text-edits.json"),
         bajptr_project::model::edits_bytes(&p.edits).unwrap(),
@@ -2075,7 +2082,7 @@ fn unchanged_source_inventory_reuses_metadata_without_opening_the_database() {
 }
 
 fn generate_fixture_patch(p: &mut Project) -> bajptr_project::Result<Value> {
-    let config = bajptr_project::service::Config::new(p.rules.clone(), p.edits.clone());
+    let config = bajptr_project::service::Config::new(p.rules.clone(), p.edits.to_vec());
     p.engine.generate(
         bajptr_project::service::PatchJob {
             game: &p.game,
@@ -2190,8 +2197,21 @@ fn repeated_zero_change_previews_do_not_create_patch_scratch() {
             .is_err()
         );
     }
-    assert!(!f.data.join("work").exists());
+    let entries: Vec<_> = fs::read_dir(f.data.join("work"))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with("read-")
+    );
+    assert!(entries[0].path().join("read.db").is_file());
     assert!(!f.data.join("output").exists());
+    drop(p);
+    assert_eq!(fs::read_dir(f.data.join("work")).unwrap().count(), 0);
     f.unchanged();
 }
 
@@ -2318,6 +2338,10 @@ fn cancelled_preparation_can_retry_without_writing_game_or_exporting_patch() {
     );
     assert!(matches!(result, Err(bajptr_project::Error::Cancelled)));
     assert!(!f.data.join("output").exists());
+    assert_eq!(
+        fs::read_dir(f.data.join("work/prepared")).unwrap().count(),
+        0
+    );
     f.unchanged();
     assert_eq!(
         call(&mut p, "prepare_patch", json!({"nonce":preview["nonce"]}))["ready"],
@@ -2365,6 +2389,20 @@ fn prepared_install_failure_exports_patch_and_retries_without_rebuilding() {
     .unwrap();
     assert_eq!(checked.bad, 0);
     assert!(output.with_file_name("TableCatalog.bytes").is_file());
+    let retry = p
+        .dispatch(
+            "apply",
+            &json!({"nonce":preview["nonce"],"prepared":true}),
+            &no_build,
+        )
+        .unwrap();
+    assert_eq!(retry["output"], fallback["output"]);
+    assert_eq!(
+        fs::read_dir(output.parent().unwrap().parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
     f.unchanged();
     drop(locked);
     assert_eq!(
@@ -2448,11 +2486,22 @@ fn failed_fallback_save_reports_both_errors_and_keeps_recovery_files() {
         "{error}"
     );
     assert!(error.contains("暂存"), "{error}");
+    let recovery = f.data.join("work/recovery");
+    let manifest = walkdir::WalkDir::new(&recovery)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name() == "TableCatalog.bytes")
+        .unwrap();
+    let entry = region::parse(&fs::read(manifest.path()).unwrap()).unwrap();
+    let bundle = manifest
+        .path()
+        .with_file_name(format!("123456_{}", entry.crc));
+    assert_eq!(fs::metadata(bundle).unwrap().len(), entry.size);
     assert!(
-        walkdir::WalkDir::new(f.data.join("work"))
+        !walkdir::WalkDir::new(f.data.join("work"))
             .into_iter()
             .filter_map(Result::ok)
-            .any(|e| e.file_name() == "encrypted.db")
+            .any(|entry| entry.file_name() == "working.db")
     );
     assert_ne!(p.application, "已应用，与当前词表一致");
     f.unchanged();
@@ -2597,7 +2646,7 @@ fn migration_after_update_preserves_pairs_backs_up_and_rejects_stale_or_cancelle
     assert!(
         p.edits
             .iter()
-            .all(|e| Some(&e.version) == p.version.as_ref())
+            .all(|e| Some(e.version.as_ref()) == p.version.as_deref())
     );
     assert!(
         p.dispatch("migration_commit", &payload, &control())
@@ -2611,7 +2660,7 @@ fn migration_after_update_preserves_pairs_backs_up_and_rejects_stale_or_cancelle
     assert!(
         p.edits
             .iter()
-            .all(|e| Some(&e.version) == p.version.as_ref())
+            .all(|e| Some(e.version.as_ref()) == p.version.as_deref())
     );
     let mut reopened = f.project();
     assert_eq!(
@@ -2657,7 +2706,7 @@ fn migration_replays_paired_edits_on_changed_and_moved_baseline_text() {
     let key = bajptr_core::codec::key(region::KEY).unwrap();
     bajptr_core::codec::decrypt(&game.bundle, &plain, &key, &control()).unwrap();
     let con = rusqlite::Connection::open(&plain).unwrap();
-    assert_eq!(source.table, "LocalizeDBSchema");
+    assert_eq!(source.table.as_ref(), "LocalizeDBSchema");
     let database::RowId::Integer(id) = source.row_id else {
         panic!("expected numeric fixture ID");
     };
@@ -2789,7 +2838,7 @@ fn migration_start_saves_unchanged_content_even_when_its_position_moved() {
         );
     }
     assert_eq!(p.edits.len(), 2);
-    p.edits[1].row_id = bajptr_core::database::RowId::Integer(1_000_000);
+    Arc::make_mut(&mut p.edits)[1].row_id = bajptr_core::database::RowId::Integer(1_000_000);
     p.store
         .save(
             "text-edits.json",
@@ -2818,7 +2867,7 @@ fn migration_start_saves_unchanged_content_even_when_its_position_moved() {
     assert_eq!(
         after_automatic
             .iter()
-            .filter(|e| Some(&e.version) == p.version.as_ref())
+            .filter(|e| Some(e.version.as_ref()) == p.version.as_deref())
             .count(),
         2
     );
@@ -2830,7 +2879,7 @@ fn migration_start_saves_unchanged_content_even_when_its_position_moved() {
     assert!(
         p.edits
             .iter()
-            .all(|e| Some(&e.version) == p.version.as_ref())
+            .all(|e| Some(e.version.as_ref()) == p.version.as_deref())
     );
     call(&mut p, "history", json!({"undo":true}));
     assert_eq!(p.edits, old);
@@ -3693,7 +3742,7 @@ fn overlapping_batch_selections_are_a_union_without_replacing_twice() {
     }
     assert_eq!(p.edits.len(), 2);
     assert_eq!(p.state().unwrap()["batches"][0]["count"], 2);
-    for edit in &p.edits {
+    for edit in p.edits.iter() {
         let operation = edit.batch_operation.as_ref().unwrap();
         assert_eq!(
             edit.replacement,
@@ -3725,13 +3774,13 @@ fn batch_merge_preserves_other_games_versions_and_unclassified_legacy_entries() 
     );
     call(&mut p, "batch_save", json!({"nonce":preview["nonce"]}));
     let mut inactive = p.edits[0].clone();
-    inactive.version = "0".repeat(64);
+    inactive.version = "0".repeat(64).into();
     inactive.batch_operation.as_mut().unwrap().id = "a".repeat(32);
     let mut foreign = p.edits[0].clone();
     foreign.game = "another-game".into();
     foreign.batch_operation.as_mut().unwrap().id = "b".repeat(32);
-    p.edits[0].batch_operation = None;
-    p.edits.extend([inactive, foreign]);
+    Arc::make_mut(&mut p.edits)[0].batch_operation = None;
+    Arc::make_mut(&mut p.edits).extend([inactive, foreign]);
     let preserved = p.edits.clone();
     let search = call(&mut p, "search", json!({"keyword":"任务"}));
     let preview = call(
@@ -3741,7 +3790,7 @@ fn batch_merge_preserves_other_games_versions_and_unclassified_legacy_entries() 
     );
     let saved = call(&mut p, "batch_save", json!({"nonce":preview["nonce"]}));
     assert_eq!(p.edits.len(), 4);
-    assert_eq!(&p.edits[..3], preserved);
+    assert_eq!(&p.edits[..3], preserved.as_slice());
     assert_eq!(saved["batches"].as_array().unwrap().len(), 3);
     assert!(
         saved["batches"]
@@ -3929,6 +3978,53 @@ fn cancelling_apply_during_encryption_leaves_game_unchanged_and_preview_reusable
     f.unchanged();
     let applied = call(&mut project, "apply", json!({"nonce":preview["nonce"]}));
     assert_eq!(applied["application"], "已应用，与当前词表一致");
+}
+
+#[test]
+fn apply_rechecks_workspace_bytes_after_encryption() {
+    let f = Fixture::new();
+    let mut project = f.ready_project();
+    let preview = call(&mut project, "preview", json!({}));
+    let rules = f.data.join(".gui/rules.tsv");
+    let original = fs::read_to_string(&rules).unwrap();
+    let changed = original.replace("委托", "请求");
+    assert_ne!(original, changed);
+    assert_eq!(original.len(), changed.len());
+    let modified = std::cell::Cell::new(false);
+    let error = project
+        .dispatch(
+            "apply",
+            &json!({"nonce":preview["nonce"]}),
+            &Control::new(&|message| {
+                if message.is_some_and(|m| m.starts_with("正在加密数据库："))
+                    && !modified.replace(true)
+                {
+                    fs::write(&rules, &changed).unwrap();
+                }
+                true
+            }),
+        )
+        .unwrap_err();
+    assert!(modified.get());
+    assert!(error.to_string().contains("词表已被其他窗口修改"));
+    assert_eq!(fs::read_to_string(&rules).unwrap(), changed);
+    assert!(!f.data.join("output").exists());
+    f.unchanged();
+}
+
+#[test]
+fn cached_preview_rechecks_the_revision_of_missing_edit_records() {
+    let f = Fixture::new();
+    let mut project = f.ready_project();
+    call(&mut project, "preview", json!({}));
+    let edits = f.data.join(".gui/text-edits.json");
+    assert!(!edits.exists());
+    fs::write(edits, bajptr_project::model::edits_bytes(&[]).unwrap()).unwrap();
+    let error = project
+        .dispatch("preview", &json!({}), &control())
+        .unwrap_err();
+    assert!(error.to_string().contains("单条修改记录已变化"));
+    f.unchanged();
 }
 
 #[test]

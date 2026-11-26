@@ -1,17 +1,41 @@
 //! Cross-instance exclusion, compare-and-swap saves and durable atomic publication.
 use crate::{Result, invalid};
+use base64::{Engine as _, display::Base64Display, engine::general_purpose::STANDARD as B64};
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::HashMap,
+    fmt,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{BufWriter, Write},
     path::{Component, Path, PathBuf},
 };
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+pub fn file_digest(path: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    std::io::copy(&mut File::open(path)?, &mut hash)?;
+    Ok(format!("{:x}", hash.finalize()))
+}
+pub fn is_plain_directory(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(metadata.file_type().is_dir())
+}
+pub(crate) fn serialized_digest(value: &impl Serialize) -> Result<String> {
+    let mut hash = Sha256::new();
+    serde_json::to_writer(&mut hash, value)?;
+    Ok(format!("{:x}", hash.finalize()))
 }
 pub fn validate_data_dir(data: &Path) -> Result<()> {
     let resolved = resolved(data)?;
@@ -87,10 +111,10 @@ pub fn identity(path: &Path) -> Result<String> {
     }
 }
 pub fn revision(path: &Path) -> Result<Option<String>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(digest(&bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+    match file_digest(path) {
+        Ok(hash) => Ok(Some(hash)),
+        Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 pub struct Lock {
@@ -161,27 +185,34 @@ pub fn replace(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 pub fn check_revision(path: &Path, expected: &Option<String>) -> Result<()> {
-    if &revision(path)? != expected {
-        return Err(invalid(format!(
-            "{} 已被其他程序修改，未覆盖原文件。请重新打开工具。",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        )));
+    if &revision(path)? == expected {
+        Ok(())
+    } else {
+        Err(revision_conflict(path))
     }
-    Ok(())
+}
+fn revision_conflict(path: &Path) -> crate::Error {
+    invalid(format!(
+        "{} 已被其他程序修改，未覆盖原文件。请重新打开工具。",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
 }
 /// Caller holds the corresponding file lock across validation and publication.
 pub fn write_locked(path: &Path, bytes: &[u8]) -> Result<String> {
+    write_pending(path, |stream| Ok(stream.write_all(bytes)?))?;
+    Ok(digest(bytes))
+}
+fn write_pending(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
     fs::create_dir_all(path.parent().ok_or_else(|| invalid("保存路径无效。"))?)?;
     let pending = temporary_path(path)?;
     let mut stream = OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(&pending)?;
-    stream.write_all(bytes)?;
+    write(&mut stream)?;
     stream.sync_all()?;
     drop(stream);
-    replace(&pending, path)?;
-    Ok(digest(bytes))
+    replace(&pending, path)
 }
 pub fn atomic_write(
     path: &Path,
@@ -202,10 +233,49 @@ pub struct Store {
 }
 const SOURCES_TRANSACTION: &str = "sources-transaction.json";
 #[derive(Serialize, Deserialize)]
-struct SourceWrite {
+struct SourceWrite<'a> {
     name: String,
-    before: Option<Vec<u8>>,
-    after: Vec<u8>,
+    before: Option<JournalBytes<'a>>,
+    after: JournalBytes<'a>,
+}
+struct JournalBytes<'a>(Cow<'a, [u8]>);
+impl Serialize for JournalBytes<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(&Base64Display::new(&self.0, &B64))
+    }
+}
+impl<'de> Deserialize<'de> for JournalBytes<'_> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl<'de> de::Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("base64 data or a legacy byte array")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Vec<u8>, E> {
+                B64.decode(value).map_err(E::custom)
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+        deserializer
+            .deserialize_any(BytesVisitor)
+            .map(|bytes| Self(Cow::Owned(bytes)))
+    }
+}
+impl SourceWrite<'_> {
+    fn before(&self) -> Option<&[u8]> {
+        self.before.as_ref().map(|bytes| bytes.0.as_ref())
+    }
 }
 fn document_locks(root: &Path, names: &[&str]) -> Result<Vec<Lock>> {
     names
@@ -213,11 +283,11 @@ fn document_locks(root: &Path, names: &[&str]) -> Result<Vec<Lock>> {
         .map(|name| Lock::acquire(&root.join(name)))
         .collect()
 }
-fn rollback_documents(root: &Path, journal: &str, writes: &[SourceWrite]) -> Result<()> {
+fn rollback_documents(root: &Path, journal: &str, writes: &[SourceWrite<'_>]) -> Result<()> {
     for write in writes {
         let current = revision(&root.join(&write.name))?;
-        let before = write.before.as_deref().map(digest);
-        if current != before && current != Some(digest(&write.after)) {
+        let before = write.before().map(digest);
+        if current != before && current != Some(digest(&write.after.0)) {
             return Err(invalid(
                 "成组保存中断后文件又被修改，请保留事务记录并检查数据目录，未覆盖文件。",
             ));
@@ -225,10 +295,10 @@ fn rollback_documents(root: &Path, journal: &str, writes: &[SourceWrite]) -> Res
     }
     for write in writes {
         let path = root.join(&write.name);
-        if revision(&path)? == write.before.as_deref().map(digest) {
+        if revision(&path)? == write.before().map(digest) {
             continue;
         }
-        if let Some(bytes) = &write.before {
+        if let Some(bytes) = write.before() {
             write_locked(&path, bytes)?;
         } else {
             let archived = root.join(format!(
@@ -271,7 +341,7 @@ fn recover_documents(root: &Path, journal: &str, names: &[&str]) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let writes: Vec<SourceWrite> = serde_json::from_slice(&bytes)?;
+    let writes: Vec<SourceWrite<'_>> = serde_json::from_slice(&bytes)?;
     if writes.len() != names.len()
         || writes
             .iter()
@@ -332,6 +402,9 @@ impl Store {
                 .get(name)
                 .ok_or_else(|| invalid("修改记录尚未读取。"))?,
         )
+    }
+    pub(crate) fn expected_revision(&self, name: &str) -> Option<&Option<String>> {
+        self.revisions.get(name)
     }
     pub fn save_sources(&mut self, rules: &[u8], history: &[u8]) -> Result<()> {
         self.save_documents(
@@ -395,47 +468,52 @@ impl Store {
         }
         let mut writes = Vec::new();
         for &(name, bytes) in documents {
-            check_revision(
-                &self.root.join(name),
-                expected
-                    .get(name)
-                    .ok_or_else(|| invalid("缺少恢复前的文件修订，未保存。"))?,
-            )?;
-            let before = match fs::read(self.root.join(name)) {
+            let path = self.root.join(name);
+            let revision = expected
+                .get(name)
+                .ok_or_else(|| invalid("缺少恢复前的文件修订，未保存。"))?;
+            let before = match fs::read(&path) {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
             };
+            if &before.as_deref().map(digest) != revision {
+                return Err(revision_conflict(&path));
+            }
             writes.push(SourceWrite {
                 name: name.into(),
-                before,
-                after: bytes.to_vec(),
+                before: before.map(|bytes| JournalBytes(Cow::Owned(bytes))),
+                after: JournalBytes(Cow::Borrowed(bytes)),
             });
         }
-        write_locked(&self.root.join(journal), &serde_json::to_vec(&writes)?)?;
-        let result = (|| -> Result<()> {
+        write_pending(&self.root.join(journal), |stream| {
+            let mut writer = BufWriter::new(stream);
+            serde_json::to_writer(&mut writer, &writes)?;
+            Ok(writer.flush()?)
+        })?;
+        let result = (|| -> Result<Vec<String>> {
+            let mut revisions = Vec::with_capacity(writes.len());
             for write in &writes {
-                write_locked(&self.root.join(&write.name), &write.after)?;
+                revisions.push(write_locked(&self.root.join(&write.name), &write.after.0)?);
             }
             fs::remove_file(self.root.join(journal))?;
-            Ok(())
+            Ok(revisions)
         })();
-        if let Err(error) = result {
+        let revisions = result.map_err(|error| {
             if let Err(rollback) = rollback_documents(&self.root, journal, &writes) {
                 self.failed
                     .extend(writes.iter().map(|write| write.name.clone()));
-                return Err(crate::Error::Context {
+                return crate::Error::Context {
                     message:
                         "成组保存失败，原记录尚未完整恢复。请重新打开工具恢复；详细原因见日志。"
                             .into(),
                     source: Box::new(invalid(format!("保存：{error}；回滚：{rollback}"))),
-                });
+                };
             }
-            return Err(error);
-        }
-        for write in writes {
-            self.revisions
-                .insert(write.name, Some(digest(&write.after)));
+            error
+        })?;
+        for (write, revision) in writes.into_iter().zip(revisions) {
+            self.revisions.insert(write.name, Some(revision));
         }
         Ok(())
     }
@@ -576,5 +654,61 @@ mod lock_tests {
                 !crate::diagnostics::user_message("save_rule", &error).contains("另一个工具实例")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn compact_journal_recovers_binary_files_and_records_that_were_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let before: Vec<u8> = (0..=255).cycle().take(4096).collect();
+        let after: &[u8] = b"first file written before interruption";
+        let created: &[u8] = b"new file written before interruption";
+        fs::write(root.join("rules.tsv"), after).unwrap();
+        fs::write(root.join("source-history.json"), created).unwrap();
+
+        let writes = [
+            SourceWrite {
+                name: "rules.tsv".into(),
+                before: Some(JournalBytes(Cow::Borrowed(&before))),
+                after: JournalBytes(Cow::Borrowed(after)),
+            },
+            SourceWrite {
+                name: "source-history.json".into(),
+                before: None,
+                after: JournalBytes(Cow::Borrowed(created)),
+            },
+        ];
+        let bytes = serde_json::to_vec(&writes).unwrap();
+        let legacy = serde_json::to_vec(&serde_json::json!([
+            {"name":"rules.tsv","before":before,"after":after},
+            {"name":"source-history.json","before":null,"after":created},
+        ]))
+        .unwrap();
+        assert!(bytes.len() * 2 < legacy.len());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value[0]["before"], B64.encode(&before));
+        assert!(value[1]["before"].is_null());
+        fs::write(root.join(SOURCES_TRANSACTION), bytes).unwrap();
+
+        recover_sources(root).unwrap();
+        assert_eq!(fs::read(root.join("rules.tsv")).unwrap(), before);
+        assert!(!root.join("source-history.json").exists());
+        assert!(!root.join(SOURCES_TRANSACTION).exists());
+        let archived = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("source-sync-aborted-")
+            })
+            .unwrap();
+        assert_eq!(fs::read(archived).unwrap(), created);
     }
 }

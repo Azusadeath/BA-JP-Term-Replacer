@@ -5,12 +5,12 @@ use crate::{
     rules::{Evidence, Miss, Rules, View},
 };
 use rusqlite::{
-    Connection, OpenFlags,
+    Connection, OpenFlags, Statement,
     types::{Value, ValueRef},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -172,7 +172,7 @@ fn relative_offset(spos: usize, fpos: usize) -> Result<u32> {
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| invalid("FlatBuffer 偏移超出支持范围。"))
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Options {
     #[serde(default = "yes")]
     pub ascii_exact: bool,
@@ -276,7 +276,17 @@ impl Database {
         key: &[u8; 32],
         control: &Control<'_>,
     ) -> Result<Self> {
-        Self::open_inner(path, encrypted, key, control, None)
+        Self::open_inner(path, encrypted, key, control, None, None)
+    }
+
+    pub fn open_in(
+        path: &Path,
+        encrypted: bool,
+        key: &[u8; 32],
+        control: &Control<'_>,
+        work: &Path,
+    ) -> Result<Self> {
+        Self::open_inner(path, encrypted, key, control, None, Some(work))
     }
 
     pub fn open_verified(
@@ -286,7 +296,18 @@ impl Database {
         size: u64,
         crc: u32,
     ) -> Result<Self> {
-        Self::open_inner(path, true, key, control, Some((size, crc)))
+        Self::open_inner(path, true, key, control, Some((size, crc)), None)
+    }
+
+    pub fn open_verified_in(
+        path: &Path,
+        key: &[u8; 32],
+        control: &Control<'_>,
+        size: u64,
+        crc: u32,
+        work: &Path,
+    ) -> Result<Self> {
+        Self::open_inner(path, true, key, control, Some((size, crc)), Some(work))
     }
 
     fn open_inner(
@@ -295,9 +316,15 @@ impl Database {
         key: &[u8; 32],
         control: &Control<'_>,
         expected: Option<(u64, u32)>,
+        work: Option<&Path>,
     ) -> Result<Self> {
         let (plain, decrypted) = if encrypted {
-            let temporary = tempfile::tempdir()?;
+            let temporary = if let Some(work) = work {
+                std::fs::create_dir_all(work)?;
+                tempfile::Builder::new().prefix("read-").tempdir_in(work)?
+            } else {
+                tempfile::tempdir()?
+            };
             let plain = temporary.path().join("read.db");
             let info = crate::codec::decrypt_temporary(path, &plain, key, control, expected)?;
             (plain, Some((temporary, info)))
@@ -507,10 +534,18 @@ pub fn current_overrides(
     }
     Ok(Some(output))
 }
-fn targets(con: &Connection, edits: &[TextEdit], tables: &[String]) -> Result<Targets> {
+fn targets<'a>(
+    con: &Connection,
+    edits: &'a [TextEdit],
+    tables: &[String],
+    keys: &mut HashMap<&'a str, String>,
+) -> Result<Targets> {
     let mut result = HashMap::new();
+    let mut queries: HashMap<&str, Statement<'_>> = HashMap::new();
     for edit in edits {
-        if !tables.contains(&edit.table) {
+        let table = edit.table.as_str();
+        let query = queries.entry(table);
+        if matches!(query, Entry::Vacant(_)) && !tables.contains(&edit.table) {
             return Err(invalid("单条修改的文本表已不存在，请重新查找对应记录。"));
         }
         if edit.replacement.len() > fields::MAX_STRING || fields::forbidden(&edit.replacement) {
@@ -520,11 +555,20 @@ fn targets(con: &Connection, edits: &[TextEdit], tables: &[String]) -> Result<Ta
                 field_error(edit.slot, invalid("单条修改文字过长或包含控制字符。")),
             ));
         }
-        let key = key_name(con, &edit.table)?;
-        let sql = format!("SELECT Bytes FROM {} WHERE {key}=?", quote(&edit.table));
-        let blob: Vec<u8> = con
-            .query_row(&sql, [edit.row_id.value()], |r| r.get(0))
-            .map_err(|_| invalid("单条修改对应的记录已不存在，请重新查找。"))?;
+        let missing_record = |_| invalid("单条修改对应的记录已不存在，请重新查找。");
+        let query = match query {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let key = key_name(con, table)?;
+                let sql = format!("SELECT Bytes FROM {} WHERE {key}=?", quote(table));
+                let query = con.prepare(&sql).map_err(missing_record)?;
+                keys.insert(table, key);
+                entry.insert(query)
+            }
+        };
+        let blob: Vec<u8> = query
+            .query_row([edit.row_id.value()], |r| r.get(0))
+            .map_err(missing_record)?;
         let fields =
             fields::parse(&blob, true).map_err(|e| record_error(&edit.table, &edit.row_id, e))?;
         if fields.iter().find(|f| f.slot == edit.slot).map(|f| f.text)
@@ -668,7 +712,8 @@ pub fn patch_database(
     {
         return Err(invalid("当前游戏文本表与底稿不同，请检查游戏资源后重试。"));
     }
-    let targets = targets(con, &options.edits, &todo)?;
+    let mut keys = HashMap::new();
+    let targets = targets(con, &options.edits, &todo, &mut keys)?;
     let mut stats = Stats {
         tables: todo.clone(),
         ..Default::default()
@@ -682,14 +727,20 @@ pub fn patch_database(
         for (index, table) in todo.iter().enumerate() {
             control.log(&format!("检查文本表 {}/{}：{table}", index + 1, todo.len()))?;
             let view = rules.view(table);
-            let key = match key_name(con, table) {
-                Ok(k) => k,
-                Err(Error::UnsupportedTable(reason)) => {
-                    stats.tables_skipped += 1;
-                    note(&mut stats, "table", table, None, None, reason, control)?;
-                    continue;
-                }
-                Err(error) => return Err(invalid(format!("文本表 {table}：{error}"))),
+            let uncached_key;
+            let key = if let Some(key) = keys.get(table.as_str()) {
+                key
+            } else {
+                uncached_key = match key_name(con, table) {
+                    Ok(k) => k,
+                    Err(Error::UnsupportedTable(reason)) => {
+                        stats.tables_skipped += 1;
+                        note(&mut stats, "table", table, None, None, reason, control)?;
+                        continue;
+                    }
+                    Err(error) => return Err(invalid(format!("文本表 {table}：{error}"))),
+                };
+                &uncached_key
             };
             let sql = format!("SELECT {key}, Bytes FROM {} ORDER BY 1", quote(table));
             let mut query = con.prepare(&sql)?;

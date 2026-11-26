@@ -2,7 +2,7 @@
 use crate::{Result, invalid, model};
 use bajptr_core::rules::Rule;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Inventory {
@@ -51,25 +51,30 @@ impl Sources {
 /// Preserve table-specific overrides when freezing a legacy global rule.
 /// An empty fixed set keeps a fully overridden rule dormant, rather than deleting it.
 pub fn freeze(rules: &[Rule], known: &BTreeSet<String>) -> Result<Vec<Rule>> {
+    if rules.iter().all(|r| !r.table.is_empty()) {
+        return model::normalize_scopes(rules.to_vec());
+    }
+    let mut overrides = HashMap::<_, BTreeSet<_>>::new();
+    for rule in rules.iter().filter(|r| !r.table.is_empty()) {
+        if let Some(scope) = model::scopes(&rule.table)? {
+            overrides
+                .entry((rule.old.as_str(), rule.mode.as_str()))
+                .or_default()
+                .extend(scope);
+        }
+    }
     let mut fixed = rules.to_vec();
     for rule in &mut fixed {
         if !rule.table.is_empty() {
             continue;
         }
-        let mut names = known.clone();
-        for other in rules
-            .iter()
-            .filter(|r| r.old == rule.old && r.mode == rule.mode && !r.table.is_empty())
-        {
-            if let Some(scope) = model::scopes(&other.table)? {
-                for name in scope {
-                    names.remove(&name);
-                }
-            }
-        }
+        let names: Vec<_> = match overrides.get(&(rule.old.as_str(), rule.mode.as_str())) {
+            Some(scope) => known.difference(scope).collect(),
+            None => known.iter().collect(),
+        };
         rule.table = serde_json::to_string(&names)?;
     }
-    model::normalize(fixed)
+    model::normalize_scopes(fixed)
 }
 
 #[cfg(test)]

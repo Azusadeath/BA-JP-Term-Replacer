@@ -20,9 +20,6 @@ use eframe::egui;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    if let Some(code) = bajptr_project::cleanup::handle_mode() {
-        std::process::exit(code);
-    }
     startup::begin();
     let args: Vec<_> = std::env::args_os().collect();
     let argument = |name: &str| {

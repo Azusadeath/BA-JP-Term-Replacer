@@ -7,9 +7,10 @@ use bajptr_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::Path,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 pub fn scopes(value: &str) -> Result<Option<Vec<String>>> {
     if value.is_empty() {
@@ -30,7 +31,7 @@ pub fn scopes(value: &str) -> Result<Option<Vec<String>>> {
     names.dedup();
     Ok(Some(names))
 }
-pub fn normalize(mut values: Vec<Rule>) -> Result<Vec<Rule>> {
+pub(crate) fn normalize_scopes(mut values: Vec<Rule>) -> Result<Vec<Rule>> {
     for value in &mut values {
         value.table = match scopes(value.table.trim())? {
             None => String::new(),
@@ -38,10 +39,18 @@ pub fn normalize(mut values: Vec<Rule>) -> Result<Vec<Rule>> {
             Some(n) => serde_json::to_string(&n)?,
         };
     }
-    Rules::new(values.clone())?;
     Ok(values)
 }
+pub fn normalize(values: Vec<Rule>) -> Result<Vec<Rule>> {
+    Ok(Rules::new(normalize_scopes(values)?)?.values)
+}
 pub fn parse_rules(bytes: &[u8]) -> Result<Vec<Rule>> {
+    Ok(parse_compiled_rules(bytes)?.values)
+}
+pub fn parse_compiled_rules(bytes: &[u8]) -> Result<Rules> {
+    Rules::new(parse_rule_values(bytes)?)
+}
+pub fn parse_rule_values(bytes: &[u8]) -> Result<Vec<Rule>> {
     let source = std::str::from_utf8(bytes)
         .map_err(|_| invalid("词表不是有效的 UTF-8 文本。"))?
         .trim_start_matches('\u{feff}');
@@ -66,11 +75,14 @@ pub fn parse_rules(bytes: &[u8]) -> Result<Vec<Rule>> {
             table: fields[4].into(),
         });
     }
-    normalize(values)
+    normalize_scopes(values)
 }
 pub fn rules_bytes(rules: &[Rule]) -> Result<Vec<u8>> {
     let rules = normalize(rules.to_vec())?;
-    Ok(rules
+    Ok(normalized_rules_bytes(&rules))
+}
+pub(crate) fn normalized_rules_bytes(rules: &[Rule]) -> Vec<u8> {
+    rules
         .iter()
         .map(|r| {
             format!(
@@ -79,7 +91,7 @@ pub fn rules_bytes(rules: &[Rule]) -> Result<Vec<u8>> {
             )
         })
         .collect::<String>()
-        .into_bytes())
+        .into_bytes()
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchOperation {
@@ -97,9 +109,9 @@ pub struct PreviousBatchScope {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edit {
-    pub game: String,
-    pub version: String,
-    pub table: String,
+    pub game: Arc<str>,
+    pub version: Arc<str>,
+    pub table: Arc<str>,
     pub row_id: RowId,
     pub slot: usize,
     pub original: String,
@@ -125,7 +137,7 @@ impl Edit {
     }
     pub fn core(&self) -> TextEdit {
         TextEdit {
-            table: self.table.clone(),
+            table: self.table.to_string(),
             row_id: self.row_id.clone(),
             slot: self.slot,
             original: self.original.clone(),
@@ -141,7 +153,6 @@ impl Edit {
     }
 }
 pub fn validate_edits(edits: &[Edit]) -> Result<()> {
-    let mut seen = HashSet::new();
     let mut addresses = HashMap::new();
     let mut batches = HashMap::new();
     for e in edits {
@@ -175,16 +186,19 @@ pub fn validate_edits(edits: &[Edit]) -> Result<()> {
             }
         }
         let address = (&e.game, &e.version, &e.table, &e.row_id, e.slot);
-        if !seen.insert((address, e.batch)) {
+        let pair: &mut [Option<&Edit>; 2] = addresses.entry(address).or_default();
+        let layer = usize::from(e.batch);
+        if pair[layer].is_some() {
             return Err(invalid("同一段文本有重复的同类修改，请保留一项。"));
         }
-        if let Some(previous) = addresses.insert(address, e)
+        if let Some(previous) = pair[1 - layer]
             && (previous.original != e.original
                 || (previous.batch && previous.batch_operation.is_none())
                 || (e.batch && e.batch_operation.is_none()))
         {
             return Err(invalid("单条与批量修改的原文或操作信息不一致。"));
         }
+        pair[layer] = Some(e);
     }
     Ok(())
 }
@@ -194,25 +208,80 @@ pub fn is_version(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 pub fn parse_edits(bytes: &[u8]) -> Result<Vec<Edit>> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    if value["format"] != 2 {
+    use serde_json::value::RawValue;
+    #[derive(Deserialize)]
+    struct Document<'a> {
+        #[serde(borrow)]
+        format: Option<&'a RawValue>,
+        #[serde(borrow)]
+        edits: Option<&'a RawValue>,
+    }
+    #[derive(Deserialize)]
+    struct StoredEdit<'a> {
+        #[serde(borrow)]
+        game: Cow<'a, str>,
+        #[serde(borrow)]
+        version: Cow<'a, str>,
+        #[serde(borrow)]
+        table: Cow<'a, str>,
+        row_id: RowId,
+        slot: usize,
+        original: String,
+        replacement: String,
+        #[serde(default)]
+        batch: bool,
+        batch_operation: Option<BatchOperation>,
+        anchor: Option<bajptr_core::database::LocationAnchor>,
+    }
+    let doc: Document = serde_json::from_slice(bytes)?;
+    if !doc.format.is_some_and(|format| format.get() == "2") {
         return Err(invalid("单条修改记录格式不受支持。"));
     }
-    if !value["edits"]
-        .as_array()
-        .is_some_and(|rows| rows.iter().all(Value::is_object))
-    {
-        return Err(invalid("单条修改必须使用具名字段格式。"));
+    let rows = doc
+        .edits
+        .filter(|v| v.get().starts_with('['))
+        .ok_or_else(|| invalid("单条修改必须使用具名字段格式。"))?;
+    let raw: Vec<&RawValue> = serde_json::from_str(rows.get())?;
+    let mut shared = HashSet::<Arc<str>>::new();
+    let mut intern = |text: &str| {
+        if let Some(existing) = shared.get(text) {
+            return existing.clone();
+        }
+        let text = Arc::<str>::from(text);
+        shared.insert(text.clone());
+        text
+    };
+    let mut edits = Vec::with_capacity(raw.len());
+    for row in raw {
+        if !row.get().starts_with('{') {
+            return Err(invalid("单条修改必须使用具名字段格式。"));
+        }
+        let row: StoredEdit<'_> = serde_json::from_str(row.get())?;
+        edits.push(Edit {
+            game: intern(&row.game),
+            version: intern(&row.version),
+            table: intern(&row.table),
+            row_id: row.row_id,
+            slot: row.slot,
+            original: row.original,
+            replacement: row.replacement,
+            batch: row.batch,
+            batch_operation: row.batch_operation,
+            anchor: row.anchor,
+        });
     }
-    let edits: Vec<Edit> = serde_json::from_value(value["edits"].clone())?;
+    drop(shared);
     validate_edits(&edits)?;
     Ok(edits)
 }
 pub fn edits_bytes(edits: &[Edit]) -> Result<Vec<u8>> {
     validate_edits(edits)?;
-    Ok(serde_json::to_vec_pretty(
-        &json!({"format":2,"edits":edits}),
-    )?)
+    #[derive(Serialize)]
+    struct Document<'a> {
+        format: u8,
+        edits: &'a [Edit],
+    }
+    Ok(serde_json::to_vec_pretty(&Document { format: 2, edits })?)
 }
 pub fn update_edits(existing: &[Edit], updates: Vec<Edit>) -> Result<Vec<Edit>> {
     let mut values = existing.to_vec();
@@ -247,9 +316,9 @@ pub fn effective(
     if let Some(e) = edits
         .iter()
         .filter(|e| {
-            e.game == game
-                && e.version == version
-                && e.table == row.0
+            e.game.as_ref() == game
+                && e.version.as_ref() == version
+                && e.table.as_ref() == row.0
                 && e.row_id == row.1
                 && e.slot == row.2
         })
@@ -263,7 +332,7 @@ pub fn effective(
     let result = rules.view(&row.0).apply(
         rules,
         &row.3,
-        &mut Evidence::new(rules.values.len(), false),
+        &mut Evidence::default(),
         !fields::has_cjk(&row.3),
     )?;
     Ok((result.unwrap_or_else(|| row.3.clone()), false))
@@ -276,9 +345,9 @@ pub fn final_edits(edits: &[Edit], game: &str, version: &str) -> Result<Vec<Text
     Ok([true, false]
         .into_iter()
         .flat_map(|batch| {
-            edits
-                .iter()
-                .filter(move |e| e.game == game && e.version == version && e.batch == batch)
+            edits.iter().filter(move |e| {
+                e.game.as_ref() == game && e.version.as_ref() == version && e.batch == batch
+            })
         })
         .filter(|e| seen.insert((&e.table, &e.row_id, e.slot)))
         .map(Edit::core)

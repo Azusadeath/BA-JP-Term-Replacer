@@ -53,6 +53,41 @@ fn simple_db() -> Connection {
 }
 
 #[test]
+fn overlapping_field_candidates_keep_scope_and_rule_priority() {
+    let mut scoped = rule("甲乙", "乙", "sub");
+    scoped.table = "LocalizeDBSchema".into();
+    let rules = Rules::new(vec![
+        rule("甲乙", "错", "sub"),
+        rule("乙", "丁", "sub"),
+        scoped,
+        rule("(?<=丙)甲", "戊", "re"),
+        rule("(?:丁|庚)", "辛", "re"),
+    ])
+    .unwrap();
+    let view = rules.view("LocalizeDBSchema");
+    let mut evidence = Evidence::new(rules.values.len(), true);
+    assert_eq!(
+        view.apply(&rules, "甲乙丙甲庚", &mut evidence, false)
+            .unwrap()
+            .as_deref(),
+        Some("乙丙戊辛")
+    );
+    assert_eq!(evidence.hits, [0, 0, 1, 1, 1]);
+    assert!(
+        evidence.misses[0]
+            .as_ref()
+            .unwrap()
+            .reason
+            .contains("专用规则")
+    );
+    assert!(evidence.misses[1].as_ref().unwrap().reason.contains("重叠"));
+    assert!(std::sync::Arc::ptr_eq(
+        &view,
+        &rules.view("LocalizeDBSchema")
+    ));
+}
+
+#[test]
 fn blank_table_filter_uses_the_default_scope_for_preview_and_patch() {
     let con = simple_db();
     con.execute_batch(
@@ -531,7 +566,7 @@ fn search_includes_text_containing_kana() {
 }
 
 #[test]
-fn composite_primary_keys_bind_only_the_selected_record() {
+fn composite_primary_keys_bind_each_selected_record_in_the_same_table() {
     for columns in ["Id", "Key"] {
         let con = Connection::open_in_memory().unwrap();
         con.execute_batch(&format!("CREATE TABLE LocalizeDBSchema({columns} INTEGER, Lang TEXT, Bytes BLOB, PRIMARY KEY({columns},Lang)) WITHOUT ROWID")).unwrap();
@@ -546,41 +581,42 @@ fn composite_primary_keys_bind_only_the_selected_record() {
             [&original],
         )
         .unwrap();
+        con.execute(
+            "INSERT INTO LocalizeDBSchema VALUES (1,'kr',?)",
+            [&original],
+        )
+        .unwrap();
         let (found, total) = database::scan(&con, "Localize", "攻击", 10, &ctl()).unwrap();
-        assert_eq!(total, 2, "{columns}");
+        assert_eq!(total, 3, "{columns}");
         assert_ne!(
             found[0].1, found[1].1,
             "a partial Key column must not identify both rows"
         );
         let mut options = options();
-        options.edits.push(TextEdit {
-            table: "LocalizeDBSchema".into(),
-            row_id: found[0].1.clone(),
-            slot: 0,
-            original: "攻击".into(),
-            replacement: "只改这条".into(),
-        });
+        for (row, replacement) in found.iter().zip(["中文替换", "日文替换"]) {
+            options.edits.push(TextEdit {
+                table: "LocalizeDBSchema".into(),
+                row_id: row.1.clone(),
+                slot: 0,
+                original: "攻击".into(),
+                replacement: replacement.into(),
+            });
+        }
         let rules = Rules::new(vec![]).unwrap();
         let stats =
             database::patch_database(&con, None, None, &rules, &options, true, &ctl()).unwrap();
-        assert_eq!(stats.rows_changed, 1);
+        assert_eq!(stats.rows_changed, 2);
         assert_eq!(stats.parse_failed, 0);
-        let modified: Vec<u8> = con
-            .query_row(
-                "SELECT Bytes FROM LocalizeDBSchema WHERE Lang='cn'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let untouched: Vec<u8> = con
-            .query_row(
-                "SELECT Bytes FROM LocalizeDBSchema WHERE Lang='jp'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(fields::parse(&modified, true).unwrap()[0].text, "只改这条");
-        assert_eq!(untouched, original);
+        for (lang, expected) in [("cn", "中文替换"), ("jp", "日文替换"), ("kr", "攻击")] {
+            let actual: Vec<u8> = con
+                .query_row(
+                    "SELECT Bytes FROM LocalizeDBSchema WHERE Lang=?",
+                    [lang],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fields::parse(&actual, true).unwrap()[0].text, expected);
+        }
     }
 }
 

@@ -2,10 +2,9 @@ use bajptr_core::{
     Control, Result, codec,
     database::{self, Database, Options},
     invalid,
-    rules::Rules,
 };
 use bajptr_project::{
-    baseline, model, region,
+    baseline, region,
     service::{Config, Engine, PatchJob},
     storage,
 };
@@ -50,13 +49,14 @@ impl Source {
             None => Ok(region::locate(&self.game()?)?.bundle),
         }
     }
-    fn open(&self, control: &Control<'_>) -> Result<Database> {
+    fn open(&self, work: &Path, control: &Control<'_>) -> Result<Database> {
         let path = self.path()?;
-        Database::open(
+        Database::open_in(
             &path,
             is_encrypted(&path)?,
             &codec::key(&self.key)?,
             control,
+            work,
         )
     }
 }
@@ -136,7 +136,8 @@ fn oneline(s: &str) -> String {
 pub fn run(control: &Control<'_>) -> Result<()> {
     let cli = Cli::parse();
     let data = std::env::current_dir()?;
-    let mut engine = Engine::default();
+    let work = data.join("work");
+    let mut engine = Engine::with_work(work.clone());
     match cli.command {
         Command::Paths { source } => {
             let game = region::locate(&source.game()?)?;
@@ -163,7 +164,7 @@ pub fn run(control: &Control<'_>) -> Result<()> {
             tables,
             limit,
         } => {
-            let db = source.open(control)?;
+            let db = source.open(&work, control)?;
             let (rows, total) = database::scan(&db.con, &tables, &keyword, limit, control)?;
             for (table, rid, slot, text) in &rows {
                 println!("{table}\t{}\tfield{slot}\t{}", rid.display(), oneline(text));
@@ -175,7 +176,7 @@ pub fn run(control: &Control<'_>) -> Result<()> {
             tables,
             out,
         } => {
-            let db = source.open(control)?;
+            let db = source.open(&work, control)?;
             let count = bajptr_project::text_export::export(&out, control, |stage| {
                 database::export(&db.con, &tables, stage, control)
             })?;
@@ -193,20 +194,11 @@ pub fn run(control: &Control<'_>) -> Result<()> {
             no_ascii_exact,
             work_dir,
         } => {
-            let rules = glossary
-                .as_ref()
-                .map(|p| {
-                    fs::read(p)
-                        .map_err(bajptr_core::Error::Io)
-                        .and_then(|b| model::parse_rules(&b))
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let mut config = Config::new(rules, vec![]);
-            config.rules_path = glossary;
+            let mut config = Config::from_glossary(glossary)?;
             config.ascii_exact = !no_ascii_exact;
             config.tables = tables;
-            config.work_dir = work_dir;
+            config.work_dir = work_dir.or(Some(work));
+            engine = Engine::with_work(config.work_dir.clone().unwrap());
             let result = if let Some(path) = &source.db {
                 if install {
                     return Err(invalid(
@@ -253,22 +245,26 @@ fn standalone_patch(
 ) -> Result<Value> {
     let key = codec::key(key)?;
     let encrypted = is_encrypted(input)?;
-    let rules = Rules::new(config.rules.clone())?;
+    let rules = config.compiled_rules()?;
     let options: Options = serde_json::from_value(
         json!({"ascii_exact":config.ascii_exact,"tables":config.tables,"explain":true}),
     )?;
+    let stage_root = config
+        .work_dir
+        .as_deref()
+        .unwrap_or_else(|| Path::new("work"));
     if dry_run {
-        let db = Database::open(input, encrypted, &key, control)?;
-        return Ok(
-            json!({"stats":database::patch_database(&db.con,None,None,&rules,&options,false,control)?}),
-        );
+        let db = Database::open_in(input, encrypted, &key, control, stage_root)?;
+        let stats =
+            database::patch_database(&db.con, None, None, &rules, &options, false, control)?;
+        config.check_documents()?;
+        return Ok(json!({"stats":stats}));
     }
-    let stage_root = config.work_dir.clone().unwrap_or(std::env::temp_dir());
-    fs::create_dir_all(&stage_root)?;
-    let stage = stage_root.join(format!("bajptr-standalone-{}", uuid_name()));
-    fs::create_dir(&stage)?;
-    bajptr_project::cleanup::mark(&stage)?;
-    let plain = stage.join("working.db");
+    fs::create_dir_all(stage_root)?;
+    let stage = tempfile::Builder::new()
+        .prefix("bajptr-standalone-")
+        .tempdir_in(stage_root)?;
+    let plain = stage.path().join("working.db");
     let info = if encrypted {
         Some(codec::decrypt(input, &plain, &key, control)?)
     } else {
@@ -283,8 +279,8 @@ fn standalone_patch(
         return Err(invalid("生成数据库完整性校验失败。"));
     }
     drop(con);
-    let result = stage.join("patched.db");
-    if let Some(info) = info {
+    let result = if let Some(info) = info {
+        let result = stage.path().join("patched.db");
         let salt = B64.decode(info.salt).map_err(|_| invalid("salt 无效。"))?;
         let ivs = info
             .ivs
@@ -295,35 +291,32 @@ fn standalone_patch(
         if checked.ok == 0 || checked.bad > 0 {
             return Err(invalid("输出数据库 HMAC 校验失败。"));
         }
+        fs::remove_file(&plain)?;
+        result
     } else {
-        baseline::copy_sync(&plain, &result)?;
-    }
-    let _lock = config
-        .rules_path
-        .as_ref()
-        .map(|p| storage::Lock::acquire(p))
-        .transpose()?;
-    if let Some(path) = &config.rules_path
-        && model::parse_rules(&fs::read(path)?)? != config.rules
-    {
-        return Err(invalid("词表在处理期间发生变化，未发布补丁。"));
-    }
+        plain
+    };
+    let _document_locks = config.lock_checked_documents()?;
     control.check()?;
     fs::create_dir_all(out)?;
-    let folder = out.join(format!("patch-{}", uuid_name()));
-    fs::create_dir(&folder)?;
+    let digest = storage::file_digest(&result)?;
+    let folder = out.join(format!("patch-{digest}"));
+    let _lock = storage::Lock::acquire(&folder)?;
     let target = folder.join("patched.db");
-    baseline::copy_sync(&result, &target)?;
-    bajptr_project::cleanup::remove_success(&stage, control);
+    if folder.exists() {
+        if !storage::is_plain_directory(&folder)? || storage::file_digest(&target)? != digest {
+            return Err(invalid("同名补丁内容已变化，请选择其他输出目录。"));
+        }
+    } else {
+        let pending = tempfile::Builder::new()
+            .prefix("pending-")
+            .tempdir_in(out)?;
+        let pending_file = pending.path().join("patched.db");
+        baseline::copy_sync(&result, &pending_file)?;
+        if storage::file_digest(&pending_file)? != digest {
+            return Err(invalid("补丁副本校验失败。"));
+        }
+        fs::rename(pending.path(), &folder)?;
+    }
     Ok(json!({"output":target,"stats":stats,"verified":true}))
-}
-fn uuid_name() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }

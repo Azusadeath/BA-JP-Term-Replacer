@@ -1,4 +1,7 @@
-use crate::{Control, Error, desktop::Project};
+use crate::{
+    Control, Error,
+    desktop::{EditSnapshot, Project},
+};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
@@ -22,9 +25,14 @@ struct Completed {
     before: Value,
     after: Value,
 }
-pub struct Worker {
+pub struct DesktopEvent {
+    pub value: Value,
+    pub edits: Option<EditSnapshot>,
+}
+
+pub struct Worker<T = Value> {
     input: Sender<Request>,
-    pub events: Receiver<Value>,
+    pub events: Receiver<T>,
     tokens: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -78,6 +86,29 @@ pub fn read_only(action: &str) -> bool {
 }
 impl Worker {
     pub fn start(data: PathBuf, notify: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Self> {
+        Self::start_with(data, notify, false, |value, _| value)
+    }
+}
+
+impl Worker<DesktopEvent> {
+    pub fn start_desktop(
+        data: PathBuf,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Self> {
+        Self::start_with(data, notify, true, |value, edits| DesktopEvent {
+            value,
+            edits,
+        })
+    }
+}
+
+impl<T: Send + 'static> Worker<T> {
+    fn start_with(
+        data: PathBuf,
+        notify: Arc<dyn Fn() + Send + Sync>,
+        shared_edit_state: bool,
+        event: impl Fn(Value, Option<EditSnapshot>) -> T + Send + 'static,
+    ) -> std::io::Result<Self> {
         crate::storage::validate_data_dir(&data)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let (input, jobs) = mpsc::channel::<Request>();
@@ -85,10 +116,11 @@ impl Worker {
         let tokens = Arc::new(Mutex::new(HashMap::new()));
         let worker_tokens = tokens.clone();
         let thread=std::thread::Builder::new().name("bajptr-project".into()).spawn(move||{
-            let send=|value:Value|{let _=output.send(value);notify();};
+            let send=|value:Value, edits|{let _=output.send(event(value, edits));notify();};
             let mut active = None;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut project=Project::new(data);let mut completed=VecDeque::<Completed>::new();
+            project.shared_edit_state = shared_edit_state;
             while let Ok(request)=jobs.recv(){
                 active = Some((request.id, request.action.clone()));
                 if request.action=="quit"{break;}
@@ -108,13 +140,22 @@ impl Worker {
                 }
                 let read=read_only(&request.action);let can_cancel=cancellable(&request.action);let before=project.snapshot();let revision=project.revision;
                 let callback=|_:Option<&str>| !can_cancel || !request.token.load(Ordering::Relaxed);
-                let logger=|level:crate::LogLevel,message:&str|send(json!({"id":request.id,"event":"progress","level":level,"message":message}));
+                let logger=|level:crate::LogLevel,message:&str|send(json!({"id":request.id,"event":"progress","level":level,"message":message}),None);
                 let control=Control::new(&callback).with_logger(&logger);
                 let result=control.check().and_then(|_|project.dispatch(&request.action,&request.payload,&control));
                 match result{
-                    Ok(data)=>{if read{completed.push_back(Completed{id:request.id,revision,before,after:project.snapshot()});if completed.len()>32{completed.pop_front();}}send(json!({"id":request.id,"event":"result","data":data}));},
-                    Err(Error::Cancelled)=>{project.restore_snapshot(&before);send(json!({"id":request.id,"event":"cancelled"}));},
-                    Err(error)=>{if read{project.restore_snapshot(&before);}send(json!({"id":request.id,"event":"error","level":"error","message":crate::diagnostics::user_message(&request.action,&error),"detail":error.to_string()}));},
+                    Ok(data)=>{
+                        if read{completed.push_back(Completed{id:request.id,revision,before,after:project.snapshot()});if completed.len()>32{completed.pop_front();}}
+                        let state = if data.get("edits").is_some_and(Value::is_null) {
+                            Some(&data)
+                        } else {
+                            data.get("state").filter(|state| state.get("edits").is_some_and(Value::is_null))
+                        };
+                        let edits = state.and_then(|state| state["edit_game_key"].as_str()).map(|key| project.edit_snapshot(key.into()));
+                        send(json!({"id":request.id,"event":"result","data":data}),edits);
+                    },
+                    Err(Error::Cancelled)=>{project.restore_snapshot(&before);send(json!({"id":request.id,"event":"cancelled"}),None);},
+                    Err(error)=>{if read{project.restore_snapshot(&before);}send(json!({"id":request.id,"event":"error","level":"error","message":crate::diagnostics::user_message(&request.action,&error),"detail":error.to_string()}),None);},
                 }
                 worker_tokens.lock().unwrap().remove(&request.id);
             }
@@ -129,7 +170,7 @@ impl Worker {
                 }
             };
             // Deliver shutdown independently of the callback that may have panicked.
-            let _ = output.send(json!({"id":0,"event":"backend_closed","message":message,"detail":detail}));
+            let _ = output.send(event(json!({"id":0,"event":"backend_closed","message":message,"detail":detail}),None));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||notify()));
         })?;
         Ok(Self {
@@ -172,9 +213,22 @@ impl Worker {
         }
     }
 }
-impl Drop for Worker {
+impl<T> Drop for Worker<T> {
     fn drop(&mut self) {
-        let _ = self.send(0, "quit", json!({}));
+        for token in self
+            .tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            token.store(true, Ordering::Relaxed);
+        }
+        let _ = self.input.send(Request {
+            id: 0,
+            action: "quit".into(),
+            payload: Value::Null,
+            token: Arc::new(AtomicBool::new(false)),
+        });
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

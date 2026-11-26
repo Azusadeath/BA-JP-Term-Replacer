@@ -21,9 +21,14 @@ pub struct Baseline {
     pub origin: String,
 }
 pub(crate) type Stamp = (u64, SystemTime, SystemTime);
-#[derive(Default)]
 pub struct Baselines {
     verified: HashMap<PathBuf, (Stamp, u32)>,
+    pub(crate) work: PathBuf,
+}
+impl Default for Baselines {
+    fn default() -> Self {
+        Self::with_work(PathBuf::from("work"))
+    }
 }
 pub fn stamp(path: &Path) -> Result<Stamp> {
     let m = path.metadata()?;
@@ -141,6 +146,12 @@ pub(crate) fn publish_generation(destination: &Path, stage: &Path) -> Result<()>
     Ok(())
 }
 impl Baselines {
+    pub(crate) fn with_work(work: PathBuf) -> Self {
+        Self {
+            verified: HashMap::new(),
+            work,
+        }
+    }
     pub fn checked(&mut self, path: &Path, entry: &Entry, control: &Control<'_>) -> Result<()> {
         let stat = stamp(path)?;
         if stat.0 != entry.size {
@@ -313,11 +324,12 @@ impl Baselines {
         }
         self.checked(&stage.join(name), &entry, control)?;
         control.log("正在验证底稿数据库完整性…")?;
-        let db = bajptr_core::database::Database::open(
+        let db = bajptr_core::database::Database::open_in(
             &stage.join(name),
             true,
             &codec::key(region::KEY)?,
             control,
+            &self.work,
         )?;
         let integrity: String = db
             .con

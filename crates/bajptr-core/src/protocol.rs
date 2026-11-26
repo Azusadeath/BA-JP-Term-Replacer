@@ -12,6 +12,7 @@ use std::{collections::HashMap, path::Path};
 pub struct Session {
     pub database: Option<Database>,
     pub comparison: Option<(String, database::CurrentOverrides)>,
+    pub work_dir: Option<std::path::PathBuf>,
 }
 fn text<'a>(v: &'a Value, name: &str) -> Result<&'a str> {
     v.get(name)
@@ -140,74 +141,27 @@ pub fn execute(session: &mut Session, v: Value, control: &Control<'_>) -> Result
         ),
         "preview" => {
             let rules = rules(&v)?;
-            let mut options = options(&v)?;
-            options.explain = true;
-            let original = &session
-                .database
-                .as_ref()
-                .ok_or_else(|| invalid("请先读取数据库。"))?
-                .con;
-            let mut current = None;
-            let mut comparison = None;
-            if let Some(path) = v.get("current").and_then(Value::as_str) {
-                let identity = v
-                    .get("current_identity")
-                    .and_then(Value::as_str)
-                    .map(|id| format!("{id}\0{}", options.tables));
-                let cached = identity.as_ref().is_some_and(|id| {
-                    session
-                        .comparison
-                        .as_ref()
-                        .is_some_and(|(key, _)| key == id)
-                });
-                if !cached {
-                    control.log("正在比较当前游戏和初始底稿…")?;
-                    let opened = Database::open(
+            let options = options(&v)?;
+            let current = v
+                .get("current")
+                .and_then(Value::as_str)
+                .map(|path| {
+                    Ok::<_, Error>((
                         Path::new(path),
-                        true,
-                        &codec::key(text(&v, "key")?)?,
-                        control,
-                    )?;
-                    let overrides = database::current_overrides(
-                        original,
-                        &opened.con,
-                        &options.tables,
-                        16 * 1024 * 1024,
-                        control,
-                    )?;
-                    session.comparison = None;
-                    if let (Some(identity), Some(overrides)) = (identity, overrides) {
-                        session.comparison = Some((identity, overrides));
-                    } else {
-                        current = Some(opened);
-                    }
-                }
-                if current.is_none() {
-                    comparison = session.comparison.as_ref().map(|(_, map)| map);
-                }
-            }
-            Ok(serde_json::to_value(database::patch_database(
-                original,
-                current.as_ref().map(|d| &d.con),
-                comparison,
-                &rules,
-                &options,
-                false,
-                control,
+                        v.get("current_identity").and_then(Value::as_str),
+                        text(&v, "key")?,
+                    ))
+                })
+                .transpose()?;
+            Ok(serde_json::to_value(preview(
+                session, &rules, options, current, control,
             )?)?)
         }
         "patch_file" => {
             let rules = rules(&v)?;
             let options = options(&v)?;
-            let con = rusqlite::Connection::open_with_flags(
+            Ok(serde_json::to_value(patch_file(
                 Path::new(text(&v, "input")?),
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            )?;
-            database::configure_connection(&con, false)?;
-            Ok(serde_json::to_value(database::patch_database(
-                &con,
-                None,
-                None,
                 &rules,
                 &options,
                 !v.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
@@ -216,6 +170,80 @@ pub fn execute(session: &mut Session, v: Value, control: &Control<'_>) -> Result
         }
         _ => Err(invalid("未知内核操作。")),
     }
+}
+
+pub fn preview(
+    session: &mut Session,
+    rules: &Rules,
+    mut options: Options,
+    live: Option<(&Path, Option<&str>, &str)>,
+    control: &Control<'_>,
+) -> Result<database::Stats> {
+    control.check()?;
+    options.explain = true;
+    let original = &session
+        .database
+        .as_ref()
+        .ok_or_else(|| invalid("请先读取数据库。"))?
+        .con;
+    let mut current = None;
+    let mut comparison = None;
+    if let Some((path, resource_identity, key)) = live {
+        let identity = resource_identity.map(|id| format!("{id}\0{}", options.tables));
+        let cached = identity.as_ref().is_some_and(|id| {
+            session
+                .comparison
+                .as_ref()
+                .is_some_and(|(key, _)| key == id)
+        });
+        if !cached {
+            control.log("正在比较当前游戏和初始底稿…")?;
+            let key = codec::key(key)?;
+            let opened = match &session.work_dir {
+                Some(work) => Database::open_in(path, true, &key, control, work)?,
+                None => Database::open(path, true, &key, control)?,
+            };
+            let overrides = database::current_overrides(
+                original,
+                &opened.con,
+                &options.tables,
+                16 * 1024 * 1024,
+                control,
+            )?;
+            session.comparison = None;
+            if let (Some(identity), Some(overrides)) = (identity, overrides) {
+                session.comparison = Some((identity, overrides));
+            } else {
+                current = Some(opened);
+            }
+        }
+        if current.is_none() {
+            comparison = session.comparison.as_ref().map(|(_, map)| map);
+        }
+    }
+    database::patch_database(
+        original,
+        current.as_ref().map(|d| &d.con),
+        comparison,
+        rules,
+        &options,
+        false,
+        control,
+    )
+}
+
+pub fn patch_file(
+    path: &Path,
+    rules: &Rules,
+    options: &Options,
+    write: bool,
+    control: &Control<'_>,
+) -> Result<database::Stats> {
+    control.check()?;
+    let con =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    database::configure_connection(&con, false)?;
+    database::patch_database(&con, None, None, rules, options, write, control)
 }
 
 pub fn envelope(result: Result<Value>) -> Value {

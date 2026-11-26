@@ -1421,7 +1421,10 @@ impl Desktop {
             return;
         };
         let state = self.state.clone();
-        let members: Vec<_> = slice(&state, "edits")
+        let rows = self.edit_rows();
+        let members: Vec<_> = rows
+            .as_deref()
+            .map_or_else(|| slice(&state, "edits"), Vec::as_slice)
             .iter()
             .filter(|e| form.contains(e))
             .collect();
@@ -1589,7 +1592,10 @@ impl Desktop {
             return;
         }
         let state = self.state.clone();
-        let edits: Vec<_> = slice(&state, "edits")
+        let rows = self.edit_rows();
+        let edits: Vec<_> = rows
+            .as_deref()
+            .map_or_else(|| slice(&state, "edits"), Vec::as_slice)
             .iter()
             .filter(|e| e["edit"]["batch"] != true)
             .collect();

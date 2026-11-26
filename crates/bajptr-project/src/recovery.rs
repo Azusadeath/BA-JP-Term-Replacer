@@ -8,7 +8,12 @@ use crate::{
 use serde_json::{Value, json};
 use std::{fs, path::Path};
 
-pub fn baseline_plan(live: &Game, root: &Path, control: &Control<'_>) -> Result<Value> {
+pub fn baseline_plan(
+    live: &Game,
+    root: &Path,
+    work: &Path,
+    control: &Control<'_>,
+) -> Result<Value> {
     control.check()?;
     let folder = baseline::location(live, root)?;
     if !folder.is_dir() {
@@ -60,7 +65,7 @@ pub fn baseline_plan(live: &Game, root: &Path, control: &Control<'_>) -> Result<
         control.check()?;
         let verified = (|| -> Result<()> {
             Baselines::default().checked(&source, &entry, control)?;
-            verify_sqlite(&source, control)
+            verify_sqlite(&source, work, control)
         })();
         match verified {
             Ok(()) => {
@@ -84,12 +89,13 @@ pub fn baseline_plan(live: &Game, root: &Path, control: &Control<'_>) -> Result<
     ))
 }
 
-fn verify_sqlite(path: &Path, control: &Control<'_>) -> Result<()> {
-    let database = bajptr_core::database::Database::open(
+fn verify_sqlite(path: &Path, work: &Path, control: &Control<'_>) -> Result<()> {
+    let database = bajptr_core::database::Database::open_in(
         path,
         true,
         &bajptr_core::codec::key(region::KEY)?,
         control,
+        work,
     )?;
     let result: String = database
         .con
@@ -103,10 +109,11 @@ fn verify_sqlite(path: &Path, control: &Control<'_>) -> Result<()> {
 pub fn rebuild_baseline(
     live: &Game,
     root: &Path,
+    work: &Path,
     expected: &Value,
     control: &Control<'_>,
 ) -> Result<Value> {
-    let plan = baseline_plan(live, root, control)?;
+    let plan = baseline_plan(live, root, work, control)?;
     if expected != &plan["token"] {
         return Err(invalid("游戏资源或底稿已变化，请重新尝试重建。"));
     }
@@ -129,7 +136,7 @@ pub fn rebuild_baseline(
     }
     let entry = region::parse(&fs::read(stage.join("TableCatalog.bytes"))?)?;
     Baselines::default().checked(&stage.join(name), &entry, control)?;
-    verify_sqlite(&stage.join(name), control)?;
+    verify_sqlite(&stage.join(name), work, control)?;
     storage::write_locked(
         &stage.join("baseline.json"),
         &serde_json::to_vec_pretty(&json!({
@@ -139,7 +146,7 @@ pub fn rebuild_baseline(
         }))?,
     )?;
     let current = region::locate(live.dir.to_str().ok_or_else(|| invalid("游戏路径无效。"))?)?;
-    if baseline_plan(&current, root, control)?["token"] != *expected {
+    if baseline_plan(&current, root, work, control)?["token"] != *expected {
         return Err(invalid(
             "重建期间资源发生变化，暂存副本已保留，原底稿未替换。",
         ));

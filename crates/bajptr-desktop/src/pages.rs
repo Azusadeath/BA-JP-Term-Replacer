@@ -219,7 +219,7 @@ impl Desktop {
             }
             let can_promote = can_edit && self.connected && self.sources_ready
                 && !self.path_dirty && self.busy.is_none()
-                && slice(&self.state, "edits").iter().any(|edit| edit["active"] == true);
+                && self.has_active_edits();
             if ui.add_enabled(can_promote,ToolButton::new("整理批量修改"))
                 .clicked() {
                 self.submit("promotion_start",json!({"revision":self.revision()}),"正在核对并整理批量修改…");

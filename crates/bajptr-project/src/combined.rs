@@ -13,8 +13,8 @@ pub fn rule_matches(rule: &Rule, old: &str, new: &str) -> bool {
             .is_ok_and(|scope| scope.is_some_and(|names| !names.is_empty()))
 }
 pub fn batch_matches(edit: &Edit, game: &str, version: &str, old: &str, new: &str) -> bool {
-    edit.game == game
-        && edit.version == version
+    edit.game.as_ref() == game
+        && edit.version.as_ref() == version
         && edit.batch
         && edit
             .batch_operation

@@ -1,15 +1,15 @@
-use bajptr_project::worker::Worker;
+use bajptr_project::worker::{DesktopEvent, Worker};
 use serde_json::Value;
 use std::{path::Path, sync::Arc};
 pub struct Backend {
-    worker: Worker,
+    worker: Worker<DesktopEvent>,
     next: u64,
     ctx: eframe::egui::Context,
 }
 impl Backend {
     pub fn start(_project: &Path, data: &Path, ctx: eframe::egui::Context) -> Result<Self, String> {
         let repaint = ctx.clone();
-        Worker::start(
+        Worker::start_desktop(
             data.to_path_buf(),
             Arc::new(move || repaint.request_repaint()),
         )
@@ -36,7 +36,7 @@ impl Backend {
         self.worker.send(id, action, payload)?;
         Ok(id)
     }
-    pub fn poll(&self) -> (Vec<Value>, bool) {
+    pub fn poll(&self) -> (Vec<DesktopEvent>, bool) {
         let mut events = Vec::new();
         for _ in 0..200 {
             match self.worker.events.try_recv() {
@@ -61,13 +61,16 @@ mod tests {
         assert!(!backend.poll().1);
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
-            .send(serde_json::json!({"id":7,"event":"progress"}))
+            .send(DesktopEvent {
+                value: serde_json::json!({"id":7,"event":"progress"}),
+                edits: None,
+            })
             .unwrap();
         drop(sender);
         backend.worker.events = receiver;
         let (events, disconnected) = backend.poll();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["id"], 7);
+        assert_eq!(events[0].value["id"], 7);
         assert!(disconnected);
     }
 }

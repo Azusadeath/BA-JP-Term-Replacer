@@ -4,9 +4,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 fn main() {
-    if let Some(code) = bajptr_project::cleanup::handle_mode() {
-        std::process::exit(code);
-    }
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|s| s == "--engine-stdio") {
         kernel_stdio();

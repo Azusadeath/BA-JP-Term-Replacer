@@ -3,7 +3,10 @@ use crate::{Error, Result, invalid};
 use aho_corasick::AhoCorasick;
 use fancy_regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Rule {
@@ -34,6 +37,11 @@ impl Evidence {
             hits: vec![0; count],
             misses: vec![None; count],
             explain,
+        }
+    }
+    fn hit(&mut self, index: usize) {
+        if let Some(count) = self.hits.get_mut(index) {
+            *count += 1;
         }
     }
     fn miss(&mut self, index: usize, reason: &str, text: &str, table: &str) {
@@ -581,19 +589,34 @@ pub fn regex_sample(old: &str, new: &str, text: &str) -> Result<(String, usize)>
     Ok((out, count))
 }
 
+#[derive(Default)]
 pub struct Rules {
     pub values: Vec<Rule>,
     scopes: Vec<Option<HashSet<String>>>,
     candidate: Option<AhoCorasick>,
+    pattern_rules: Vec<Vec<usize>>,
+    unindexed: Vec<usize>,
     regex: Vec<Option<PortableRegex>>,
+    views: Mutex<HashMap<String, Arc<View>>>,
 }
 pub struct View {
     pub table: String,
-    exact: HashMap<String, usize>,
-    subs: Vec<usize>,
-    regex: Vec<usize>,
-    eligible: Vec<usize>,
-    excluded: Vec<(usize, &'static str)>,
+    scopes: Vec<RuleScope>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleScope {
+    Eligible,
+    Outside,
+    Overridden,
+}
+impl RuleScope {
+    fn exclusion(self) -> Option<&'static str> {
+        match self {
+            Self::Eligible => None,
+            Self::Outside => Some("原词出现在未选中的文本表里。请核对来源范围。"),
+            Self::Overridden => Some("该文本表有同原词的专用规则，已覆盖这条全局规则。"),
+        }
+    }
 }
 
 fn rule_error(index: usize, original: &str, error: Error) -> Error {
@@ -609,11 +632,12 @@ fn rule_error(index: usize, original: &str, error: Error) -> Error {
 
 // Match only required, contiguous UTF-8 bytes. Complex regexes still run on
 // every eligible field, including patterns that can match empty text.
-fn candidate_matcher(rules: &[Rule]) -> Option<AhoCorasick> {
-    let mut needles = Vec::new();
-    for rule in rules {
+fn candidate_matcher(rules: &[Rule]) -> (Option<AhoCorasick>, Vec<Vec<usize>>, Vec<usize>) {
+    let mut needles = HashMap::<&str, Vec<usize>>::new();
+    let mut unindexed = Vec::new();
+    for (index, rule) in rules.iter().enumerate() {
         if rule.mode != "re" {
-            needles.push(rule.old.as_str());
+            needles.entry(&rule.old).or_default().push(index);
             continue;
         }
         let body = rule
@@ -621,20 +645,26 @@ fn candidate_matcher(rules: &[Rule]) -> Option<AhoCorasick> {
             .strip_prefix("(?:")
             .and_then(|part| part.strip_suffix(')'))
             .unwrap_or(&rule.old);
-        for alternative in body.split('|') {
-            if alternative.is_empty() || alternative.chars().any(|c| r"\.^$*+?{}[]()".contains(c)) {
-                return None;
-            }
-            needles.push(alternative);
+        let alternatives = body.split('|');
+        if alternatives.clone().any(|alternative| {
+            alternative.is_empty() || alternative.chars().any(|c| r"\.^$*+?{}[]()".contains(c))
+        }) {
+            unindexed.push(index);
+            continue;
+        }
+        for alternative in alternatives {
+            needles.entry(alternative).or_default().push(index);
         }
     }
-    AhoCorasick::new(needles).ok()
+    let (patterns, owners): (Vec<_>, Vec<_>) = needles.into_iter().unzip();
+    (AhoCorasick::new(patterns).ok(), owners, unindexed)
 }
 
 impl Rules {
     pub fn new(values: Vec<Rule>) -> Result<Self> {
         let mut scopes = Vec::new();
         let mut regex = Vec::new();
+        let mut first = HashMap::new();
         for (index, r) in values.iter().enumerate() {
             if r.old.is_empty()
                 || r.old.len() > MAX_STRING
@@ -662,22 +692,33 @@ impl Rules {
                 }
                 Some(names.into_iter().collect::<HashSet<String>>())
             };
-            for previous in 0..index {
-                let p = &values[previous];
-                if p.old == r.old && p.mode == r.mode {
-                    let conflict = match (&scope, &scopes[previous]) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => !a.is_disjoint(b),
-                        _ => false,
-                    };
-                    if conflict {
-                        return Err(invalid(format!(
-                            "第 {} 条与第 {} 条词条冲突。",
-                            index + 1,
-                            previous + 1
-                        )));
+            let tables = scope
+                .iter()
+                .flatten()
+                .cloned()
+                .map(Some)
+                .chain(std::iter::once(None).filter(|_| scope.is_none()));
+            let mut previous = None;
+            for table in tables {
+                use std::collections::hash_map::Entry;
+                match first.entry((r.old.as_str(), r.mode.as_str(), table)) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(index);
+                    }
+                    Entry::Occupied(entry) => {
+                        let position = *entry.get();
+                        previous = Some(
+                            previous.map_or(position, |previous: usize| previous.min(position)),
+                        );
                     }
                 }
+            }
+            if let Some(previous) = previous {
+                return Err(invalid(format!(
+                    "第 {} 条与第 {} 条词条冲突。",
+                    index + 1,
+                    previous + 1
+                )));
             }
             regex.push(match r.mode.as_str() {
                 "exact" | "sub" => None,
@@ -686,16 +727,55 @@ impl Rules {
             });
             scopes.push(scope);
         }
-        let candidate = candidate_matcher(&values);
+        let (candidate, pattern_rules, unindexed) = candidate_matcher(&values);
         Ok(Self {
             values,
             scopes,
             regex,
             candidate,
+            pattern_rules,
+            unindexed,
+            views: Mutex::default(),
         })
     }
     pub(crate) fn may_match_blob(&self, blob: &[u8]) -> bool {
-        !self.values.is_empty() && self.candidate.as_ref().is_none_or(|m| m.is_match(blob))
+        !self.values.is_empty()
+            && (!self.unindexed.is_empty()
+                || self.candidate.as_ref().is_none_or(|m| m.is_match(blob)))
+    }
+
+    fn field_candidates(&self, text: &str, ascii: bool) -> Vec<usize> {
+        let all = || {
+            self.values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, rule)| (!ascii || rule.mode == "exact").then_some(index))
+                .collect()
+        };
+        let Some(matcher) = &self.candidate else {
+            return all();
+        };
+        let mut indices = Vec::new();
+        if !ascii {
+            indices.extend_from_slice(&self.unindexed);
+        }
+        let mut patterns = HashSet::new();
+        for (count, hit) in matcher.find_overlapping_iter(text).enumerate() {
+            if count >= text.len().saturating_add(self.values.len()) {
+                return all();
+            }
+            if patterns.insert(hit.pattern()) {
+                indices.extend(
+                    self.pattern_rules[hit.pattern().as_usize()]
+                        .iter()
+                        .copied()
+                        .filter(|&index| !ascii || self.values[index].mode == "exact"),
+                );
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
     }
 
     pub fn validate_tables(&self, tables: &[String]) -> Result<()> {
@@ -717,7 +797,11 @@ impl Rules {
         }
         Ok(())
     }
-    pub fn view(&self, table: &str) -> View {
+    pub fn view(&self, table: &str) -> Arc<View> {
+        let mut views = self.views.lock().unwrap();
+        if let Some(view) = views.get(table) {
+            return view.clone();
+        }
         let overrides: HashSet<_> = self
             .values
             .iter()
@@ -725,47 +809,35 @@ impl Rules {
             .filter(|(i, _)| self.scopes[*i].as_ref().is_some_and(|s| s.contains(table)))
             .map(|(_, r)| (r.old.as_str(), r.mode.as_str()))
             .collect();
-        let mut view = View {
-            table: table.into(),
-            exact: HashMap::new(),
-            subs: Vec::new(),
-            regex: Vec::new(),
-            eligible: Vec::new(),
-            excluded: Vec::new(),
-        };
-        for (i, r) in self.values.iter().enumerate() {
-            if self.scopes[i].as_ref().is_some_and(|s| !s.contains(table)) {
-                view.excluded
-                    .push((i, "原词出现在未选中的文本表里。请核对来源范围。"));
-                continue;
-            }
-            if self.scopes[i].is_none() && overrides.contains(&(r.old.as_str(), r.mode.as_str())) {
-                view.excluded
-                    .push((i, "该文本表有同原词的专用规则，已覆盖这条全局规则。"));
-                continue;
-            }
-            view.eligible.push(i);
-            match r.mode.as_str() {
-                "exact" => {
-                    view.exact.insert(r.old.clone(), i);
+        let scopes = self
+            .values
+            .iter()
+            .zip(&self.scopes)
+            .map(|(rule, scope)| match scope {
+                Some(names) if !names.contains(table) => RuleScope::Outside,
+                None if overrides.contains(&(rule.old.as_str(), rule.mode.as_str())) => {
+                    RuleScope::Overridden
                 }
-                "sub" => view.subs.push(i),
-                _ => view.regex.push(i),
-            }
+                _ => RuleScope::Eligible,
+            })
+            .collect();
+        let view = Arc::new(View {
+            table: table.into(),
+            scopes,
+        });
+        if views.len() >= 64 {
+            views.clear();
         }
-        view.subs
-            .sort_by_key(|i| std::cmp::Reverse(self.values[*i].old.chars().count()));
+        views.insert(table.into(), view.clone());
         view
     }
     /// Match each rule against unchanged text for source-update notices.
     /// Scopes and replacement precedence do not hide potential matches here.
     pub fn original_matches(&self, text: &str) -> Result<Vec<usize>> {
         let cjk = crate::fields::has_cjk(text);
-        self.values
-            .iter()
-            .enumerate()
-            .filter(|(_, rule)| cjk || rule.mode == "exact")
-            .filter_map(|(index, _)| match self.matches(index, text) {
+        self.field_candidates(text, !cjk)
+            .into_iter()
+            .filter_map(|index| match self.matches(index, text) {
                 Ok(true) => Some(Ok(index)),
                 Ok(false) => None,
                 Err(e) => Some(Err(rule_error(index, &self.values[index].old, e))),
@@ -788,20 +860,23 @@ impl Rules {
 }
 
 impl View {
-    fn observe(&self, rules: &Rules, text: &str, e: &mut Evidence, ascii: bool) -> Result<()> {
-        if !e.explain {
-            return Ok(());
-        }
-        for &(i, reason) in &self.excluded {
-            if (!ascii || rules.values[i].mode == "exact")
-                && e.misses[i].is_none()
-                && rules.matches(i, text)?
-            {
-                e.miss(i, reason, text, &self.table);
+    fn observe(
+        &self,
+        rules: &Rules,
+        text: &str,
+        e: &mut Evidence,
+        candidates: &[usize],
+    ) -> Result<()> {
+        for &i in candidates {
+            if e.misses[i].is_some() {
+                continue;
             }
-        }
-        for (old, &i) in &self.exact {
-            if text != old && text.contains(old) {
+            let rule = &rules.values[i];
+            if let Some(reason) = self.scopes[i].exclusion() {
+                if rules.matches(i, text)? {
+                    e.miss(i, reason, text, &self.table);
+                }
+            } else if rule.mode == "exact" && text != rule.old && text.contains(&rule.old) {
                 e.miss(
                     i,
                     "“整段相同”要求整段文字一致；示例中原词只是句子的一部分。可改为“包含文字”。",
@@ -813,10 +888,11 @@ impl View {
         Ok(())
     }
     pub fn overridden(&self, rules: &Rules, text: &str, e: &mut Evidence) -> Result<()> {
-        self.observe(rules, text, e, false)?;
         if e.explain {
-            for &i in &self.eligible {
-                if rules.matches(i, text)? {
+            let candidates = rules.field_candidates(text, false);
+            self.observe(rules, text, e, &candidates)?;
+            for i in candidates {
+                if self.scopes[i] == RuleScope::Eligible && rules.matches(i, text)? {
                     e.miss(
                         i,
                         "这段文本已有单条修改，使用指定的最终文字，不再执行通用词表。",
@@ -835,12 +911,21 @@ impl View {
         e: &mut Evidence,
         ascii: bool,
     ) -> Result<Option<String>> {
-        self.observe(rules, text, e, ascii)?;
-        if let Some(&i) = self.exact.get(text) {
+        let candidates = rules.field_candidates(text, ascii);
+        if e.explain {
+            self.observe(rules, text, e, &candidates)?;
+        }
+        if let Some(i) = candidates.iter().copied().find(|&index| {
+            let rule = &rules.values[index];
+            self.scopes[index] == RuleScope::Eligible && rule.mode == "exact" && rule.old == text
+        }) {
             let new = &rules.values[i].new;
             if !ascii && e.explain {
-                for &other in &self.eligible {
-                    if other != i && rules.matches(other, text)? {
+                for other in candidates {
+                    if other != i
+                        && self.scopes[other] == RuleScope::Eligible
+                        && rules.matches(other, text)?
+                    {
                         e.miss(
                             other,
                             "整段相同规则已占用这段原文，其他重叠规则不再处理。",
@@ -851,7 +936,7 @@ impl View {
                 }
             }
             if new != text {
-                e.hits[i] += 1;
+                e.hit(i);
                 return Ok(Some(new.clone()));
             }
             e.miss(i, "原文字与替换文字相同，无需修改。", text, &self.table);
@@ -860,6 +945,21 @@ impl View {
         if ascii {
             return Ok(None);
         }
+        let (mut subs, regex): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .filter(|&index| {
+                self.scopes[index] == RuleScope::Eligible && rules.values[index].mode != "exact"
+            })
+            .partition(|&index| rules.values[index].mode == "sub");
+        if subs.is_empty() && regex.is_empty() {
+            return Ok(None);
+        }
+        subs.sort_unstable_by_key(|&index| {
+            (
+                std::cmp::Reverse(rules.values[index].old.chars().count()),
+                index,
+            )
+        });
         let mut occupied = vec![false; text.len() + 1];
         let mut zeroes = HashMap::new();
         let mut edits = Vec::new();
@@ -901,16 +1001,16 @@ impl View {
                 occupied[start..end].fill(true);
             }
             edits.push((start, end, replacement));
-            e.hits[i] += 1;
+            e.hit(i);
             Ok(())
         };
-        for &i in &self.subs {
+        for i in subs {
             let r = &rules.values[i];
             for (at, _) in text.match_indices(&r.old) {
                 accept(at, at + r.old.len(), r.new.clone(), i)?;
             }
         }
-        for &i in &self.regex {
+        for i in regex {
             let re = rules.regex[i].as_ref().unwrap();
             re.for_each(text, |caps| {
                 let m = caps.get(0).unwrap();

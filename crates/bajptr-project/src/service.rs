@@ -10,26 +10,33 @@ use crate::{
 };
 use bajptr_core::{
     codec, database,
-    protocol::{Session, execute},
+    protocol::{self, Session, execute},
     rules::{Rule, Rules},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque, hash_map::Entry},
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub struct Config {
-    pub rules: Vec<Rule>,
-    pub edits: Vec<Edit>,
-    pub rules_path: Option<PathBuf>,
-    pub edits_path: Option<PathBuf>,
+    rules: Vec<Rule>,
+    edits: Arc<Vec<Edit>>,
+    rules_document: Option<DocumentRevision>,
+    edits_document: Option<DocumentRevision>,
     pub ascii_exact: bool,
     pub tables: String,
     pub work_dir: Option<PathBuf>,
+    compiled: RefCell<Option<Arc<Rules>>>,
+}
+struct DocumentRevision {
+    path: PathBuf,
+    digest: Option<String>,
 }
 pub struct PatchJob<'a> {
     pub game: &'a str,
@@ -42,43 +49,95 @@ pub struct PatchJob<'a> {
 }
 impl Config {
     pub fn new(rules: Vec<Rule>, edits: Vec<Edit>) -> Self {
+        Self::from_shared_edits(rules, Arc::new(edits))
+    }
+    pub fn from_compiled_rules(rules: Rules) -> Self {
+        let mut config = Self::new(rules.values.clone(), vec![]);
+        *config.compiled.get_mut() = Some(Arc::new(rules));
+        config
+    }
+    pub fn from_glossary(path: Option<PathBuf>) -> Result<Self> {
+        let Some(path) = path else {
+            return Ok(Self::from_compiled_rules(Rules::default()));
+        };
+        let bytes = fs::read(&path)?;
+        let mut config = Self::from_compiled_rules(model::parse_compiled_rules(&bytes)?);
+        config.rules_document = Some(DocumentRevision {
+            path,
+            digest: Some(storage::digest(&bytes)),
+        });
+        Ok(config)
+    }
+    pub(crate) fn from_shared_edits(rules: Vec<Rule>, edits: Arc<Vec<Edit>>) -> Self {
         Self {
             rules,
             edits,
-            rules_path: None,
-            edits_path: None,
+            rules_document: None,
+            edits_document: None,
             ascii_exact: true,
             tables: database::default_tables(),
             work_dir: None,
+            compiled: RefCell::new(None),
         }
     }
-    fn options(&self, game: &str, version: &str) -> Result<Value> {
-        Ok(
-            json!({"ascii_exact":self.ascii_exact,"tables":self.tables,"explain":true,"edits":model::final_edits(&self.edits,game,version)?}),
-        )
+    pub(crate) fn with_documents(mut self, store: &storage::Store, compiled: Arc<Rules>) -> Self {
+        let document = |name| {
+            store
+                .expected_revision(name)
+                .map(|digest| DocumentRevision {
+                    path: store.root.join(name),
+                    digest: digest.clone(),
+                })
+        };
+        self.rules_document = document("rules.tsv");
+        self.edits_document = document("text-edits.json");
+        *self.compiled.get_mut() = Some(compiled);
+        self
     }
-    fn check_documents(&self) -> Result<()> {
-        if let Some(path) = &self.rules_path {
-            let rules = if path.exists() {
-                model::parse_rules(&fs::read(path)?)?
-            } else {
-                vec![]
-            };
-            if rules != self.rules {
-                return Err(invalid("词表已被其他窗口修改，请重新打开并预览。"));
-            }
+    pub fn compiled_rules(&self) -> Result<Arc<Rules>> {
+        let mut compiled = self.compiled.borrow_mut();
+        if let Some(rules) = compiled.as_ref().filter(|rules| rules.values == self.rules) {
+            return Ok(rules.clone());
         }
-        if let Some(path) = &self.edits_path {
-            let edits = if path.exists() {
-                model::parse_edits(&fs::read(path)?)?
-            } else {
-                vec![]
-            };
-            if edits != self.edits {
-                return Err(invalid("单条修改记录已变化，请重新打开并预览。"));
+        let rules = Arc::new(Rules::new(self.rules.clone())?);
+        *compiled = Some(rules.clone());
+        Ok(rules)
+    }
+    fn options(&self, game: &str, version: &str) -> Result<database::Options> {
+        Ok(database::Options {
+            ascii_exact: self.ascii_exact,
+            tables: self.tables.clone(),
+            explain: true,
+            edits: model::final_edits(&self.edits, game, version)?,
+        })
+    }
+    pub fn check_documents(&self) -> Result<()> {
+        for (document, changed) in [
+            (
+                &self.rules_document,
+                "词表已被其他窗口修改，请重新打开并预览。",
+            ),
+            (
+                &self.edits_document,
+                "单条修改记录已变化，请重新打开并预览。",
+            ),
+        ] {
+            if let Some(document) = document
+                && storage::revision(&document.path)? != document.digest
+            {
+                return Err(invalid(changed));
             }
         }
         Ok(())
+    }
+    pub fn lock_checked_documents(&self) -> Result<Vec<Lock>> {
+        let locks = [&self.rules_document, &self.edits_document]
+            .into_iter()
+            .flatten()
+            .map(|document| Lock::acquire(&document.path))
+            .collect::<Result<Vec<_>>>()?;
+        self.check_documents()?;
+        Ok(locks)
     }
 }
 #[derive(Default)]
@@ -133,6 +192,11 @@ fn same_bundle(left: &Path, right: &Path, control: &Control<'_>) -> Result<bool>
 }
 
 impl Engine {
+    pub fn with_work(work: PathBuf) -> Self {
+        let mut engine = Self::default();
+        engine.baselines = Baselines::with_work(work);
+        engine
+    }
     pub fn rebuild_baseline(
         &mut self,
         game: &str,
@@ -144,11 +208,17 @@ impl Engine {
         let _lock = Lock::acquire(&live.catalog)?;
         if let Some(expected) = expected {
             self.close();
-            let result = crate::recovery::rebuild_baseline(&live, root, expected, control)?;
-            self.baselines = Baselines::default();
+            let result = crate::recovery::rebuild_baseline(
+                &live,
+                root,
+                &self.baselines.work,
+                expected,
+                control,
+            )?;
+            self.baselines = Baselines::with_work(self.baselines.work.clone());
             Ok(result)
         } else {
-            crate::recovery::baseline_plan(&live, root, control)
+            crate::recovery::baseline_plan(&live, root, &self.baselines.work, control)
         }
     }
     pub(crate) fn migration_candidates(
@@ -177,11 +247,13 @@ impl Engine {
         let current = region::version(&live.catalog)?;
         let game = storage::identity(&live.dir)?;
         let mut versions = std::collections::BTreeMap::<String, Vec<&mut Edit>>::new();
-        for edit in edits
-            .iter_mut()
-            .filter(|edit| edit.anchor.is_none() && edit.game == game && edit.version != current)
-        {
-            versions.entry(edit.version.clone()).or_default().push(edit);
+        for edit in edits.iter_mut().filter(|edit| {
+            edit.anchor.is_none() && edit.game.as_ref() == game && edit.version.as_ref() != current
+        }) {
+            versions
+                .entry(edit.version.to_string())
+                .or_default()
+                .push(edit);
         }
         for (version, edits) in versions {
             let result = (|| -> Result<()> {
@@ -189,15 +261,16 @@ impl Engine {
                 else {
                     return Ok(());
                 };
-                let db = database::Database::open(
+                let db = database::Database::open_in(
                     &source.bundle,
                     true,
                     &codec::key(region::KEY)?,
                     control,
+                    &self.baselines.work,
                 )?;
                 for edit in edits {
                     let row = (
-                        edit.table.clone(),
+                        edit.table.to_string(),
                         edit.row_id.clone(),
                         edit.slot,
                         edit.original.clone(),
@@ -235,7 +308,10 @@ impl Engine {
         self.close_session();
     }
     fn close_session(&mut self) {
-        self.session = Session::default();
+        self.session = Session {
+            work_dir: Some(self.baselines.work.clone()),
+            ..Session::default()
+        };
         self.source_key = None;
         self.identical_live = None;
         self.search_index = None;
@@ -247,11 +323,13 @@ impl Engine {
         if self.source_key.as_ref() != Some(&key) {
             self.close_session();
             control.log("正在读取初始底稿…")?;
-            execute(
-                &mut self.session,
-                json!({"op":"open","input":original.bundle,"key":region::KEY,"encrypted":true}),
+            self.session.database = Some(database::Database::open_in(
+                &original.bundle,
+                true,
+                &codec::key(region::KEY)?,
                 control,
-            )?;
+                &self.baselines.work,
+            )?);
             self.source_key = Some(key);
         }
         Ok(())
@@ -280,12 +358,13 @@ impl Engine {
         } else {
             self.close_session();
             control.log("正在读取初始底稿…")?;
-            let db = database::Database::open_verified(
+            let db = database::Database::open_verified_in(
                 &original.bundle,
                 &codec::key(region::KEY)?,
                 control,
                 entry.size,
                 entry.crc,
+                &self.baselines.work,
             )?;
             if baseline::stamp(&original.bundle)? != source_stamp {
                 return Err(invalid("数据库在读取期间发生变化，请重试。"));
@@ -429,7 +508,7 @@ impl Engine {
         game: &str,
         root: &Path,
         names: &[String],
-        rules: &[Rule],
+        rules: &Rules,
         control: &Control<'_>,
     ) -> Result<Vec<database::SourceRuleMatch>> {
         let original = self.baseline(game, root, control)?;
@@ -442,7 +521,7 @@ impl Engine {
                 .ok_or_else(|| invalid("底稿尚未读取。"))?
                 .con,
             names,
-            &bajptr_core::rules::Rules::new(rules.to_vec())?,
+            rules,
             control,
         )
     }
@@ -472,13 +551,13 @@ impl Engine {
                 game,
                 root,
                 &names,
-                &[Rule {
+                &Rules::new(vec![Rule {
                     old: old.into(),
                     new: String::new(),
                     mode: mode.into(),
                     source: String::new(),
                     table: String::new(),
-                }],
+                }])?,
                 control,
             )?
             .into_iter()
@@ -618,7 +697,9 @@ impl Engine {
         let current: Vec<_> = plan
             .edits
             .iter()
-            .filter(|edit| edit.game == game_key && edit.version == original.version)
+            .filter(|edit| {
+                edit.game.as_ref() == game_key && edit.version.as_ref() == original.version
+            })
             .cloned()
             .collect();
         let rules = Rules::new(plan.rules.clone())?;
@@ -637,14 +718,27 @@ impl Engine {
                     let entries = match snapshots.entry(source.snapshot.clone()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
-                            let path = data.join(".gui").join(format!(
-                                "text-edits-before-migration-{}.json",
-                                &source.snapshot[..16]
-                            ));
+                            let gui = data.join(".gui");
+                            let path = gui
+                                .join("recovery")
+                                .join(format!("migration-{}", source.snapshot))
+                                .join("text-edits.json");
                             let bytes = match fs::read(path) {
                                 Ok(bytes) => bytes,
                                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                    return Ok(None);
+                                    let legacy = gui.join(format!(
+                                        "text-edits-before-migration-{}.json",
+                                        &source.snapshot[..16]
+                                    ));
+                                    match fs::read(legacy) {
+                                        Ok(bytes) => bytes,
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::NotFound =>
+                                        {
+                                            return Ok(None);
+                                        }
+                                        Err(error) => return Err(error.into()),
+                                    }
                                 }
                                 Err(error) => return Err(error.into()),
                             };
@@ -657,7 +751,7 @@ impl Engine {
                     let selected: Vec<_> = entries
                         .iter()
                         .filter(|edit| {
-                            edit.table == item.table
+                            edit.table.as_ref() == item.table
                                 && crate::combined::batch_matches(
                                     edit,
                                     &game_key,
@@ -681,11 +775,12 @@ impl Engine {
                             )?;
                             let db = baseline
                                 .map(|baseline| {
-                                    database::Database::open(
+                                    database::Database::open_in(
                                         &baseline.bundle,
                                         true,
                                         &codec::key(region::KEY)?,
                                         control,
+                                        &self.baselines.work,
                                     )
                                 })
                                 .transpose()?;
@@ -748,21 +843,22 @@ impl Engine {
         config: &Config,
         control: &Control<'_>,
     ) -> Result<Value> {
-        config.check_documents()?;
         let live = region::locate(game)?;
         let identity = region::resource_identity(&live)?;
         let original = self.open_baseline(&live, backup_root, control)?;
-        let options = config.options(&storage::identity(&live.dir)?, &original.version)?;
-        let key = storage::digest(&serde_json::to_vec(&json!([
-            identity,
-            config.rules,
-            options,
-            config.edits
-        ]))?);
+        let game_key = storage::identity(&live.dir)?;
+        let key = storage::serialized_digest(&(
+            &identity,
+            &original.version,
+            &config.rules,
+            &config.edits,
+            &config.tables,
+            config.ascii_exact,
+        ))?;
         let mut stats = if let Some((_, stats)) = self.previews.iter().find(|(k, _)| k == &key) {
             stats.clone()
         } else {
-            let mut request = json!({"op":"preview","rules":config.rules,"options":options});
+            let mut compare = false;
             if self.identical_live.as_ref() != Some(&identity) {
                 let eligible = original.bundle.file_name().is_some_and(|name| {
                     name.to_string_lossy()
@@ -771,12 +867,21 @@ impl Engine {
                 if eligible && same_bundle(&live.bundle, &original.bundle, control)? {
                     self.identical_live = Some(identity.clone());
                 } else {
-                    request["current"] = json!(live.bundle);
-                    request["current_identity"] = json!(identity.to_string());
-                    request["key"] = json!(region::KEY);
+                    compare = true;
                 }
             }
-            let mut value = execute(&mut self.session, request, control)?;
+            let rules = config.compiled_rules()?;
+            let options = config.options(&game_key, &original.version)?;
+            let comparison_key = compare.then(|| identity.to_string());
+            let mut value = serde_json::to_value(protocol::preview(
+                &mut self.session,
+                &rules,
+                options,
+                comparison_key
+                    .as_deref()
+                    .map(|id| (live.bundle.as_path(), Some(id), region::KEY)),
+                control,
+            )?)?;
             value["comparison_identity"] = identity.clone();
             value["zero_reasons"] = json!(
                 value["zero_reasons"]
@@ -791,8 +896,7 @@ impl Engine {
                     .edits
                     .iter()
                     .filter(
-                        |e| e.game == storage::identity(&live.dir).unwrap_or_default()
-                            && e.version != original.version
+                        |e| e.game.as_ref() == game_key && e.version.as_ref() != original.version
                     )
                     .map(Edit::array)
                     .collect::<Vec<_>>()
@@ -826,16 +930,17 @@ impl Engine {
         original: &Baseline,
         config: &Config,
     ) -> Result<String> {
-        Ok(storage::digest(&serde_json::to_vec(&json!([
+        storage::serialized_digest(&(
             region::resource_identity(game)?,
             storage::identity(&original.bundle)?,
             format!("{:?}", baseline::stamp(&original.bundle)?),
             storage::revision(&original.catalog)?,
             storage::revision(&original.catalog.with_file_name("baseline.json"))?,
-            config.rules,
-            config.edits,
-            config.options(&storage::identity(&game.dir)?, &original.version)?
-        ]))?))
+            &config.rules,
+            &config.edits,
+            &config.tables,
+            config.ascii_exact,
+        ))
     }
     /// Prepare a private, verified patch without publishing anything to the game
     /// or the user's fallback output directory. Closing the preview keeps it.
@@ -875,7 +980,6 @@ impl Engine {
             install,
             expected,
         } = job;
-        config.check_documents()?;
         let live = region::locate(game)?;
         let _game_lock = Lock::acquire(&live.catalog)?;
         let identity = region::resource_identity(&live)?;
@@ -895,21 +999,12 @@ impl Engine {
             {
                 self.check_prepared(&patch, control)?;
                 if prepare {
+                    config.check_documents()?;
                     return Ok(json!({
                         "ready":true,"reused":true,"cache_id":patch.key,"prepared_path":patch.output
                     }));
                 }
-                let _rules_lock = config
-                    .rules_path
-                    .as_ref()
-                    .map(|p| Lock::acquire(p))
-                    .transpose()?;
-                let _edits_lock = config
-                    .edits_path
-                    .as_ref()
-                    .map(|p| Lock::acquire(p))
-                    .transpose()?;
-                config.check_documents()?;
+                let _document_locks = config.lock_checked_documents()?;
                 if Self::preparation_key(&region::locate(game)?, &original, config)? != cache_key {
                     return Err(invalid("游戏资源或底稿已变化，请重新预览。"));
                 }
@@ -945,6 +1040,7 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| data.join(if prepare { "work/prepared" } else { "work" }));
         fs::create_dir_all(&stage_root)?;
+        let scratch;
         let stage = if prepare {
             self.invalidate_prepared();
             if self.preparation_stage.as_ref().is_some_and(|stage| {
@@ -965,10 +1061,10 @@ impl Engine {
                 .path()
                 .to_path_buf()
         } else {
-            let stage = stage_root.join(format!("patch-{}", uuid::Uuid::new_v4().simple()));
-            fs::create_dir(&stage)?;
-            crate::cleanup::mark(&stage)?;
-            stage
+            scratch = tempfile::Builder::new()
+                .prefix("patch-")
+                .tempdir_in(&stage_root)?;
+            scratch.path().to_path_buf()
         };
         let started = std::time::Instant::now();
         let result = (|| -> Result<Value> {
@@ -994,11 +1090,10 @@ impl Engine {
                 &decrypted
             };
             let options = config.options(&storage::identity(&live.dir)?, &original.version)?;
-            let stats = execute(
-                &mut Session::default(),
-                json!({"op":"patch_file","input":plain,"rules":config.rules,"options":options}),
-                control,
-            )?;
+            let rules = config.compiled_rules()?;
+            let stats = serde_json::to_value(protocol::patch_file(
+                &plain, &rules, &options, true, control,
+            )?)?;
             let connection = rusqlite::Connection::open_with_flags(
                 &plain,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1024,17 +1119,8 @@ impl Engine {
             if checked.ok == 0 || checked.bad > 0 {
                 return Err(invalid("生成资源 HMAC 校验失败，未发布补丁。"));
             }
-            let _rules_lock = config
-                .rules_path
-                .as_ref()
-                .map(|p| Lock::acquire(p))
-                .transpose()?;
-            let _edits_lock = config
-                .edits_path
-                .as_ref()
-                .map(|p| Lock::acquire(p))
-                .transpose()?;
-            config.check_documents()?;
+            fs::remove_file(&plain)?;
+            let _document_locks = config.lock_checked_documents()?;
             if fs::read(&live.catalog)? != live.bytes
                 || region::version(&live.catalog)? != original.version
                 || region::resource_identity(&region::locate(game)?)? != identity
@@ -1069,7 +1155,6 @@ impl Engine {
             if prepare {
                 let output = stage.join(&name);
                 fs::rename(&patch.output, &output)?;
-                fs::remove_file(&plain)?;
                 patch.output = output;
                 let result = json!({
                     "ready":true,"reused":false,"cache_id":patch.key,"prepared_path":patch.output
@@ -1093,16 +1178,14 @@ impl Engine {
                 &commit_control,
             )
         })();
-        if prepare {
-            if let Err(error) = &result {
-                let stage = self.preparation_stage.take().unwrap();
-                if !matches!(error, crate::Error::Cancelled) {
-                    let path = stage.keep();
-                    let _ = control.warn(&format!("补丁暂存文件保留在 {}。", path.display()));
-                }
+        if prepare
+            && result.is_err()
+            && let Some(stage) = self.preparation_stage.take()
+        {
+            let path = stage.path().to_path_buf();
+            if let Err(error) = stage.close() {
+                let _ = control.warn(&format!("临时目录清理失败 {}：{error}", path.display()));
             }
-        } else if result.is_ok() {
-            crate::cleanup::remove_success(&stage, control);
         }
         result
     }
@@ -1181,23 +1264,40 @@ impl Engine {
                     }
                     let _ = control.warn(&format!("安装补丁失败：{error}"));
                     let reason = crate::diagnostics::user_message("apply", &error);
-                    let target = save_patch(
+                    let target = match save_patch(
                         &mut self.baselines,
                         &patch.output,
                         output_root,
                         live,
                         name,
                         &entry,
+                        true,
                         &commit_control,
-                    )
-                    .map_err(|save_error| {
-                        let _ = control.warn(&format!("补丁导出失败：{save_error}"));
-                        invalid(format!(
-                            "应用失败：{reason}\n补丁保存失败：{}\n已校验的暂存文件保留在：{}",
-                            crate::diagnostics::user_message("export_text", &save_error),
-                            patch.output.parent().unwrap().display()
-                        ))
-                    })?;
+                    ) {
+                        Ok(target) => target,
+                        Err(save_error) => {
+                            let saved = save_patch(
+                                &mut self.baselines,
+                                &patch.output,
+                                &data.join("work/recovery"),
+                                live,
+                                name,
+                                &entry,
+                                true,
+                                &commit_control,
+                            );
+                            let recovery = match saved {
+                                Ok(path) => {
+                                    format!("已校验的补丁保留在暂存恢复目录 {}", path.display())
+                                }
+                                Err(error) => format!("暂存恢复目录写入失败：{error}"),
+                            };
+                            return Err(invalid(format!(
+                                "应用失败：{reason}\n补丁保存失败：{}\n{recovery}",
+                                crate::diagnostics::user_message("export_text", &save_error)
+                            )));
+                        }
+                    };
                     install_error = Some(reason);
                     target
                 }
@@ -1210,6 +1310,7 @@ impl Engine {
                 live,
                 name,
                 &entry,
+                false,
                 &commit_control,
             )?
         };
@@ -1299,6 +1400,7 @@ fn remember(cache: &mut VecDeque<(String, Value)>, key: String, value: Value, li
     }
     cache.push_back((key, value));
 }
+#[allow(clippy::too_many_arguments)]
 fn save_patch(
     checks: &mut Baselines,
     source: &Path,
@@ -1306,25 +1408,64 @@ fn save_patch(
     game: &region::Game,
     name: &str,
     entry: &region::Entry,
+    automatic: bool,
     control: &Control<'_>,
 ) -> Result<PathBuf> {
-    let folder = output_root.join(format!(
-        "patch-{}-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        uuid::Uuid::new_v4().simple()
-    ));
-    fs::create_dir_all(&folder)?;
-    let target = folder.join(name);
-    publish_resource(checks, source, &target, entry.size, entry.crc, control)?;
     let mut catalog = game.bytes.clone();
     catalog[game.entry.size_offset..game.entry.size_offset + 8]
         .copy_from_slice(&(entry.size as i64).to_le_bytes());
     catalog[game.entry.crc_offset..game.entry.crc_offset + 8]
         .copy_from_slice(&(entry.crc as i64).to_le_bytes());
-    storage::write_locked(&folder.join("TableCatalog.bytes"), &catalog)?;
     let marker = game.catalog.with_file_name("TableCatalog.hash");
-    if marker.is_file() {
-        baseline::copy_sync(&marker, &folder.join("TableCatalog.hash"))?;
+    let marker = match fs::read(marker) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let content = storage::file_digest(source)?;
+    let id = storage::serialized_digest(&(name, &content, storage::digest(&catalog), &marker))?;
+    let root = if automatic {
+        let game_id = storage::digest(storage::identity(&game.dir)?.as_bytes());
+        output_root.join("automatic").join(game_id)
+    } else {
+        output_root.to_path_buf()
+    };
+    let _lock = Lock::acquire(&root.join(".packages"))?;
+    fs::create_dir_all(&root)?;
+    let folder = root.join(format!("patch-{id}"));
+    let target = folder.join(name);
+    if folder.exists() {
+        if !storage::is_plain_directory(&folder)?
+            || storage::file_digest(&target)? != content
+            || fs::read(folder.join("TableCatalog.bytes"))? != catalog
+            || storage::revision(&folder.join("TableCatalog.hash"))?
+                != marker.as_deref().map(storage::digest)
+        {
+            return Err(invalid("同名补丁内容已变化，请选择其他输出目录。"));
+        }
+    } else {
+        let stage = tempfile::Builder::new()
+            .prefix("pending-")
+            .tempdir_in(&root)?;
+        publish_resource(
+            checks,
+            source,
+            &stage.path().join(name),
+            entry.size,
+            entry.crc,
+            control,
+        )?;
+        storage::write_locked(&stage.path().join("TableCatalog.bytes"), &catalog)?;
+        if let Some(marker) = marker {
+            storage::write_locked(&stage.path().join("TableCatalog.hash"), &marker)?;
+        }
+        if automatic {
+            crate::cleanup::mark_managed(stage.path())?;
+        }
+        fs::rename(stage.path(), &folder)?;
+    }
+    if automatic {
+        crate::cleanup::retain_recent(&root, "patch-", 2, |key| key == id, control);
     }
     Ok(target)
 }
@@ -1382,7 +1523,7 @@ pub fn record(
     let edits = config
         .edits
         .iter()
-        .filter(|e| e.game == key)
+        .filter(|e| e.game.as_ref() == key)
         .cloned()
         .collect::<Vec<_>>();
     let path = data.join(".gui/application-state.json");
@@ -1460,7 +1601,7 @@ pub fn status(game: &str, data: &Path, config: &Config) -> Result<String> {
     let edits = config
         .edits
         .iter()
-        .filter(|e| e.game == key)
+        .filter(|e| e.game.as_ref() == key)
         .cloned()
         .collect::<Vec<_>>();
     Ok(if receipt["kind"] == "restored" {

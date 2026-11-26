@@ -71,8 +71,8 @@ pub(crate) fn plan_candidates(
 ) -> Result<Vec<Item>> {
     let occupied: HashSet<_> = edits
         .iter()
-        .filter(|e| e.game == game && e.version == version)
-        .map(|e| (e.table.as_str(), &e.row_id, e.slot))
+        .filter(|e| e.game.as_ref() == game && e.version.as_ref() == version)
+        .map(|e| (e.table.as_ref(), &e.row_id, e.slot))
         .collect();
     let mut by_original = HashMap::<(&str, &str), Vec<&LocatedText>>::new();
     let mut by_address = HashMap::new();
@@ -105,7 +105,7 @@ pub(crate) fn plan_candidates(
     for (index, edit) in edits
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.game == game && e.version != version)
+        .filter(|(_, e)| e.game.as_ref() == game && e.version.as_ref() != version)
     {
         let key = (&edit.version, &edit.table, &edit.row_id, edit.slot);
         let position = *positions.entry(key).or_insert_with(|| {
@@ -119,7 +119,7 @@ pub(crate) fn plan_candidates(
         control.check()?;
         let layers: Vec<_> = indices.iter().map(|&i| &edits[i]).collect();
         let edit = layers.iter().copied().max_by_key(|e| e.batch).unwrap();
-        let table = edit.table.as_str();
+        let table = edit.table.as_ref();
         let address = (table, &edit.row_id, edit.slot);
         let original_matches = by_original
             .get(&(table, edit.original.as_str()))
@@ -189,7 +189,10 @@ pub(crate) fn plan_candidates(
             changed.extend(corroborated.iter().copied().take(8));
             if matches.is_empty() || anchor_disagrees {
                 changed.extend(by_address.get(&address).copied());
-                if let Some(fuzzy) = pool.fuzzy.get(&(edit.table.clone(), edit.original.clone())) {
+                if let Some(fuzzy) = pool
+                    .fuzzy
+                    .get(&(edit.table.to_string(), edit.original.clone()))
+                {
                     changed.extend(fuzzy.iter());
                 }
             }
@@ -269,7 +272,7 @@ pub(crate) fn plan_candidates(
                 .as_bytes(),
             ),
             indices,
-            table: edit.table.clone(),
+            table: edit.table.to_string(),
             original: edit.original.clone(),
             replacement: edit.replacement.clone(),
             kind: kind.into(),
@@ -414,7 +417,7 @@ pub(crate) fn apply_choices(
     let mut batches = HashMap::new();
     for edit in edits
         .iter()
-        .filter(|e| e.game == game && e.version == version)
+        .filter(|e| e.game.as_ref() == game && e.version.as_ref() == version)
     {
         if let Some(op) = &edit.batch_operation {
             batches.insert((op.old.clone(), op.new.clone()), op.id.clone());
@@ -436,9 +439,9 @@ pub(crate) fn apply_choices(
             return Err(invalid("多条旧记录指向同一段新文本，请只保留一项。"));
         }
         if edits.iter().any(|e| {
-            e.game == game
-                && e.version == version
-                && e.table == candidate.row.0
+            e.game.as_ref() == game
+                && e.version.as_ref() == version
+                && e.table.as_ref() == candidate.row.0
                 && e.row_id == candidate.row.1
                 && e.slot == candidate.row.2
         }) {
@@ -471,9 +474,9 @@ pub(crate) fn apply_choices(
                 .cloned()
                 .ok_or_else(|| invalid("旧记录已变化，请重新核对。"))?;
             if !removed.insert(index)
-                || edit.game != game
-                || edit.version == version
-                || edit.table != item.table
+                || edit.game.as_ref() != game
+                || edit.version.as_ref() == version
+                || edit.table.as_ref() != item.table
                 || edit.original != item.original
                 || edit.row_id != item.row_id
                 || edit.slot != item.slot
@@ -481,7 +484,7 @@ pub(crate) fn apply_choices(
                 return Err(invalid("迁移范围已变化，请重新核对。"));
             }
             let source_version = std::mem::replace(&mut edit.version, version.into());
-            edit.table.clone_from(&candidate.row.0);
+            edit.table = candidate.row.0.as_str().into();
             edit.original.clone_from(&candidate.row.3);
             edit.anchor.clone_from(&candidate.anchor);
             if let Some(proposal) = &proposal {
@@ -498,7 +501,7 @@ pub(crate) fn apply_choices(
             edit.slot = candidate.row.2;
             if let Some(op) = &mut edit.batch_operation {
                 op.previous_scope = snapshot.map(|digest| model::PreviousBatchScope {
-                    version: source_version,
+                    version: source_version.to_string(),
                     snapshot: digest.into(),
                 });
                 op.id = batches
@@ -557,7 +560,7 @@ mod tests {
     fn edit(id: i64, original: &str) -> Edit {
         Edit {
             game: "game".into(),
-            version: "a".repeat(64),
+            version: "a".repeat(64).into(),
             table: "Text".into(),
             row_id: RowId::Integer(id),
             slot: 0,
@@ -619,7 +622,7 @@ mod tests {
     #[test]
     fn same_text_at_the_old_address_cannot_preempt_a_competing_version() {
         let mut other = edit(9, "唯一原文");
-        other.version = "c".repeat(64);
+        other.version = "c".repeat(64).into();
         other.replacement = "另一版结果".into();
         let plan = plan(
             &[edit(1, "唯一原文"), other],
@@ -645,7 +648,7 @@ mod tests {
     #[test]
     fn exact_matches_are_selected_while_relocations_duplicates_and_conflicts_need_review() {
         let mut current = edit(5, "已有");
-        current.version = "b".repeat(64);
+        current.version = "b".repeat(64).into();
         let edits = vec![
             edit(1, "一致"),
             edit(2, "移位"),
@@ -695,17 +698,17 @@ mod tests {
         assert!(
             updated
                 .iter()
-                .any(|e| e.version == "b".repeat(64) && e.row_id == RowId::Integer(20))
+                .any(|e| e.version.as_ref() == "b".repeat(64) && e.row_id == RowId::Integer(20))
         );
         assert_eq!(
             updated
                 .iter()
-                .find(|e| e.original == "已有" && e.version == "b".repeat(64))
+                .find(|e| e.original == "已有" && e.version.as_ref() == "b".repeat(64))
                 .unwrap(),
             &edits[5]
         );
         let mut older = edit(1, "一致");
-        older.version = "c".repeat(64);
+        older.version = "c".repeat(64).into();
         older.replacement = "另一版结果".into();
         let conflicts = plan(
             &[edits[0].clone(), older],
@@ -731,7 +734,7 @@ mod tests {
         assert!(
             updated
                 .iter()
-                .all(|e| e.version == "b".repeat(64) && e.replacement == "原文改")
+                .all(|e| e.version.as_ref() == "b".repeat(64) && e.replacement == "原文改")
         );
         assert_eq!(
             updated
@@ -759,7 +762,7 @@ mod tests {
         conflict[6].replacement = "不同修改".into();
         assert!(automatic_choices(&plan(&conflict, "game", &"b".repeat(64), &moved)).is_empty());
         conflict[6] = edits[6].clone();
-        conflict[6].version = "c".repeat(64);
+        conflict[6].version = "c".repeat(64).into();
         assert!(automatic_choices(&plan(&conflict, "game", &"b".repeat(64), &moved)).is_empty());
     }
 
@@ -813,17 +816,17 @@ mod tests {
         assert_eq!(
             updated
                 .iter()
-                .filter(|e| e.version == "b".repeat(64))
+                .filter(|e| e.version.as_ref() == "b".repeat(64))
                 .count(),
             2
         );
         let old = updated
             .iter()
-            .find(|e| e.version == "a".repeat(64))
+            .find(|e| e.version.as_ref() == "a".repeat(64))
             .unwrap();
         let new = updated
             .iter()
-            .find(|e| e.version == "b".repeat(64) && e.batch)
+            .find(|e| e.version.as_ref() == "b".repeat(64) && e.batch)
             .unwrap();
         assert_ne!(
             old.batch_operation.as_ref().unwrap().id,
@@ -852,7 +855,7 @@ mod tests {
             &"b".repeat(64),
         )
         .unwrap();
-        assert!(merged.iter().all(|e| e.version == "b".repeat(64)));
+        assert!(merged.iter().all(|e| e.version.as_ref() == "b".repeat(64)));
         assert_eq!(
             merged
                 .iter()

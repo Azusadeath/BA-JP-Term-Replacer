@@ -49,7 +49,7 @@ pub(crate) fn read_review(path: &Path) -> Result<BTreeSet<String>> {
 
 pub(crate) struct TableEvaluator<'a> {
     rules: &'a Rules,
-    view: View,
+    view: std::sync::Arc<View>,
     edits: HashMap<(&'a RowId, usize), &'a Edit>,
     evidence: Evidence,
 }
@@ -62,10 +62,11 @@ impl<'a> TableEvaluator<'a> {
         version: &str,
     ) -> Self {
         let mut indexed = HashMap::new();
-        for edit in edits
-            .iter()
-            .filter(|edit| edit.game == game && edit.version == version && edit.table == table)
-        {
+        for edit in edits.iter().filter(|edit| {
+            edit.game.as_ref() == game
+                && edit.version.as_ref() == version
+                && edit.table.as_ref() == table
+        }) {
             let previous: &mut &Edit = indexed.entry((&edit.row_id, edit.slot)).or_insert(edit);
             if edit.batch >= previous.batch {
                 *previous = edit;
@@ -75,7 +76,7 @@ impl<'a> TableEvaluator<'a> {
             rules,
             view: rules.view(table),
             edits: indexed,
-            evidence: Evidence::new(rules.values.len(), false),
+            evidence: Evidence::default(),
         }
     }
 
@@ -148,7 +149,7 @@ fn relocate(
     for (index, edit) in edits
         .iter()
         .enumerate()
-        .filter(|(_, edit)| edit.game == game && edit.version == version)
+        .filter(|(_, edit)| edit.game.as_ref() == game && edit.version.as_ref() == version)
     {
         tables.entry(&edit.table).or_default().push(index);
     }
@@ -304,8 +305,10 @@ pub fn plan(
     let edits = located.as_slice();
     let single_addresses = edits
         .iter()
-        .filter(|edit| edit.game == game && edit.version == version && !edit.batch)
-        .map(|edit| (edit.table.as_str(), &edit.row_id, edit.slot))
+        .filter(|edit| {
+            edit.game.as_ref() == game && edit.version.as_ref() == version && !edit.batch
+        })
+        .map(|edit| (edit.table.as_ref(), &edit.row_id, edit.slot))
         .collect::<HashSet<_>>();
     let blocked = relocations
         .iter()
@@ -315,7 +318,7 @@ pub fn plan(
     let mut groups = BTreeMap::<_, Vec<&Edit>>::new();
     for edit in edits
         .iter()
-        .filter(|edit| edit.game == game && edit.version == version && edit.batch)
+        .filter(|edit| edit.game.as_ref() == game && edit.version.as_ref() == version && edit.batch)
     {
         if let Some(op) = &edit.batch_operation {
             groups
@@ -338,7 +341,7 @@ pub fn plan(
         ))?;
         let mut item = Item {
             label: model::title(&table),
-            table: table.clone(),
+            table: table.to_string(),
             old: old.clone(),
             new: new.clone(),
             count: members.len(),
@@ -351,14 +354,14 @@ pub fn plan(
         };
         if old == new {
             item.reason = "替换前后文字相同，无需转换。".into();
-        } else if !tables.contains(&table) {
+        } else if !tables.iter().any(|name| name == table.as_ref()) {
             item.reason = "当前底稿中没有这张文本表。请检查游戏目录和版本；旧版记录可通过「迁移旧版修改」重新定位。".into();
-        } else if blocked.contains(table.as_str()) {
+        } else if blocked.contains(table.as_ref()) {
             item.reason =
                 "本表仍有无法确定位置的修改，保留指定文本；具体原因和处理方法见位置核对日志。"
                     .into();
         } else if members.iter().any(|member| {
-            single_addresses.contains(&(member.table.as_str(), &member.row_id, member.slot))
+            single_addresses.contains(&(member.table.as_ref(), &member.row_id, member.slot))
         }) {
             item.reason = "包含单条修改，保留现有优先级。".into();
         }
@@ -390,7 +393,7 @@ pub fn plan(
             new: new.clone(),
             mode: "sub".into(),
             source: String::new(),
-            table: table.clone(),
+            table: table.to_string(),
         }])?;
         let mut before = TableEvaluator::new(&table, &before_rules, &result.edits, game, version);
         let mut after = TableEvaluator::new(&table, &after_rules, &next_edits, game, version);
@@ -521,7 +524,10 @@ impl Item {
                 .entry((row.2, row.3.as_str()))
                 .or_insert(0usize) += 1;
         }
-        for edit in current.iter().filter(|edit| edit.table == self.table) {
+        for edit in current
+            .iter()
+            .filter(|edit| edit.table.as_ref() == self.table)
+        {
             if let Some(count) = current_counts.get_mut(&(edit.slot, edit.original.as_str())) {
                 *count += 1;
             }
@@ -620,7 +626,7 @@ mod tests {
     fn edit(table: &str, id: i64, text: &str) -> Edit {
         Edit {
             game: "game".into(),
-            version: "a".repeat(64),
+            version: "a".repeat(64).into(),
             table: table.into(),
             row_id: RowId::Integer(id),
             slot: 0,
@@ -691,7 +697,7 @@ mod tests {
         let mut other_game = edit("LocalizeDBSchema", 2, "任务");
         other_game.game = "other-game".into();
         let mut other_version = edit("LocalizeDBSchema", 3, "任务");
-        other_version.version = "b".repeat(64);
+        other_version.version = "b".repeat(64).into();
         for edits in [
             vec![
                 batch.clone(),
@@ -766,7 +772,7 @@ mod tests {
             ("LocalizeSkillDBSchema", 2, "任务乙"),
         ]);
         let mut prior = edit("LocalizeDBSchema", 1, "任务一");
-        prior.version = "b".repeat(64);
+        prior.version = "b".repeat(64).into();
         prior.batch_operation.as_mut().unwrap().id = "2".repeat(32);
         let edits = vec![
             edit("LocalizeDBSchema", 1, "任务一"),
@@ -859,7 +865,7 @@ mod tests {
         other_game.batch_operation.as_mut().unwrap().id = "2".repeat(32);
         let mut other_version = other_game.clone();
         other_version.game = "game".into();
-        other_version.version = "b".repeat(64);
+        other_version.version = "b".repeat(64).into();
         other_version.batch_operation.as_mut().unwrap().id = "3".repeat(32);
         let edits = vec![batch, single, other_game.clone(), other_version.clone()];
         let result = check(&con, &[], &edits);

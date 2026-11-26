@@ -4,7 +4,7 @@ use serde_json::json;
 fn edit_documents_have_named_fields_and_reject_positional_rows() {
     let edit = model::Edit {
         game: "game".into(),
-        version: "a".repeat(64),
+        version: "a".repeat(64).into(),
         table: "LocalizeDBSchema".into(),
         row_id: bajptr_core::database::RowId::Integer(1),
         slot: 0,
@@ -39,7 +39,7 @@ fn edit_documents_have_named_fields_and_reject_positional_rows() {
 fn single_and_batch_pair_round_trips_but_same_kind_duplicates_are_rejected() {
     let single = model::Edit {
         game: "game".into(),
-        version: "a".repeat(64),
+        version: "a".repeat(64).into(),
         table: "LocalizeDBSchema".into(),
         row_id: bajptr_core::database::RowId::Integer(1),
         slot: 0,
@@ -60,10 +60,14 @@ fn single_and_batch_pair_round_trips_but_same_kind_duplicates_are_rejected() {
         previous_scope: None,
     });
     let pair = vec![single.clone(), batch.clone()];
-    assert_eq!(
-        model::parse_edits(&model::edits_bytes(&pair).unwrap()).unwrap(),
-        pair
-    );
+    let parsed = model::parse_edits(&model::edits_bytes(&pair).unwrap()).unwrap();
+    assert_eq!(parsed, pair);
+    assert!(std::sync::Arc::ptr_eq(&parsed[0].game, &parsed[1].game));
+    assert!(std::sync::Arc::ptr_eq(
+        &parsed[0].version,
+        &parsed[1].version
+    ));
+    assert!(std::sync::Arc::ptr_eq(&parsed[0].table, &parsed[1].table));
     let resolved = model::final_edits(&pair, "game", &"a".repeat(64)).unwrap();
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].replacement, "私人委托");

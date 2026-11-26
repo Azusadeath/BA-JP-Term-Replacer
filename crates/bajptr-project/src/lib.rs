@@ -1,6 +1,6 @@
 mod backup;
 pub mod baseline;
-pub mod cleanup;
+mod cleanup;
 mod combined;
 pub mod desktop;
 pub mod diagnostics;
