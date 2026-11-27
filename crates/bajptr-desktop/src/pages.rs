@@ -802,9 +802,23 @@ impl Desktop {
                                 });
                         });
                     }
-                    if self.migration_count > 0
-                        && secondary(ui, self.connected && self.busy.is_none(), "迁移旧版修改…")
-                            .clicked()
+                    let migrating = self.busy.as_ref().is_some_and(|busy| {
+                        self.pending
+                            .get(&busy.id)
+                            .is_some_and(|action| action == "migration_start")
+                    });
+                    let available = self.connected && self.healthy() && self.busy.is_none();
+                    if migrating {
+                        ui.colored_label(MUTED, "正在迁移…");
+                    } else if let Some(pending) = self.migration_result() {
+                        let label = format!("待处理 {pending} 段");
+                        if pending == 0 {
+                            ui.colored_label(MUTED, label);
+                        } else if secondary(ui, available, &label).clicked() {
+                            self.open_migration();
+                        }
+                    } else if self.migration_count > 0
+                        && secondary(ui, available, "迁移旧版修改").clicked()
                     {
                         self.open_migration();
                     }

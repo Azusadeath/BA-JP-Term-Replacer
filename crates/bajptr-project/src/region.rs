@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
-pub const KEY: &str = "a74336c72d78fb60cd9a8ad9b74bddea14af94dd7c331cee49732841fdc68498";
+pub const KEY: &str = "52c73d09c9ca0b913f67c498e00dfae70e2f45dd3953b37f14d3a286c6df1dd3";
 pub const BUNDLES: &str = "BlueArchive_Data/StreamingAssets/TableBundles";
 pub const CATALOG: &str =
     "BlueArchive_Data/StreamingAssets/TableBundles/Catalog/TableCatalog.bytes";

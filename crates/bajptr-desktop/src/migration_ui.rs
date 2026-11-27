@@ -2,6 +2,37 @@ use crate::{app::*, dialogs::window, state::*};
 use eframe::egui::{self, RichText};
 use serde_json::json;
 
+fn conflict_text(ui: &mut egui::Ui, value: &str, other: &str) {
+    let mut prefix = 0;
+    for (a, _) in value.chars().zip(other.chars()).take_while(|(a, b)| a == b) {
+        prefix += a.len_utf8();
+    }
+    let suffix: usize = value[prefix..]
+        .chars()
+        .rev()
+        .zip(other[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum();
+    let end = value.len() - suffix;
+    let normal = egui::TextFormat::simple(
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&value[..prefix], 0., normal.clone());
+    job.append(
+        &value[prefix..end],
+        0.,
+        egui::TextFormat {
+            background: SOFT_BLUE,
+            ..normal.clone()
+        },
+    );
+    job.append(&value[end..], 0., normal);
+    ui.add(egui::Label::new(job).wrap());
+}
+
 fn comparison(ui: &mut egui::Ui, original: &str, replacement: &str) {
     ui.columns(2, |cols| {
         cols[0].colored_label(MUTED, "旧版原文");
@@ -17,32 +48,6 @@ fn comparison(ui: &mut egui::Ui, original: &str, replacement: &str) {
 
 impl Desktop {
     pub fn migration_dialogs(&mut self, ctx: &egui::Context) {
-        if self.migration_notice {
-            let mut open = true;
-            let mut close = false;
-            window("迁移旧版修改", ctx, 520.)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label("检测到旧版单条或批量修改，是否迁移到当前底稿？");
-                    ui.add_space(8.);
-                    ui.horizontal(|ui| {
-                        if primary(ui, self.busy.is_none(), "开始迁移").clicked() {
-                            self.submit(
-                                "migration_start",
-                                json!({"revision":self.revision()}),
-                                "正在核对旧版修改…",
-                            );
-                            close = true;
-                        }
-                        if ui.button("暂不迁移").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-            if !open || close {
-                self.migration_notice = false;
-            }
-        }
         let Some(mut form) = self.migration_form.take() else {
             return;
         };
@@ -84,30 +89,18 @@ impl Desktop {
             } else {
                 (ctx.content_rect().height() - 130.).clamp(360., 620.)
             });
-            let total = slice(&form.plan, "items").len();
-            let confirmed = form.confirmed_count();
-            let pending = form.groups.iter().filter(|g| !g.confirmed).count();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{} 段 · {} 组修改", total, form.groups.len()));
-                ui.colored_label(MUTED, format!("已确认 {} 段 · 未保存", confirmed));
-            });
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut form.show_confirmed,
-                    false,
-                    format!("待核对 {pending} 组"),
-                );
-                ui.selectable_value(
-                    &mut form.show_confirmed,
-                    true,
-                    format!("已确认 {} 组", form.groups.len() - pending),
-                );
+            let total = form.pending_count();
+            let selected_count = form.selected_count();
+            if total > 0 {
+                ui.label(format!("待处理 {total} 段"));
+            }
+            if total > 1 {
                 ui.add(
                     egui::TextEdit::singleline(&mut form.filter)
                         .hint_text("搜索文本或文本表")
                         .desired_width(ui.available_width()),
                 );
-            });
+            }
             form.sync_selection();
             egui::Panel::bottom("migration-actions")
                 .frame(
@@ -120,38 +113,14 @@ impl Desktop {
                         ui.colored_label(RED, &form.error);
                     }
                     ui.horizontal(|ui| {
-                        if let Some(index) = form.selected {
-                            if form.groups[index].confirmed {
-                                if secondary(ui, !busy, "重新核对这组").clicked() {
-                                    form.groups[index].confirmed = false;
-                                    form.show_confirmed = false;
-                                }
-                            } else {
-                                let amount = if form.groups[index].equal_count() {
-                                    form.groups[index].members.len()
-                                } else {
-                                    form.groups[index].chosen.len()
-                                };
-                                if secondary(
-                                    ui,
-                                    !busy && form.can_confirm(index),
-                                    &format!("确认本组（{amount} 处）"),
-                                )
-                                .clicked()
-                                {
-                                    form.confirm(index);
-                                }
-                                if secondary(ui, !busy && visible_count > 1, "暂时跳过").clicked()
-                                {
-                                    form.next();
-                                }
-                            }
+                        if visible_count > 1 && secondary(ui, !busy, "下一组").clicked() {
+                            form.next();
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if primary(
                                 ui,
-                                !busy && confirmed > 0,
-                                &format!("保存已确认（{confirmed} 段）"),
+                                !busy && selected_count > 0,
+                                &format!("保存 {selected_count} 段"),
                             )
                             .clicked()
                             {
@@ -163,8 +132,6 @@ impl Desktop {
                             }
                         });
                     });
-                    ui.add_space(3.);
-                    ui.colored_label(MUTED, "保存时自动备份，可撤销。");
                 });
             let area = ui.available_rect_before_wrap();
             let visible = form.visible();
@@ -188,19 +155,20 @@ impl Desktop {
                 list_ui.shrink_clip_rect(left);
                 let visible = form.visible();
                 egui::ScrollArea::vertical()
-                    .id_salt(("migration-groups", form.show_confirmed, &form.filter))
+                    .id_salt(("migration-groups", &form.filter))
                     .min_scrolled_height(0.)
                     .auto_shrink([false, false])
                     .show_rows(&mut list_ui, 60., visible.len(), |ui, range| {
                         for position in range {
                             let index = visible[position];
                             let group = &form.groups[index];
-                            let caption = if group.confirmed {
-                                format!("已确认 {} 处", group.chosen.len())
+                            let caption = if !group.chosen.is_empty() {
+                                format!("已选 {} 处", group.chosen.len())
                             } else {
                                 format!(
-                                    "原 {} 处 → 新 {} 处",
-                                    group.members.len(),
+                                    "记录 {} · {} 个候选",
+                                    group.item["row_id"].as_str().map(str::to_owned)
+                                        .unwrap_or_else(|| group.item["row_id"].to_string()),
                                     group.targets.len()
                                 )
                             };
@@ -234,12 +202,15 @@ impl Desktop {
                                         ))
                                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                                 );
-                                line.add(
+                                let response = line.add(
                                     egui::Label::new(label)
                                         .selectable(false)
                                         .truncate()
                                         .show_tooltip_when_elided(false),
                                 );
+                                if offset == 30. {
+                                    response.on_hover_text(text(&group.item, "original"));
+                                }
                             }
                             if response.clicked() {
                                 form.selected = Some(index);
@@ -257,10 +228,10 @@ impl Desktop {
                 let group = &form.groups[index];
                 let item = group.item.clone();
                 let old_count = group.members.len();
-                let new_count = group.targets.len();
-                let equal = group.equal_count();
-                let competing = form.has_competing(index);
-                let is_confirmed = group.confirmed;
+                let candidates: Vec<_> = (0..group.targets.len())
+                    .filter(|&candidate| !form.automatically_selected(index, candidate))
+                    .collect();
+                let new_count = candidates.len();
 
                 egui::ScrollArea::vertical()
                     .id_salt(("migration-detail", index))
@@ -272,15 +243,14 @@ impl Desktop {
                                 MUTED,
                                 bajptr_project::model::title(&text(&item, "table")),
                             );
-                            ui.label(format!("原 {old_count} 处 → 新 {new_count} 处"));
+                            if new_count > 1 {
+                                ui.label(format!("{new_count} 个候选"));
+                            }
                         });
                         ui.add_space(6.);
                         comparison(ui, &text(&item, "original"), &text(&item, "replacement"));
                         ui.add_space(10.);
                         ui.separator();
-                        if competing {
-                            ui.colored_label(ORANGE, "这段新版文本也出现在其他组的候选中。");
-                        }
                         if let Some(reason) = match item["kind"].as_str() {
                             Some("occupied") => Some("对应位置已有新版修改。"),
                             Some("missing_table") => Some("新版底稿中找不到原文本表。"),
@@ -290,7 +260,7 @@ impl Desktop {
                         } {
                             ui.colored_label(ORANGE, reason);
                         }
-                        if !is_confirmed {
+                        let mut search = |ui: &mut egui::Ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.add_enabled(!busy, egui::TextEdit::singleline(&mut form.keyword)
                                     .hint_text("输入新版原文中的文字").desired_width(205.));
@@ -303,9 +273,24 @@ impl Desktop {
                             if !form.search_message.is_empty() {
                                 ui.colored_label(MUTED, &form.search_message);
                             }
+                        };
+                        if new_count == 0 {
+                            search(ui);
+                        } else {
+                            ui.collapsing("查找其他位置", search);
                         }
-                        if new_count > 0 && !equal {
-                            ui.label(format!("最多选择 {old_count} 处新版文本。"));
+                        if old_count > 1 && new_count > 0 {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("最多选择 {old_count} 处新版文本。"));
+                                if form.groups[index].can_select_all()
+                                    && candidates.iter().all(|&candidate| !form.reserved(index, candidate))
+                                {
+                                    let mut all = form.groups[index].chosen.len() == new_count;
+                                    if ui.add_enabled(!busy, egui::Checkbox::new(&mut all, "全选本组")).changed() {
+                                        form.toggle_context(index, &candidates, all);
+                                    }
+                                }
+                            });
                         }
                         let page = &mut form.groups[index].candidate_page;
                         let page_count = new_count.div_ceil(20);
@@ -316,56 +301,83 @@ impl Desktop {
                                 if secondary(ui, *page + 1 < page_count, "下一页").clicked() { *page += 1; }
                             });
                         }
-                        let start = *page * 20;
-                        for candidate in start..new_count.min(start + 20) {
+                        let start = (*page).min(page_count.saturating_sub(1)) * 20;
+                        for &candidate in candidates.iter().skip(start).take(20) {
                                 let entry = &item["candidates"][candidate];
                                 let row = &entry["row"];
-                                let context = text(entry, "context");
                                 let proposal = &item["proposals"][candidate];
                                 let reserved = form.reserved(index, candidate);
                                 let mut checked = form.groups[index].chosen.contains(&candidate);
-                                let selectable = !busy && !is_confirmed && !reserved
-                                    && (checked || form.groups[index].chosen.len() < old_count);
-                                let label = format!("{} · 记录 {} · 字段 {}", bajptr_project::model::title(row[0].as_str().unwrap_or_default()),
-                                    row[1].as_str().map(str::to_owned).unwrap_or_else(|| row[1].to_string()), row[2]);
+                                let selectable = !busy && !reserved
+                                    && (checked || old_count == 1 || form.groups[index].chosen.len() < old_count);
+                                let old_location = row[0] == item["table"] && row[1] == item["row_id"] && row[2] == item["slot"];
+                                let label = format!("{} · 记录 {} · 字段 {}{}", bajptr_project::model::title(row[0].as_str().unwrap_or_default()),
+                                    row[1].as_str().map(str::to_owned).unwrap_or_else(|| row[1].to_string()), row[2],
+                                    if old_location { " · 原位置" } else { "" });
                                 egui::Frame::new().fill(BG).corner_radius(6).inner_margin(10).show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
                                     ui.push_id(candidate, |ui| {
-                                        if equal {
-                                            ui.colored_label(MUTED, &label);
-                                        } else if ui.add_enabled(selectable, egui::Checkbox::new(&mut checked, &label)).changed() {
+                                        if ui.add_enabled(selectable, egui::Checkbox::new(&mut checked, &label)).changed() {
                                             form.toggle_context(index, &[candidate], checked);
                                         }
                                         ui.add(egui::Label::new(row[3].as_str().unwrap_or_default()).wrap().selectable(true));
-                                        if !context.is_empty() {
-                                            ui.add(egui::Label::new(RichText::new(context).color(MUTED)).wrap().selectable(true));
-                                        }
                                         if reserved {
                                             ui.colored_label(ORANGE, "已分配给另一组修改。");
                                         }
-                                        if proposal.is_null() { return; }
-                                        let reason = text(proposal, "reason");
-                                        if !reason.is_empty() { ui.add(egui::Label::new(RichText::new(reason).color(ORANGE)).wrap()); }
-                                        let group = &mut form.groups[index];
-                                        if checked && proposal["editable"] == true {
-                                            let mut input = group.edits.get(&candidate).cloned().unwrap_or_else(|| text(proposal, "input"));
-                                            if ui.add_enabled(!busy && !is_confirmed, egui::TextEdit::multiline(&mut input)
-                                                .desired_rows(2).desired_width(ui.available_width()).hint_text("输入迁移后的文字")).changed() {
-                                                group.edits.insert(candidate, input);
-                                            }
-                                            if proposal["input"].is_null() && !group.edits.contains_key(&candidate)
-                                                && secondary(ui, !busy && !is_confirmed, "使用空文本").clicked() {
-                                                group.edits.insert(candidate, String::new());
-                                            }
+                                        if !form.groups[index].chosen.contains(&candidate) {
+                                            return;
                                         }
-                                        let replaced = if let Some(input) = group.edits.get(&candidate) {
-                                            if let Some(old) = proposal["batch_old"].as_str() {
-                                                input.contains(old).then(|| input.replace(old, &text(proposal, "batch_new")))
-                                            } else { Some(input.clone()) }
-                                        } else { proposal["replacement"].as_str().map(str::to_owned) };
-                                        if let Some(result) = replaced {
-                                            ui.colored_label(MUTED, "迁移后文本");
-                                            ui.add(egui::Label::new(RichText::new(if result.is_empty() { "（空文本）".into() } else { result }).color(BLUE)).wrap().selectable(true));
+                                        let group = &mut form.groups[index];
+                                        let mine = proposal["mine"]["result"].as_str();
+                                        let game = proposal["game"]["result"].as_str();
+                                        if let (Some(mine), Some(game)) = (mine, game) {
+                                            ui.columns(2, |columns| {
+                                                for (column, (button, value, other)) in columns.iter_mut().zip([
+                                                    ("用我的改法", mine, game),
+                                                    ("用新版改法", game, mine),
+                                                ]) {
+                                                    if secondary(column, !busy, button).clicked() {
+                                                        group.edits.insert(candidate, value.to_owned());
+                                                    }
+                                                    conflict_text(column, value, other);
+                                                }
+                                            });
+                                        }
+                                        let default = if proposal.is_null() {
+                                            item["replacement"].as_str()
+                                        } else {
+                                            proposal["replacement"].as_str()
+                                        };
+                                        if let Some(result) = group.edits.get_mut(&candidate) {
+                                            ui.colored_label(MUTED, "最终文字");
+                                            ui.add_enabled(!busy, egui::TextEdit::multiline(result)
+                                                .desired_rows(2).desired_width(ui.available_width()));
+                                            let batch_retained = proposal["batch_old"].as_str().is_some_and(|old| {
+                                                default == Some(result.as_str()) ||
+                                                    ["mine", "game"].into_iter().any(|name| {
+                                                        proposal[name]["result"].as_str() == Some(result.as_str())
+                                                            && proposal[name]["input"].as_str().is_some_and(|input| input.contains(old))
+                                                    })
+                                            });
+                                            if proposal["batch_old"].is_string() && !batch_retained {
+                                                ui.colored_label(MUTED, "保存为单条修改");
+                                            }
+                                        } else {
+                                            if let Some(result) = default {
+                                                ui.colored_label(MUTED, "最终文字");
+                                                ui.add(egui::Label::new(RichText::new(result).color(BLUE)).wrap().selectable(true));
+                                                let reason = text(proposal, "reason");
+                                                if !reason.is_empty() {
+                                                    ui.colored_label(ORANGE, reason);
+                                                    if secondary(ui, !busy, "采用结果").clicked() {
+                                                        group.edits.insert(candidate, result.to_owned());
+                                                    }
+                                                }
+                                            }
+                                            if !proposal.is_null() && secondary(ui, !busy, "编辑结果").clicked() {
+                                                let initial = default.or(game).or_else(|| row[3].as_str()).unwrap_or_default();
+                                                group.edits.insert(candidate, initial.to_owned());
+                                            }
                                         }
                                     });
                                 });
@@ -377,11 +389,8 @@ impl Desktop {
                     ui.add_space(6.);
                     if !form.filter.is_empty() {
                         ui.label("没有匹配的文本。");
-                    } else if !form.show_confirmed && pending == 0 {
-                        ui.heading("核对完成");
-                        ui.label(format!("{confirmed} 段修改等待保存"));
-                    } else {
-                        ui.label("尚未确认任何修改。");
+                    } else if form.automatic_count() == 0 {
+                        ui.label("没有需要核对的修改。");
                     }
                 });
             }

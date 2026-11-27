@@ -69,34 +69,54 @@ fn changes(base: &[char], updated: &[char]) -> Option<Vec<Change>> {
     Some(result)
 }
 
-fn merge(original: &str, edited: &str, target: &str) -> Option<String> {
+enum Merge {
+    Clean(String),
+    Conflict { mine: String, game: String },
+}
+
+fn overlaps(a: &Change, b: &Change) -> bool {
+    a != b
+        && (a.start < b.end && b.start < a.end
+            || a.start == b.start && (a.start == a.end || b.start == b.end))
+}
+
+fn merge(original: &str, edited: &str, target: &str) -> Option<Merge> {
     if edited == target || original == target {
-        return Some(edited.into());
+        return Some(Merge::Clean(edited.into()));
     }
     let base: Vec<_> = original.chars().collect();
-    let mut game = changes(&base, &target.chars().collect::<Vec<_>>())?;
-    for user in changes(&base, &edited.chars().collect::<Vec<_>>())? {
-        if game.contains(&user) {
-            continue;
+    let game = changes(&base, &target.chars().collect::<Vec<_>>())?;
+    let mine = changes(&base, &edited.chars().collect::<Vec<_>>())?;
+    let combine = |primary: &[Change], secondary: &[Change]| {
+        let mut combined = primary
+            .iter()
+            .chain(secondary.iter().filter(|change| {
+                !primary.contains(change) && primary.iter().all(|other| !overlaps(change, other))
+            }))
+            .collect::<Vec<_>>();
+        combined.sort_by_key(|c| (c.start, c.end));
+        let mut result = String::new();
+        let mut cursor = 0;
+        for change in combined {
+            result.extend(base[cursor..change.start].iter());
+            result.extend(change.text.iter());
+            cursor = change.end;
         }
-        if game.iter().any(|other| {
-            user.start < other.end && other.start < user.end
-                || user.start == other.start && (user.start == user.end || other.start == other.end)
-        }) {
-            return None;
-        }
-        game.push(user);
+        result.extend(base[cursor..].iter());
+        result
+    };
+    let result = combine(&game, &mine);
+    if mine
+        .iter()
+        .any(|change| game.iter().any(|other| overlaps(change, other)))
+    {
+        Some(Merge::Conflict {
+            mine: combine(&mine, &game),
+            game: result,
+        })
+    } else {
+        Some(Merge::Clean(result))
     }
-    game.sort_by_key(|c| (c.start, c.end));
-    let mut result = String::new();
-    let mut cursor = 0;
-    for change in game {
-        result.extend(base[cursor..change.start].iter());
-        result.extend(change.text);
-        cursor = change.end;
-    }
-    result.extend(base[cursor..].iter());
-    Some(result)
 }
 
 pub(super) fn propose(
@@ -129,9 +149,24 @@ pub(super) fn propose(
         ..Proposal::default()
     };
     if let Some(edit) = literal {
-        proposal.input = manual
-            .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"))
-            .or_else(|| merge(&edit.original, &edit.replacement, &row.3));
+        if let Some(text) = manual {
+            proposal.input = Some(text.replace("\r\n", "\n").replace('\r', "\n"));
+        } else {
+            match merge(&edit.original, &edit.replacement, &row.3) {
+                Some(Merge::Clean(text)) => proposal.input = Some(text),
+                Some(Merge::Conflict { mine, game }) => {
+                    let option = |input: String| {
+                        let result = batch
+                            .map(|op| input.replace(&op.old, &op.new))
+                            .unwrap_or_else(|| input.clone());
+                        super::MergeOption { input, result }
+                    };
+                    proposal.mine = Some(option(mine));
+                    proposal.game = Some(option(game));
+                }
+                None => {}
+            }
+        }
     } else if manual.is_some() {
         return Err(invalid("这条批量修改需按原操作重放。"));
     } else {
@@ -151,8 +186,10 @@ pub(super) fn propose(
         } else {
             proposal.replacement = Some(input.clone());
         }
+    } else if proposal.mine.is_some() {
+        proposal.reason = "文字冲突".into();
     } else {
-        proposal.reason = "旧修改和新版原文有重叠改动，请填写迁移后的文字。".into();
+        proposal.reason = "请核对最终文字。".into();
     }
     if top.batch && top.batch_operation.is_none() && manual.is_none() {
         proposal.replacement = None;
@@ -163,15 +200,21 @@ pub(super) fn propose(
 
 #[cfg(test)]
 mod tests {
-    use super::merge;
+    use super::{Merge, merge};
 
     #[test]
     fn merges_independent_changes_and_flags_overlaps() {
-        assert_eq!(
-            merge("体力 10，金币 20", "行动力 10，金块 20", "体力 15，金币 25").as_deref(),
-            Some("行动力 15，金块 25")
+        assert!(matches!(
+            merge("体力 10，金币 20", "行动力 10，金块 20", "体力 15，金币 25"),
+            Some(Merge::Clean(text)) if text == "行动力 15，金块 25"
+        ));
+        assert!(matches!(
+            merge("消耗体力 10", "消耗体力 20", "消耗体力 30（每日一次）"),
+            Some(Merge::Conflict { mine, game })
+                if mine == "消耗体力 20（每日一次）" && game == "消耗体力 30（每日一次）"
+        ));
+        assert!(
+            matches!(merge("abc", "xabc", "abcz"), Some(Merge::Clean(text)) if text == "xabcz")
         );
-        assert_eq!(merge("消耗体力 10", "消耗体力 20", "消耗体力 30"), None);
-        assert_eq!(merge("abc", "xabc", "abcz").as_deref(), Some("xabcz"));
     }
 }

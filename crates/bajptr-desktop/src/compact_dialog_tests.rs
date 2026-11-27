@@ -359,7 +359,7 @@ fn migration_review_uses_compact_empty_and_single_group_layouts() {
             let (_, rect, clip) = result
                 .texts
                 .iter()
-                .find(|(text, _, _)| text == "确认本组（1 处）")
+                .find(|(text, _, _)| text == "保存 0 段")
                 .unwrap();
             assert!(clip.contains_rect(*rect) && rect.bottom() < 620.);
             app.migration_form.as_mut().unwrap().filter = "没有匹配".into();
@@ -375,17 +375,6 @@ fn migration_review_uses_compact_empty_and_single_group_layouts() {
                     .iter()
                     .any(|(text, _, _)| text == "没有匹配的文本。")
             );
-            app.migration_form.as_mut().unwrap().filter.clear();
-            for index in 0..amount {
-                assert!(app.migration_form.as_mut().unwrap().confirm(index));
-            }
-            let complete = settle(&ctx, &mut app);
-            assert!(
-                complete.window.width() <= 560. && complete.window.height() < 360.,
-                "complete: {:?}",
-                complete.window
-            );
-            assert!(complete.texts.iter().any(|(text, _, _)| text == "核对完成"));
         }
     }
 }
@@ -833,7 +822,7 @@ fn missed_rule_locator_reveals_the_actual_main_row_after_rule_merging() {
 }
 
 #[test]
-fn skipping_a_migration_group_keeps_it_pending_and_confirmation_does_not_save() {
+fn moving_to_the_next_migration_group_preserves_pending_choices() {
     let ctx = egui::Context::default();
     crate::theme::install(&ctx);
     let mut app = Desktop::initial();
@@ -842,16 +831,24 @@ fn skipping_a_migration_group_keeps_it_pending_and_confirmation_does_not_save() 
         json!({"nonce":"test","items":items}),
     ));
     let initial = settle(&ctx, &mut app);
-    let skipped = click_label(&ctx, &mut app, &initial, "暂时跳过");
+    let skipped = click_label(&ctx, &mut app, &initial, "下一组");
     let form = app.migration_form.as_ref().unwrap();
     assert_eq!(form.selected, Some(1));
-    assert_eq!(form.confirmed_count(), 0);
+    assert_eq!(form.selected_count(), 0);
     assert!(form.payload()["choices"].as_array().unwrap().is_empty());
-    click_label(&ctx, &mut app, &skipped, "确认本组（1 处）");
+    let label = skipped
+        .texts
+        .iter()
+        .find(|(label, _, _)| label.ends_with("记录 1 · 字段 0"))
+        .unwrap()
+        .0
+        .clone();
+    let selected = click_label(&ctx, &mut app, &skipped, &label);
+    click_label(&ctx, &mut app, &selected, "下一组");
     let form = app.migration_form.as_ref().unwrap();
     assert_eq!(form.selected, Some(0));
-    assert_eq!(form.confirmed_count(), 1);
-    assert!(!form.groups[0].confirmed);
+    assert_eq!(form.selected_count(), 1);
+    assert!(form.groups[0].chosen.is_empty());
     assert!(app.pending.is_empty());
 }
 

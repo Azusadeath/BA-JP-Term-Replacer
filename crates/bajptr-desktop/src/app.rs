@@ -71,10 +71,8 @@ pub struct Desktop {
     pub confirm_backup: Option<Value>,
     pub confirm_restore: bool,
     pub confirm_baseline: Option<Value>,
-    pub migration_notice: bool,
     pub migration_count: usize,
     pub migration_form: Option<MigrationForm>,
-    migration_prompted: HashSet<String>,
     pub baseline_check: Value,
     pub baseline: Value,
     pub output_dir: PathBuf,
@@ -170,10 +168,8 @@ impl Desktop {
             confirm_backup: None,
             confirm_restore: false,
             confirm_baseline: None,
-            migration_notice: false,
             migration_count: 0,
             migration_form: None,
-            migration_prompted: HashSet::new(),
             baseline_check: Value::Null,
             baseline: Value::Null,
             output_dir: PathBuf::from("output"),
@@ -224,7 +220,6 @@ impl Desktop {
         Ok(())
     }
     pub fn game_path_changed(&mut self) {
-        self.migration_notice = false;
         self.migration_form = None;
         self.migration_count = 0;
         self.path_dirty = true;
@@ -304,7 +299,6 @@ impl Desktop {
             || self.confirm_backup.is_some()
             || self.confirm_restore
             || self.confirm_baseline.is_some()
-            || self.migration_notice
             || self.migration_form.as_ref().is_some_and(|form| form.open)
             || self.error.is_some()
             || self.confirm_record_reset.is_some()
@@ -349,7 +343,6 @@ impl Desktop {
         }
     }
     fn backend_failed(&mut self, message: String) {
-        self.migration_notice = false;
         self.migration_form = None;
         self.migration_count = 0;
         self.backend = None;
@@ -424,6 +417,8 @@ impl Desktop {
     fn set_baseline(&mut self, baseline: Value) {
         if self.baseline["version_id"] != baseline["version_id"] {
             self.sources_ready = false;
+            self.migration_form = None;
+            self.migration_count = 0;
         }
         self.baseline = baseline;
     }
@@ -521,6 +516,7 @@ impl Desktop {
         }
         if changed || game_changed {
             self.clear_promotion_result();
+            self.migration_form = None;
         }
         if changed {
             self.edit_view.selected = None;
@@ -602,21 +598,30 @@ impl Desktop {
             "正在读取这段文本…",
         );
     }
-    pub fn open_migration(&mut self) {
+    pub fn migration_result(&self) -> Option<usize> {
         let revision = self.revision();
-        let version = text(&self.baseline, "version_id");
-        if let Some(form) = &mut self.migration_form
-            && form.plan["revision"] == revision
-            && form.plan["version"] == version
-        {
-            form.open = true;
+        self.migration_form
+            .as_ref()
+            .filter(|form| {
+                form.plan["revision"] == revision
+                    && form.plan["version"] == self.baseline["version_id"]
+            })
+            .map(MigrationForm::pending_count)
+    }
+    pub fn open_migration(&mut self) {
+        if let Some(pending) = self.migration_result() {
+            if pending > 0
+                && let Some(form) = &mut self.migration_form
+            {
+                form.open = true;
+            }
             return;
         }
         self.migration_form = None;
         self.submit(
             "migration_start",
-            json!({"revision":revision}),
-            "正在核对旧版修改…",
+            json!({"revision":self.revision()}),
+            "正在迁移…",
         );
     }
     fn clear_promotion_result(&mut self) {
@@ -990,12 +995,10 @@ impl Desktop {
                         "ready" => {
                             self.confirm_baseline = None;
                             self.migration_count = count(&data, "migration_count") as usize;
-                            let prompt_key =
-                                format!("{}:{}", self.game, text(&self.baseline, "version_id"));
-                            if self.migration_count > 0
-                                && self.migration_prompted.insert(prompt_key)
+                            if let Some(form) = &self.migration_form
+                                && form.plan["token"] != self.baseline_check["token"]
                             {
-                                self.migration_notice = true;
+                                self.migration_form = None;
                             }
                             self.status = "底稿已就绪。".into();
                             self.background_tables();
@@ -1056,54 +1059,31 @@ impl Desktop {
                         );
                     }
                 }
-                "migration_preview" => {
-                    self.migration_form = Some(MigrationForm::new(data));
-                    self.status = "已核对旧版修改，请选择要迁移的文本。".into();
-                }
-                "migration_start" => {
-                    self.apply_worker_state(data["state"].clone(), edits);
-                    let review = list(&data["plan"], "items");
-                    self.migration_form =
-                        (!review.is_empty()).then(|| MigrationForm::new(data["plan"].clone()));
-                    self.status = if review.is_empty() {
-                        format!("已自动迁移 {} 段。", count(&data, "automatic_count"))
-                    } else {
-                        format!(
-                            "已自动迁移 {} 段，{} 段待核对。",
-                            count(&data, "automatic_count"),
-                            review.len()
-                        )
-                    };
-                    if data["backup"].is_string() {
-                        self.log(
-                            format!("迁移前的修改记录已备份：{}", text(&data, "backup")),
-                            None,
-                        );
-                    }
-                    if count(&data, "unavailable_count") > 0 {
-                        self.log(
-                            format!(
-                                "{} 段暂未找到可选目标，可在核对窗口查找新版文本。",
-                                count(&data, "unavailable_count")
-                            ),
-                            Some(crate::logging::Level::Warning),
-                        );
-                    }
-                }
                 "migration_find" => {
                     if let Some(form) = &mut self.migration_form {
                         form.error.clear();
                         form.apply_search_result(&data);
                     }
                 }
-                "migration_commit" => {
+                "migration_start" | "migration_commit" => {
+                    let previous = self.migration_form.take();
                     self.apply_worker_state(data["state"].clone(), edits);
-                    self.migration_form = None;
-                    self.status = format!("已迁移 {} 段文本。", count(&data, "count"));
-                    self.log(
-                        format!("迁移前的修改记录已备份：{}", text(&data, "backup")),
-                        None,
-                    );
+                    let mut form = MigrationForm::new(data["plan"].clone());
+                    form.open = false;
+                    if let Some(previous) = previous {
+                        form.open = previous.open && form.pending_count() > 0;
+                        form.filter = previous.filter;
+                        form.sync_selection();
+                        if form.selected.is_none() {
+                            form.filter.clear();
+                            form.sync_selection();
+                        }
+                    }
+                    self.migration_form = Some(form);
+                    self.status.clear();
+                    if let Some(backup) = data["backup"].as_str() {
+                        self.log(format!("迁移前的修改记录已备份：{backup}"), None);
+                    }
                 }
                 "tables" => {
                     self.tables = data.as_array().cloned().unwrap_or_default();
@@ -1302,8 +1282,6 @@ impl Desktop {
                     self.template_changed = None;
                     self.show_edits = false;
                     self.migration_form = None;
-                    self.migration_notice = false;
-                    self.migration_prompted.clear();
                     self.log(
                         format!(
                             "恢复前的数据已保留在 {}。再次恢复时可选择该目录的 info.json。",
@@ -1823,7 +1801,91 @@ mod view_tests {
     }
 
     #[test]
-    fn migration_review_confirms_then_advances_and_keeps_long_lists_above_actions() {
+    fn tools_replaces_migration_action_with_the_remaining_count() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut app = Desktop::initial();
+        app.connected = true;
+        app.migration_count = 1;
+        app.baseline = json!({"version_id":"test-version"});
+        let draw = |app: &mut Desktop, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900., 620.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.tools_page(ui),
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_owned(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let labels = draw(&mut app, vec![]);
+        assert!(labels.iter().any(|(label, _)| label == "迁移旧版修改"));
+        app.pending.insert(7, "migration_start".into());
+        app.busy = Some(Busy {
+            id: 7,
+            cancellable: true,
+        });
+        let labels = draw(&mut app, vec![]);
+        assert!(labels.iter().any(|(label, _)| label == "正在迁移…"));
+        assert!(!labels.iter().any(|(label, _)| label == "迁移旧版修改"));
+        app.pending.clear();
+        app.busy = None;
+        for (items, expected) in [(json!([{}]), "待处理 1 段"), (json!([]), "待处理 0 段")]
+        {
+            let mut form = MigrationForm::new(
+                json!({"revision":app.revision(),"version":"test-version","items":items}),
+            );
+            form.open = false;
+            app.migration_form = Some(form);
+            let labels = draw(&mut app, vec![]);
+            let pos = labels
+                .iter()
+                .find(|(label, _)| label == expected)
+                .unwrap()
+                .1
+                .center();
+            assert!(!labels.iter().any(|(label, _)| label == "迁移旧版修改"));
+            for pressed in [true, false] {
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(
+                app.migration_form.as_ref().unwrap().open,
+                expected == "待处理 1 段"
+            );
+            assert!(app.pending.is_empty());
+        }
+        app.set_baseline(json!({"version_id":"another-version"}));
+        assert_eq!(app.migration_result(), None);
+    }
+
+    #[test]
+    fn migration_review_saves_checked_targets_and_keeps_long_lists_above_actions() {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
         let mut app = Desktop::initial();
@@ -1836,7 +1898,7 @@ mod view_tests {
         app.migration_form = Some(MigrationForm::new(
             json!({"nonce":"plan","revision":0,"items":items}),
         ));
-        assert_eq!(app.migration_form.as_ref().unwrap().confirmed_count(), 0);
+        assert_eq!(app.migration_form.as_ref().unwrap().selected_count(), 0);
         let mut frame = 0;
         let mut draw = |app: &mut Desktop, events| {
             frame += 1;
@@ -1870,17 +1932,8 @@ mod view_tests {
         for _ in 0..3 {
             labels = draw(&mut app, vec![]);
         }
-        let save = labels
-            .iter()
-            .find(|(t, ..)| t == "保存已确认（0 段）")
-            .unwrap()
-            .1;
-        let footer = labels
-            .iter()
-            .find(|(t, ..)| t.starts_with("保存时自动备份"))
-            .unwrap()
-            .1;
-        assert!(footer.bottom() < 620.);
+        let save = labels.iter().find(|(t, ..)| t == "保存 0 段").unwrap().1;
+        assert!(save.bottom() < 620.);
         let rows: Vec<_> = labels
             .iter()
             .filter(|(t, ..)| t.starts_with("列表原文"))
@@ -1910,18 +1963,8 @@ mod view_tests {
         for pressed in [true, false] {
             draw(&mut app, click(position, pressed));
         }
-        labels = draw(&mut app, vec![]);
-        let position = labels
-            .iter()
-            .find(|(t, ..)| t == "确认本组（1 处）")
-            .unwrap()
-            .1
-            .center();
-        for pressed in [true, false] {
-            draw(&mut app, click(position, pressed));
-        }
-        assert_eq!(app.migration_form.as_ref().unwrap().confirmed_count(), 1);
-        assert_eq!(app.migration_form.as_ref().unwrap().selected, Some(1));
+        assert_eq!(app.migration_form.as_ref().unwrap().selected_count(), 1);
+        assert_eq!(app.migration_form.as_ref().unwrap().selected, Some(0));
         assert_eq!(
             app.migration_form.as_ref().unwrap().payload()["choices"][0],
             json!({"item":0,"candidate":0})
@@ -1965,28 +2008,15 @@ mod view_tests {
                 assert!(clip.bottom() < save.top());
             }
         }
-        assert_eq!(app.migration_form.as_ref().unwrap().confirmed_count(), 1);
-        assert!(labels.iter().any(|(t, ..)| t == "保存已确认（1 段）"));
-        let position = labels
-            .iter()
-            .find(|(t, ..)| t == "已确认 1 组")
-            .unwrap()
-            .1
-            .center();
-        for pressed in [true, false] {
-            draw(&mut app, click(position, pressed));
-        }
-        for _ in 0..3 {
-            labels = draw(&mut app, vec![]);
-        }
-        assert!(labels.iter().any(|(t, ..)| t == "重新核对这组"));
+        assert_eq!(app.migration_form.as_ref().unwrap().selected_count(), 1);
+        assert!(labels.iter().any(|(t, ..)| t == "保存 1 段"));
         app.migration_form.as_mut().unwrap().plan["version"] = json!("test-version");
         app.baseline = json!({"version_id":"test-version"});
         app.migration_form.as_mut().unwrap().open = false;
         assert!(!app.modal());
         app.open_migration();
         assert!(app.migration_form.as_ref().unwrap().open);
-        assert_eq!(app.migration_form.as_ref().unwrap().confirmed_count(), 1);
+        assert_eq!(app.migration_form.as_ref().unwrap().selected_count(), 1);
         assert!(app.pending.is_empty());
     }
     #[test]

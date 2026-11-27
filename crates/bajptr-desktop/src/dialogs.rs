@@ -530,8 +530,6 @@ impl Desktop {
                 if let Some(form) = &mut self.migration_form {
                     form.open = false;
                 }
-            } else if self.migration_notice {
-                self.migration_notice = false;
             } else if self.confirm_restore {
                 self.confirm_restore = false;
             } else if self.confirm_baseline.is_some() {
@@ -1515,7 +1513,7 @@ impl Desktop {
         }
     }
     fn source_notices_dialog(&mut self, ctx: &egui::Context) {
-        if self.migration_notice || self.migration_form.as_ref().is_some_and(|form| form.open) {
+        if self.migration_form.as_ref().is_some_and(|form| form.open) {
             return;
         }
         if !self.show_source_notices {

@@ -1315,13 +1315,13 @@ impl Project {
                 let items = migration::plan_candidates(
                     &source, &game, &version, &located, &rules, control,
                 )?;
-                let draft = json!({"nonce":nonce(),"revision":self.revision,"token":status["token"],"game":game,"version":version,"items":items});
+                let automatic = migration::automatic_choices(&items);
+                let draft = json!({"nonce":nonce(),"revision":self.revision,"token":status["token"],"game":game,"version":version,"items":items,"automatic":automatic});
                 control.check()?;
                 self.migration_draft = draft.clone();
                 if action == "migration_preview" {
                     return Ok(draft);
                 }
-                let automatic = migration::automatic_choices(&items);
                 let review = if automatic.is_empty() {
                     items
                 } else {
@@ -1458,6 +1458,7 @@ impl Project {
                     (text(&draft, "version")?, Some(&digest)),
                     &rules,
                 )?;
+                let remaining = migration::remaining_items(items, &choices, self.edits.len());
                 control.check()?;
                 let commit = control.uncancellable();
                 let snapshot = crate::backup::Snapshot {
@@ -1474,7 +1475,12 @@ impl Project {
                     .join("text-edits.json");
                 self.commit_controlled(Document::Edits(edits.into()), true, &commit)?;
                 self.prune_migration_snapshots(&digest, &commit);
-                Ok(json!({"state":self.state()?,"count":choices.len(),"backup":backup}))
+                let plan = json!({
+                    "nonce":nonce(),"revision":self.revision,"token":draft["token"],
+                    "game":draft["game"],"version":draft["version"],"items":remaining
+                });
+                self.migration_draft = plan.clone();
+                Ok(json!({"state":self.state()?,"count":choices.len(),"backup":backup,"plan":plan}))
             }
             "sources" => self.synchronize_sources(control),
             "scope_sources" => self.engine.scope_sources(

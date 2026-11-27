@@ -56,10 +56,30 @@ pub struct Proposal {
     pub batch_old: Option<String>,
     pub batch_new: Option<String>,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mine: Option<MergeOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<MergeOption>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MergeOption {
+    pub(crate) input: String,
+    pub result: String,
 }
 
 mod rebase;
 pub(crate) mod scan;
+
+fn contains_hangul(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{1100}'..='\u{11ff}' | '\u{3130}'..='\u{318f}' |
+            '\u{a960}'..='\u{a97f}' | '\u{ac00}'..='\u{d7ff}' | '\u{ffa0}'..='\u{ffdc}'
+        )
+    })
+}
 
 pub(crate) fn plan_candidates(
     edits: &[Edit],
@@ -126,12 +146,15 @@ pub(crate) fn plan_candidates(
             .map(Vec::as_slice)
             .unwrap_or_default();
         let is_free = |c: &&LocatedText| !occupied.contains(&(c.row.0.as_str(), &c.row.1, c.row.2));
+        let original_has_hangul = contains_hangul(&edit.original);
+        let same_language =
+            |candidate: &LocatedText| original_has_hangul || !contains_hangul(&candidate.row.3);
         let mut matches: Vec<_> = original_matches.iter().copied().filter(is_free).collect();
         let was_occupied = matches.len() < original_matches.len() || occupied.contains(&address);
         let anchor = layers.iter().find_map(|e| e.anchor.as_ref());
         let mut corroborated = Vec::new();
+        let mut scores = HashMap::<_, usize>::new();
         if let Some(anchor) = anchor {
-            let mut scores = HashMap::<_, usize>::new();
             for (side, value) in [
                 (0, &anchor.siblings),
                 (1, &anchor.previous),
@@ -152,12 +175,21 @@ pub(crate) fn plan_candidates(
                 }
             }
         }
-        let verified = match corroborated.as_slice() {
-            [target] if target.row.3 == edit.original && is_free(target) => matches
+        corroborated.retain(|target| same_language(target));
+        let score = |target: &LocatedText| scores[&(&target.row.1, target.row.2)];
+        let best_score = corroborated.iter().map(|target| score(target)).max();
+        let mut strongest = corroborated
+            .iter()
+            .filter(|target| Some(score(target)) == best_score);
+        let verified_target = strongest
+            .next()
+            .copied()
+            .filter(|target| strongest.next().is_none() && is_free(target));
+        let verified = verified_target.and_then(|target| {
+            matches
                 .iter()
-                .position(|candidate| candidate.row == target.row),
-            _ => None,
-        };
+                .position(|candidate| candidate.row == target.row)
+        });
         let context_mismatch = anchor.is_some_and(|old| {
             matches.len() == 1
                 && matches[0].anchor.as_ref().is_some_and(|new| {
@@ -175,7 +207,7 @@ pub(crate) fn plan_candidates(
                 })
         });
         let anchor_disagrees = verified.is_none() && (!corroborated.is_empty() || context_mismatch);
-        let suggested = verified.or_else(|| {
+        let mut suggested = verified.or_else(|| {
             (original_matches.len() == 1
                 && matches.len() == 1
                 && !anchor_disagrees
@@ -199,16 +231,26 @@ pub(crate) fn plan_candidates(
         }
         let mut seen = HashSet::new();
         for candidate in changed.into_iter().filter(is_free) {
-            if candidate.row.3 != edit.original && seen.insert((&candidate.row.1, candidate.row.2))
+            if candidate.row.3 != edit.original
+                && same_language(candidate)
+                && seen.insert((&candidate.row.1, candidate.row.2))
             {
                 matches.push(candidate);
             }
+        }
+        if let Some(target) = verified_target
+            && (target.row.3 == edit.original
+                || (target.row.1 == edit.row_id && target.row.2 == edit.slot && score(target) == 3))
+        {
+            suggested = matches
+                .iter()
+                .position(|candidate| candidate.row == target.row);
         }
         let table_missing = pool
             .tables
             .as_ref()
             .is_some_and(|tables| !tables.contains(table));
-        let kind = if suggested.is_some() {
+        let kind = if suggested.is_some_and(|index| matches[index].row.3 == edit.original) {
             "exact"
         } else if exact_count == 0 && !matches.is_empty() {
             "changed"
@@ -236,6 +278,12 @@ pub(crate) fn plan_candidates(
                     let proposal = rebase::propose(&layers, candidate, rules, None)?;
                     bytes += proposal.input.as_ref().map_or(0, String::len)
                         + proposal.replacement.as_ref().map_or(0, String::len);
+                    for option in [&proposal.mine, &proposal.game].into_iter().flatten() {
+                        bytes += option.input.len() + option.result.len();
+                    }
+                    if bytes > scan::MAX_BYTES {
+                        return Err(invalid("迁移候选过多，请分批核对旧版修改。"));
+                    }
                     Some(proposal)
                 } else {
                     None
@@ -288,11 +336,19 @@ pub(crate) fn plan_candidates(
     }
     let mut targets = HashMap::new();
     for item in &items {
-        let candidates = item.candidates.iter().enumerate().filter(|(i, target)| {
-            item.suggested
-                .map_or_else(|| target.row.3 == item.original, |index| index == *i)
-        });
-        for (_, target) in candidates {
+        if let Some(index) = item.suggested {
+            let row = &item.candidates[index].row;
+            *targets.entry((&row.0, &row.1, row.2)).or_insert(0) += 1;
+            continue;
+        }
+        let exact = item
+            .candidates
+            .iter()
+            .filter(|target| target.row.3 == item.original);
+        let exact_count = exact.clone().count();
+        for target in exact.filter(|target| {
+            target.row.1 == item.row_id && target.row.2 == item.slot || exact_count == 1
+        }) {
             let row = &target.row;
             *targets.entry((&row.0, &row.1, row.2)).or_insert(0) += 1;
         }
@@ -321,6 +377,8 @@ pub struct Choice {
     pub candidate: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_text: Option<String>,
 }
 
 /// Exact addresses take precedence. Remaining interchangeable records can move
@@ -338,11 +396,19 @@ pub fn automatic_choices(items: &[Item]) -> Vec<Choice> {
         .iter()
         .enumerate()
         .filter_map(|(item, value)| {
-            value.suggested.map(|candidate| Choice {
-                item,
-                candidate,
-                text: None,
-            })
+            value
+                .suggested
+                .filter(|&candidate| {
+                    value.proposals[candidate].as_ref().is_none_or(|proposal| {
+                        proposal.replacement.is_some() && proposal.reason.is_empty()
+                    })
+                })
+                .map(|candidate| Choice {
+                    item,
+                    candidate,
+                    text: None,
+                    final_text: None,
+                })
         })
         .collect();
     let reserved: HashSet<_> = choices
@@ -392,6 +458,7 @@ pub fn automatic_choices(items: &[Item]) -> Vec<Choice> {
                 item,
                 candidate,
                 text: None,
+                final_text: None,
             });
         }
     }
@@ -460,10 +527,43 @@ pub(crate) fn apply_choices(
         if !rebased && choice.text.is_some() {
             return Err(invalid("原文未变化，请直接确认对应文本。"));
         }
-        let proposal = rebased
+        if choice.text.is_some() && choice.final_text.is_some() {
+            return Err(invalid("迁移文字格式无效。"));
+        }
+        let mut proposal = rebased
             .then(|| rebase::propose(&layers, candidate, rules, choice.text.as_deref()))
             .transpose()?;
+        let final_text = choice
+            .final_text
+            .as_ref()
+            .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"));
+        let custom = if let Some(result) = &final_text {
+            if let Some(proposed) = &mut proposal {
+                if proposed.replacement.as_ref() == Some(result) {
+                    false
+                } else if let Some(option) = [&proposed.mine, &proposed.game]
+                    .into_iter()
+                    .flatten()
+                    .find(|option| &option.result == result)
+                    && proposed
+                        .batch_old
+                        .as_ref()
+                        .is_none_or(|old| option.input.contains(old))
+                {
+                    proposed.input = Some(option.input.clone());
+                    proposed.replacement = Some(result.clone());
+                    false
+                } else {
+                    true
+                }
+            } else {
+                item.replacement != *result
+            }
+        } else {
+            false
+        };
         if let Some(proposal) = &proposal
+            && !custom
             && proposal.replacement.is_none()
         {
             return Err(invalid(&proposal.reason));
@@ -487,6 +587,17 @@ pub(crate) fn apply_choices(
             edit.table = candidate.row.0.as_str().into();
             edit.original.clone_from(&candidate.row.3);
             edit.anchor.clone_from(&candidate.anchor);
+            edit.row_id = candidate.row.1.clone();
+            edit.slot = candidate.row.2;
+            if custom {
+                if index == item.indices[0] {
+                    edit.batch = false;
+                    edit.batch_operation = None;
+                    edit.replacement.clone_from(final_text.as_ref().unwrap());
+                    moved.push(edit);
+                }
+                continue;
+            }
             if let Some(proposal) = &proposal {
                 if let Some(op) = &mut edit.batch_operation {
                     op.before.clone_from(proposal.input.as_ref().unwrap());
@@ -497,8 +608,6 @@ pub(crate) fn apply_choices(
                         .clone_from(proposal.input.as_ref().unwrap());
                 }
             }
-            edit.row_id = candidate.row.1.clone();
-            edit.slot = candidate.row.2;
             if let Some(op) = &mut edit.batch_operation {
                 op.previous_scope = snapshot.map(|digest| model::PreviousBatchScope {
                     version: source_version.to_string(),
@@ -521,6 +630,72 @@ pub(crate) fn apply_choices(
     values.extend(moved);
     model::validate_edits(&values)?;
     Ok(values)
+}
+
+pub(crate) fn remaining_items(
+    items: Vec<Item>,
+    choices: &[Choice],
+    edit_count: usize,
+) -> Vec<Item> {
+    let selected: HashSet<_> = choices.iter().map(|choice| choice.item).collect();
+    let targets: HashSet<_> = choices
+        .iter()
+        .map(|choice| &items[choice.item].candidates[choice.candidate].row)
+        .map(|row| (row.0.clone(), row.1.clone(), row.2))
+        .collect();
+    let mut removed = vec![false; edit_count];
+    for &index in &selected {
+        for &edit in &items[index].indices {
+            removed[edit] = true;
+        }
+    }
+    let mut next = 0;
+    let indices: Vec<_> = removed
+        .into_iter()
+        .map(|removed| {
+            let index = next;
+            next += usize::from(!removed);
+            index
+        })
+        .collect();
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(_, mut item)| {
+            for index in &mut item.indices {
+                *index = indices[*index];
+            }
+            let mut suggested = None;
+            let mut occupied = false;
+            let mut candidates = Vec::new();
+            let mut proposals = Vec::new();
+            for (index, (candidate, proposal)) in
+                item.candidates.into_iter().zip(item.proposals).enumerate()
+            {
+                let row = &candidate.row;
+                if targets.contains(&(row.0.clone(), row.1.clone(), row.2)) {
+                    occupied = true;
+                    continue;
+                }
+                if item.suggested == Some(index) {
+                    suggested = Some(candidates.len());
+                }
+                candidates.push(candidate);
+                proposals.push(proposal);
+            }
+            item.candidates = candidates;
+            item.proposals = proposals;
+            item.suggested = suggested;
+            if occupied {
+                item.equivalent_group = false;
+                if item.candidates.is_empty() {
+                    item.kind = "occupied".into();
+                }
+            }
+            item
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -591,6 +766,74 @@ mod tests {
     }
 
     #[test]
+    fn stronger_context_keeps_unchanged_text_at_its_address_out_of_review() {
+        use bajptr_core::database::LocationAnchor;
+        let mut old = edit(1, "原文");
+        let anchor = LocationAnchor {
+            siblings: Some("same siblings".into()),
+            previous: Some("before".into()),
+            next: Some("after".into()),
+        };
+        old.anchor = Some(anchor.clone());
+        let mut unchanged = row(1, "原文");
+        unchanged.anchor = Some(anchor.clone());
+        let mut nearby = row(9, "改过的原文");
+        nearby.anchor = Some(LocationAnchor {
+            next: Some("different neighbor".into()),
+            ..anchor.clone()
+        });
+        let items = plan(
+            &[old.clone()],
+            "game",
+            &"b".repeat(64),
+            &[unchanged.clone(), nearby.clone()],
+        );
+        assert_eq!(automatic_choices(&items).len(), 1);
+        let mut competing = nearby;
+        competing.anchor = Some(anchor);
+        let items = plan(&[old], "game", &"b".repeat(64), &[unchanged, competing]);
+        assert!(automatic_choices(&items).is_empty());
+    }
+
+    #[test]
+    fn saving_part_of_a_plan_reindexes_edits_and_keeps_manual_candidates() {
+        let edits = [edit(1, "第一段"), edit(2, "第二段")];
+        let version = "b".repeat(64);
+        let mut items = plan(
+            &edits,
+            "game",
+            &version,
+            &[row(1, "第一段"), row(2, "第二段")],
+        );
+        items[1]
+            .add_candidate(row(1, "第一段"), &[&edits[1]], &Rules::default())
+            .unwrap();
+        items[1]
+            .add_candidate(row(3, "第二段"), &[&edits[1]], &Rules::default())
+            .unwrap();
+        let first = [Choice {
+            item: 0,
+            candidate: 0,
+            text: None,
+            final_text: None,
+        }];
+        let saved = apply(&edits, &items, &first, "game", &version).unwrap();
+        let remaining = remaining_items(items, &first, edits.len());
+        assert_eq!(remaining[0].indices, [0]);
+        assert_eq!(remaining[0].candidates.len(), 2);
+        assert!(remaining[0].proposals.iter().all(Option::is_none));
+        let next = [Choice {
+            item: 0,
+            candidate: 1,
+            text: None,
+            final_text: None,
+        }];
+        let saved = apply(&saved, &remaining, &next, "game", &version).unwrap();
+        assert!(saved.iter().all(|edit| edit.version.as_ref() == version));
+        assert!(saved.iter().any(|edit| edit.row_id == RowId::Integer(3)));
+    }
+
+    #[test]
     fn corroborated_context_finds_the_moved_member_of_a_partial_repeated_group() {
         use bajptr_core::database::LocationAnchor;
         let mut old = edit(1, "重复原文");
@@ -646,6 +889,102 @@ mod tests {
     }
 
     #[test]
+    fn korean_sibling_is_not_a_candidate_for_a_non_korean_edit() {
+        use bajptr_core::database::LocationAnchor;
+        let mut old = edit(1, "命中率增加 30%");
+        let anchor = LocationAnchor {
+            siblings: Some("same siblings".into()),
+            previous: Some("before".into()),
+            next: Some("after".into()),
+        };
+        old.anchor = Some(anchor.clone());
+        let mut translated = row(1, "명중률 30% 증가");
+        translated.anchor = Some(anchor);
+        let mut current = row(2, "命中率增加 35%");
+        current.anchor = old.anchor.clone();
+        let version = "b".repeat(64);
+        let items = plan(&[old], "game", &version, &[translated.clone(), current]);
+        assert_eq!(items[0].candidates.len(), 1);
+        assert_eq!(items[0].candidates[0].row.1, RowId::Integer(2));
+        let korean = plan(
+            &[edit(1, "명중률 30% 증가")],
+            "game",
+            &version,
+            &[translated],
+        );
+        assert_eq!(automatic_choices(&korean).len(), 1);
+    }
+
+    #[test]
+    fn saving_final_text_preserves_batch_layers_for_a_suggested_result() {
+        let mut single = edit(1, "体力 10 点");
+        single.replacement = "体力 5 点".into();
+        let mut batch = single.clone();
+        batch.batch = true;
+        batch.replacement = "行动力 5 点".into();
+        batch.batch_operation = Some(BatchOperation {
+            id: "1".repeat(32),
+            old: "体力".into(),
+            new: "行动力".into(),
+            before: single.replacement.clone(),
+            previous_scope: None,
+        });
+        let edits = [single, batch];
+        let version = "b".repeat(64);
+        let items = plan(
+            &edits,
+            "game",
+            &version,
+            &[row(1, "体力 15 点（每日一次）")],
+        );
+        let proposal = items[0].proposals[0].as_ref().unwrap();
+        let mine = &proposal.mine.as_ref().unwrap().result;
+        assert_eq!(mine, "行动力 5 点（每日一次）");
+        let save = |text: &str| {
+            apply(
+                &edits,
+                &items,
+                &[Choice {
+                    item: 0,
+                    candidate: 0,
+                    text: None,
+                    final_text: Some(text.into()),
+                }],
+                "game",
+                &version,
+            )
+            .unwrap()
+        };
+        let retained = save(mine);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[1].replacement, *mine);
+        assert!(retained[1].batch_operation.is_some());
+        let custom = save("每日消耗 8 点");
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].replacement, "每日消耗 8 点");
+        assert!(!custom[0].batch);
+    }
+
+    #[test]
+    fn automatically_merges_nonoverlapping_text_at_a_verified_location() {
+        use bajptr_core::database::LocationAnchor;
+        let mut old = edit(1, "消耗体力 10 点");
+        old.replacement = "消耗行动力 10 点".into();
+        old.anchor = Some(LocationAnchor {
+            siblings: Some("same siblings".into()),
+            previous: Some("before".into()),
+            next: Some("after".into()),
+        });
+        let mut current = row(1, "消耗体力 15 点");
+        current.anchor = old.anchor.clone();
+        let items = plan(&[old.clone()], "game", &"b".repeat(64), &[current]);
+        let choices = automatic_choices(&items);
+        assert_eq!(choices.len(), 1);
+        let saved = apply(&[old], &items, &choices, "game", &"b".repeat(64)).unwrap();
+        assert_eq!(saved[0].replacement, "消耗行动力 15 点");
+    }
+
+    #[test]
     fn exact_matches_are_selected_while_relocations_duplicates_and_conflicts_need_review() {
         let mut current = edit(5, "已有");
         current.version = "b".repeat(64).into();
@@ -683,11 +1022,13 @@ mod tests {
                     item: 0,
                     candidate: 0,
                     text: None,
+                    final_text: None,
                 },
                 Choice {
                     item: 1,
                     candidate: 0,
                     text: None,
+                    final_text: None,
                 },
             ],
             "game",
@@ -806,6 +1147,7 @@ mod tests {
                 item: 0,
                 candidate: 0,
                 text: None,
+                final_text: None,
             }],
             "game",
             &"b".repeat(64),
@@ -850,6 +1192,7 @@ mod tests {
                 item: 0,
                 candidate: 0,
                 text: None,
+                final_text: None,
             }],
             "game",
             &"b".repeat(64),
@@ -869,11 +1212,13 @@ mod tests {
                 item: 0,
                 candidate: 0,
                 text: None,
+                final_text: None,
             },
             Choice {
                 item: 1,
                 candidate: 0,
                 text: None,
+                final_text: None,
             },
         ];
         assert!(apply(&edits, &items, &duplicate, "game", &"b".repeat(64)).is_err());
